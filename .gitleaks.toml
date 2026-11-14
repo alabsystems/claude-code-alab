@@ -1,0 +1,11 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# Public-export secret scanning keeps every built-in detector enabled. The
+# central publication engine rejects repo-local allowlists and bypasses, scans
+# Git history, and scans the immutable final export again before staging.
+# Findings are fixed at the source.
+title = "claude-code-alab gitleaks config"
+
+[extend]
+useDefault = true
