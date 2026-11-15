@@ -57,7 +57,8 @@
 //! never inherits them, and nothing of the link enters a transfer capsule.
 
 use std::os::fd::{AsRawFd as _, RawFd};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use super::{Supervisor, now_ms};
 use crate::aterm::{self, Policy, SafePoint, Scope, Status};
@@ -72,6 +73,10 @@ pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The bound on every exchange made from the supervisor's loop, and on opening
 /// a connection again from it.
 pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+// Kept across control reconnections, never reusing a generation after a fork
+// attempt. Own-image transfer inside aterm remains unqualified in this release.
+static CHILD_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// How often a lost link is claimed again, an ended event stream reopened, and
 /// at most how long an aterm hold waits before `status` is read again.
@@ -197,6 +202,20 @@ fn ask(conn: &mut Connection, step: &str, request: Option<String>) -> Result<Str
         .map_err(|error| Failure::Gone(format!("{step} {error}")))
 }
 
+fn child_start_ask(
+    conn: &mut Connection,
+    deadline: Instant,
+    step: &str,
+    request: Option<String>,
+) -> Result<String, Failure> {
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| Failure::Gone("child-start deadline".to_string()))?;
+    conn.set_timeout(left);
+    ask(conn, step, request)
+}
+
 /// One fresh `harness policy`.
 fn read_policy(conn: &mut Connection, sid: &str) -> Result<Policy, Failure> {
     let reply = ask(conn, "policy", aterm::policy_verb(sid))?;
@@ -259,16 +278,29 @@ fn guarded_claim(
     pid: u32,
     version: &str,
     vendor: Option<&str>,
-) -> Result<(), Failure> {
+    child: Option<&aterm::ChildProof>,
+    generation: Option<u64>,
+) -> Result<(bool, bool, Option<u64>), Failure> {
     admits(&read_policy(conn, sid)?)?;
     // Never a trial claim: without the row, nothing below is sent.
-    if !aterm::rostered(&ask(conn, "roster", aterm::info_verb(sid))?) {
+    let info = ask(conn, "roster", aterm::info_verb(sid))?;
+    if !aterm::rostered(&info) {
         return Err(Failure::Refused("unrostered".to_string()));
     }
+    let child_proof = aterm::child_proof_supported(&info);
+    let child_start = aterm::child_start_supported(&info);
     let reply = ask(
         conn,
         "claim",
-        aterm::claim_verb(sid, pid, &SCOPES, version, vendor),
+        aterm::claim_child_generation_verb(
+            sid,
+            pid,
+            &SCOPES,
+            version,
+            vendor,
+            child.filter(|_| child_proof),
+            generation.filter(|_| child_start),
+        ),
     )?;
     if !ok(&reply) {
         return Err(Failure::Refused(format!("claim {}", reply_words(&reply))));
@@ -291,7 +323,7 @@ fn guarded_claim(
     if matches!(proof, Err(Failure::Refused(_) | Failure::Later(_))) {
         let _ = ask(conn, "release", aterm::release_verb(sid, pid));
     }
-    proof
+    proof.map(|()| (child_proof, child_start, generation.filter(|_| child_start)))
 }
 
 /// The whole claim sequence for the session `locator` names, by harness process
@@ -303,6 +335,8 @@ fn claim(
     pid: u32,
     version: &str,
     vendor: Option<&str>,
+    child: Option<aterm::ChildProof>,
+    generation: Option<u64>,
     opening: Duration,
 ) -> Result<Claimed, Failure> {
     let socket = locator
@@ -311,7 +345,15 @@ fn claim(
     let mut conn = Connection::connect(&socket, opening)
         .map_err(|error| Failure::Gone(format!("connect {error}")))?;
     conn.set_timeout(REQUEST_TIMEOUT);
-    guarded_claim(&mut conn, locator.sid(), pid, version, vendor)?;
+    let (child_proof, child_start, generation) = guarded_claim(
+        &mut conn,
+        locator.sid(),
+        pid,
+        version,
+        vendor,
+        child.as_ref(),
+        generation,
+    )?;
     match EventReader::connect(&socket, locator.sid(), opening) {
         Ok(events) => Ok(Claimed {
             conn,
@@ -319,6 +361,11 @@ fn claim(
             pid,
             holder: aterm::holder(pid),
             standing: true,
+            child_proof,
+            child_start,
+            generation,
+            child: child.filter(|_| child_proof),
+            child_pending: child_proof && child.is_none(),
             events: Some(events),
             events_retry_ms: 0,
             recheck_at_ms: 0,
@@ -420,6 +467,16 @@ pub(super) struct Claimed {
     /// the session: the claim was released, the connection and the event
     /// stream are kept, and a policy event that shows it on claims again.
     standing: bool,
+    /// Whether this host negotiated the optional contract-3 native child target.
+    child_proof: bool,
+    /// The host can capture an output barrier before a new child is spawned.
+    child_start: bool,
+    /// The pending or completed generation this connection acknowledged.
+    generation: Option<u64>,
+    /// The child lifetime last announced, retained across a policy pause.
+    child: Option<aterm::ChildProof>,
+    /// A newly spawned child's identity must be announced once observable.
+    child_pending: bool,
     /// The event subscription, until it ends.
     events: Option<EventReader>,
     /// When (epoch ms) an ended event stream is opened again.
@@ -444,6 +501,78 @@ pub(super) struct Claimed {
 }
 
 impl Claimed {
+    fn before_spawn(&mut self, vendor: Option<&str>) -> Result<(), Failure> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let sid = self.locator.sid().to_string();
+        let status = child_start_ask(
+            &mut self.conn,
+            deadline,
+            "child-start-status",
+            aterm::status_verb(&sid),
+        )?;
+        if let Some(generation) = aterm::child_generation(&status) {
+            CHILD_GENERATION.fetch_max(generation, Ordering::SeqCst);
+        }
+        let generation = CHILD_GENERATION
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| Failure::Refused("child-start generation-exhausted".to_string()))?
+            + 1;
+        let mut failure = None;
+        for _ in 0..2 {
+            let result = (|| {
+                let reply = child_start_ask(
+                    &mut self.conn,
+                    deadline,
+                    "child-start",
+                    aterm::claim_child_start_verb(
+                        &sid, self.pid, &SCOPES, VERSION, vendor, generation,
+                    ),
+                )?;
+                if !ok(&reply) {
+                    return Err(Failure::Refused(format!(
+                        "child-start {}",
+                        reply_words(&reply)
+                    )));
+                }
+                let reply = child_start_ask(
+                    &mut self.conn,
+                    deadline,
+                    "child-start-proof",
+                    aterm::status_verb(&sid),
+                )?;
+                if !aterm::child_start_pending(&reply, &self.holder, generation) {
+                    return Err(Failure::Refused("child-start unproven-pending".to_string()));
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    self.conn.set_timeout(REQUEST_TIMEOUT);
+                    self.child = None;
+                    self.child_pending = true;
+                    self.generation = Some(generation);
+                    self.last_hold = None;
+                    return Ok(());
+                }
+                Err(why) => {
+                    let gone = matches!(why, Failure::Gone(_));
+                    failure = Some(why);
+                    if gone || Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(failure.unwrap_or_else(|| Failure::Gone("child-start deadline".to_string())))
+    }
+
+    /// The negotiated host needs the first vendor child's identity after spawn.
+    pub(super) const fn wants_initial_child(&self) -> bool {
+        self.child_pending
+    }
+
     /// Give the claim back, keeping the connection. The policy is read again
     /// every [`RECLAIM_EVERY_MS`] from here ([`Supervisor::link_tick`]): aterm
     /// sends no event when a session's own Autopilot word changes, so nothing
@@ -498,8 +627,20 @@ impl Claimed {
                 self.policy_due_ms = 0;
                 return Ok(None);
             }
-            Ok(()) => match guarded_claim(&mut self.conn, &sid, self.pid, VERSION, vendor) {
-                Ok(()) => {
+            Ok(()) => match guarded_claim(
+                &mut self.conn,
+                &sid,
+                self.pid,
+                VERSION,
+                vendor,
+                self.child.as_ref(),
+                self.generation,
+            ) {
+                Ok((child_proof, child_start, generation)) => {
+                    self.child_proof = child_proof;
+                    self.child_start = child_start;
+                    self.generation = generation;
+                    self.child_pending = child_proof && self.child.is_none();
                     self.standing = true;
                     self.recheck_at_ms = 0;
                     self.policy_due_ms = 0;
@@ -659,6 +800,9 @@ pub(super) enum Link {
         /// stands until aterm answers again: a proven claim, or a refusal,
         /// which is aterm's newer word.
         held: Option<String>,
+        /// A generation acknowledged for this exact child, retained on request
+        /// reconnect so a live child keeps its original pre-spawn output floor.
+        generation: Option<(aterm::ChildProof, u64)>,
     },
 }
 
@@ -674,6 +818,43 @@ pub(super) enum Verdict {
 }
 
 impl Link {
+    /// A claimed fork needs an acknowledged pre-spawn barrier. An unavailable
+    /// barrier definitively drops the bound connection instead of blocking the
+    /// vendor indefinitely or claiming the unacknowledged barrier succeeded.
+    pub(super) fn before_spawn(&mut self, journal: &Journal, vendor: Option<&str>) {
+        let failure = match self {
+            Self::Held(claimed) if claimed.standing && claimed.child_start => {
+                match claimed.before_spawn(vendor) {
+                    Ok(()) => {
+                        journal.note(&format!(
+                            "aterm child-start generation={}",
+                            claimed.generation.unwrap_or(0)
+                        ));
+                        return;
+                    }
+                    Err(failure) => failure,
+                }
+            }
+            _ => return,
+        };
+        let why = failure.why().to_string();
+        if let Self::Held(claimed) = std::mem::replace(self, Self::Absent) {
+            let locator = claimed.locator.clone();
+            // Drop both sockets now. The request connection owns the claim;
+            // no stale bound child or ambiguous pending ACK grants input.
+            drop(claimed);
+            *self = Self::Lost {
+                locator,
+                retry_at_ms: now_ms().saturating_add(RECLAIM_EVERY_MS),
+                noted: why.clone(),
+                claimed: true,
+                held: None,
+                generation: None,
+            };
+        }
+        journal.note(&format!("aterm child-start unclaimed {why}"));
+    }
+
     /// The launch's link, decided before the first vendor start. Outside aterm
     /// nothing is attempted and nothing is journalled. Inside, a session that
     /// can be located runs the claim sequence for vendor build `vendor`;
@@ -702,6 +883,8 @@ impl Link {
                         std::process::id(),
                         VERSION,
                         vendor,
+                        None,
+                        None,
                         CONNECT_TIMEOUT,
                     );
                     (Some(locator), claimed)
@@ -722,6 +905,7 @@ impl Link {
                     noted: why,
                     claimed: false,
                     held: None,
+                    generation: None,
                 }
             }
             (Err(failure), _) => {
@@ -788,6 +972,15 @@ impl Link {
     }
 }
 
+/// Capture the direct live child's native birth. The host checks its current
+/// image separately: a token-route helper may exec the vendor with the same
+/// kernel lifetime, so no executable path is sent as authority here.
+fn live_child_proof(pid: libc::pid_t) -> Option<aterm::ChildProof> {
+    let pid = u32::try_from(pid).ok()?;
+    let identity = crate::procs::capture_child(pid)?;
+    aterm::ChildProof::from_identity(&identity)
+}
+
 impl Supervisor {
     /// The held link stopped answering (or its claim is no longer this
     /// harness's): drop both connections, which also drops the claim at aterm,
@@ -805,6 +998,7 @@ impl Supervisor {
             // Only a standing claim's answer holds: a released claim's looks
             // were already the harness's own.
             held: claimed.last_hold.clone().filter(|_| claimed.standing),
+            generation: claimed.child.zip(claimed.generation),
         };
     }
 
@@ -814,6 +1008,7 @@ impl Supervisor {
     /// step and stops at the first step that fails.
     pub(super) fn link_tick(&mut self) {
         let now = now_ms();
+        let no_child = self.no_child();
         match &mut self.link {
             Link::Absent => {}
             Link::Lost {
@@ -822,16 +1017,24 @@ impl Supervisor {
                 noted,
                 claimed,
                 held,
+                generation,
             } => {
                 if now < *retry_at_ms {
                     return;
                 }
                 let vendor = self.child.build.version.as_deref();
+                let child = (!no_child)
+                    .then(|| live_child_proof(self.child.pid))
+                    .flatten();
                 match claim(
                     locator,
                     std::process::id(),
                     VERSION,
                     vendor,
+                    child,
+                    generation
+                        .filter(|(saved, _)| Some(*saved) == child)
+                        .map(|(_, generation)| generation),
                     REQUEST_TIMEOUT,
                 ) {
                     Ok(claimed) => {
@@ -887,6 +1090,9 @@ impl Supervisor {
                     self.link_policy();
                 }
             }
+        }
+        if !self.no_child() && matches!(&self.link, Link::Held(claimed) if claimed.child_pending) {
+            self.link_reannounce();
         }
     }
 
@@ -1006,9 +1212,24 @@ impl Supervisor {
     /// The child was relaunched: announce the claim again with the build it now
     /// runs, so `supervisor_vendor=` stays true. A refusal loses the link.
     pub(super) fn link_reannounce(&mut self) {
+        if self.no_child() {
+            return;
+        }
+        let child = live_child_proof(self.child.pid);
         let Link::Held(claimed) = &mut self.link else {
             return;
         };
+        if claimed.child_proof {
+            claimed.child_pending = true;
+            let Some(child) = child else {
+                // The child's native image facts may not yet be observable
+                // immediately after spawn. Keep the target unannounced and
+                // retry on the next poll; never guess a birth from wall time.
+                return;
+            };
+            claimed.child = Some(child);
+            claimed.child_pending = false;
+        }
         // A hold aterm stated was on the child that ended.
         claimed.last_hold = None;
         if !claimed.standing {
@@ -1019,7 +1240,15 @@ impl Supervisor {
         let announced = ask(
             &mut claimed.conn,
             "reannounce",
-            aterm::claim_verb(claimed.locator.sid(), claimed.pid, &SCOPES, VERSION, vendor),
+            aterm::claim_child_generation_verb(
+                claimed.locator.sid(),
+                claimed.pid,
+                &SCOPES,
+                VERSION,
+                vendor,
+                claimed.child.as_ref().filter(|_| claimed.child_proof),
+                claimed.generation.filter(|_| claimed.child_start),
+            ),
         )
         .and_then(|reply| {
             if ok(&reply) {
@@ -1192,9 +1421,16 @@ mod tests {
     fn the_claim_takes_relaunch_and_upgrade_and_nothing_else() {
         assert_eq!(scope_words(), "relaunch,upgrade");
         assert_eq!(
-            aterm::claim_verb("s-1a", 77, &SCOPES, "0.2.0", Some("2.1.311")).as_deref(),
+            aterm::claim_verb(
+                "s-0000000000000000001a",
+                77,
+                &SCOPES,
+                "0.2.0",
+                Some("2.1.311")
+            )
+            .as_deref(),
             Some(
-                "@s-1a meta set supervisor claude-code-alab@77 contract=3 scope=relaunch,upgrade \
+                "@s-0000000000000000001a meta set supervisor claude-code-alab@77 contract=3 scope=relaunch,upgrade \
                  version=0.2.0 vendor=2.1.311"
             )
         );

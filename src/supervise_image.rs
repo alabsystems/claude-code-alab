@@ -561,7 +561,7 @@ struct Probe {
     mark: Option<FirstExecMark>,
     child: Option<sys::ProbeChild>,
     pid: Option<i32>,
-    signals: Option<sys::SignalBlock>,
+    signals: Option<sys::AllSignals>,
     nonce: String,
     until: Instant,
     stdout: Vec<u8>,
@@ -593,8 +593,8 @@ impl Probe {
         ) {
             Ok(child) => (Some(child), None, None),
             Err(refusal) if refusal.child.is_some() || refusal.signals.is_some() => (
-                refusal.child,
-                refusal.signals,
+                refusal.child.map(|child| *child),
+                refusal.signals.map(|block| *block),
                 Some(refusal.error.to_string()),
             ),
             Err(refusal) => return Err(refusal.error),
@@ -692,16 +692,12 @@ impl Probe {
         Ok(Some(capability))
     }
     fn pending(&self) -> bool {
-        self.signals.is_some()
-            || self
-                .child
-                .as_ref()
-                .is_some_and(|child| child.pid().is_some())
+        self.signals.is_some() || self.child.as_ref().is_some_and(sys::ProbeChild::pending)
     }
     fn cancel(&mut self) {
         self.failed
             .get_or_insert_with(|| "probe cancelled by continuing supervisor".into());
-        if let Some(child) = &self.child
+        if let Some(child) = &mut self.child
             && child.cancel().is_ok()
         {
             self.cancelled = true;
@@ -2815,8 +2811,14 @@ impl Hold<'_> {
     /// The child stopped: stop too, then continue the child once continued.
     fn follow_stop(&mut self) {
         sys::stop_self();
-        self.signal(libc::SIGCONT);
-        self.stopped = false;
+        self.reap();
+        if self.stopped
+            && procs::observe_child(self.child)
+                .is_some_and(|seen| seen.state == ChildState::Stopped)
+        {
+            self.signal(libc::SIGCONT);
+            self.stopped = false;
+        }
     }
 
     /// A TSTP reached the hold: follow the child if it stops with it, else pass it on.

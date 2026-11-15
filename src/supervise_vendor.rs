@@ -68,11 +68,11 @@ impl Launch {
         })
     }
     pub fn command(&self) -> Command {
-        let mut command = Command::new(&self.build.exe);
+        let mut command = crate::launch::vendor_command(&self.build.exe, &self.args, true);
         command
-            .args(&self.args)
             .env_clear()
             .envs(self.environment.iter().map(|(k, v)| (k, v)));
+        crate::launch::renderer(&mut command);
         // The continuing parent never changes cwd. Inheriting it keeps the
         // original directory object even if its pathname was renamed meanwhile.
         command

@@ -219,6 +219,185 @@ pub fn claim_verb(
     addressed(sid, &verb)
 }
 
+/// A direct vendor child's kernel lifetime, in the host's native birth units.
+/// This is identity evidence only: aterm still proves the child's image before
+/// allowing any built-in typing duty to use it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildProof {
+    /// The direct child's process id, checked once when constructed.
+    pid: std::num::NonZeroU32,
+    /// Epoch microseconds on macOS; boot clock ticks on Linux.
+    birth: std::num::NonZeroU64,
+}
+
+impl ChildProof {
+    /// A native child target in the host's admitted pid and birth ranges.
+    #[must_use]
+    pub fn new(pid: u32, birth: u64) -> Option<Self> {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return None;
+        }
+        Some(Self {
+            pid: std::num::NonZeroU32::new(pid)?,
+            birth: std::num::NonZeroU64::new(birth)?,
+        })
+    }
+
+    /// The claim target for a fresh kernel observation, refusing invalid or
+    /// overflowing identities instead of substituting a wall-clock start time.
+    #[must_use]
+    pub fn from_identity(identity: &crate::procs::ChildIdentity) -> Option<Self> {
+        let birth = match identity.birth {
+            crate::procs::Birth::MacOs {
+                seconds,
+                microseconds,
+            } => {
+                if microseconds >= 1_000_000 {
+                    return None;
+                }
+                seconds
+                    .checked_mul(1_000_000)?
+                    .checked_add(u64::from(microseconds))?
+            }
+            crate::procs::Birth::Linux(ticks) => ticks,
+        };
+        Self::new(identity.pid, birth)
+    }
+}
+
+/// A contract-3 claim naming its current child, sent only when
+/// [`child_proof_supported`] negotiated the optional field. With no child the
+/// request remains byte-for-byte the original contract-3 claim.
+#[must_use]
+pub fn claim_child_verb(
+    sid: &str,
+    pid: u32,
+    scopes: &[Scope],
+    version: &str,
+    vendor: Option<&str>,
+    child: Option<&ChildProof>,
+) -> Option<String> {
+    let mut verb = claim_verb(sid, pid, scopes, version, vendor)?;
+    if let Some(child) = child {
+        verb.push_str(&format!(" child={}:{}", child.pid, child.birth));
+    }
+    Some(verb)
+}
+
+/// Whether one unambiguous host capability advertises the optional native
+/// child proof. An older, malformed or duplicated capability enables nothing.
+#[must_use]
+pub fn child_proof_supported(info_reply: &str) -> bool {
+    capability(info_reply, "child-proof=")
+}
+
+fn capability(info_reply: &str, key: &str) -> bool {
+    let mut words = info_reply.split_ascii_whitespace();
+    if words.next() != Some("OK") {
+        return false;
+    }
+    let mut advertised = None;
+    for word in words {
+        if let Some(value) = word.strip_prefix(key)
+            && advertised.replace(value).is_some()
+        {
+            return false;
+        }
+    }
+    advertised == Some("1")
+}
+
+/// Whether the host supports a pre-spawn output barrier as well as native child proof.
+#[must_use]
+pub fn child_start_supported(info_reply: &str) -> bool {
+    child_proof_supported(info_reply) && capability(info_reply, "child-start=")
+}
+
+/// Begin a new child lifetime before spawning it. This intentionally names no
+/// child: only a later native child tuple can finish the pending barrier.
+#[must_use]
+pub fn claim_child_start_verb(
+    sid: &str,
+    pid: u32,
+    scopes: &[Scope],
+    version: &str,
+    vendor: Option<&str>,
+    generation: u64,
+) -> Option<String> {
+    if generation == 0 {
+        return None;
+    }
+    let mut verb = claim_verb(sid, pid, scopes, version, vendor)?;
+    verb.push_str(&format!(" child-start={generation}"));
+    Some(verb)
+}
+
+/// Acknowledged pending authority, read back before a claimed fork. Duplicate
+/// barrier fields, a named child or a missing proof never establish the barrier.
+#[must_use]
+pub fn child_start_pending(reply: &str, holder: &str, generation: u64) -> bool {
+    if generation == 0 {
+        return false;
+    }
+    let Ok(status) = Status::parse(reply) else {
+        return false;
+    };
+    let one = |key: &str, expected: &str| {
+        let mut values = reply
+            .split_ascii_whitespace()
+            .filter_map(|word| word.strip_prefix(key));
+        values.next() == Some(expected) && values.next().is_none()
+    };
+    status.held_by(holder)
+        && status.takes(Scope::Relaunch)
+        && status.takes(Scope::Upgrade)
+        && status
+            .supervisor_revision
+            .is_some_and(|revision| revision > 0)
+        && one("supervisor_child_start=", &generation.to_string())
+        && one("supervisor_child=", "-")
+}
+
+/// The host's unique canonical child generation, including a completed bound
+/// child. Zero or an absent/malformed field carries no generation evidence.
+#[must_use]
+pub fn child_generation(reply: &str) -> Option<u64> {
+    let mut values = reply
+        .split_ascii_whitespace()
+        .filter_map(|word| word.strip_prefix("supervisor_child_start="));
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    canonical_u64(value).filter(|value| *value > 0)
+}
+
+/// Finish or renew a particular child generation; old hosts receive the
+/// original child claim unchanged, and no guessed generation is added.
+#[must_use]
+pub fn claim_child_generation_verb(
+    sid: &str,
+    pid: u32,
+    scopes: &[Scope],
+    version: &str,
+    vendor: Option<&str>,
+    child: Option<&ChildProof>,
+    generation: Option<u64>,
+) -> Option<String> {
+    let mut verb = claim_child_verb(sid, pid, scopes, version, vendor, child)?;
+    if let Some(generation) = generation {
+        if generation == 0 {
+            return None;
+        }
+        verb.push_str(&format!(" child-start={generation}"));
+    }
+    Some(verb)
+}
+
+#[cfg(test)]
+#[path = "aterm_start_tests.rs"]
+mod start_tests;
+
 /// The release of process `pid`'s claim on session `sid`:
 /// `@<sid> meta unset supervisor holder=claude-code-alab@<pid>`. Naming the
 /// holder makes it a no-op against anyone else's claim
@@ -869,6 +1048,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_child_proof_is_negotiated_once_and_invalid_capabilities_enable_nothing() {
+        assert!(child_proof_supported(
+            "OK native-act child-proof=1 own-image=claude-code-alab:upgrade"
+        ));
+        for reply in [
+            "OK own-image=claude-code-alab:upgrade",
+            "ERR child-proof=1",
+            "OKAY child-proof=1",
+            "OK child-proof=0",
+            "OK child-proof=01",
+            "OK child-proof=2",
+            "OK child-proof=1 child-proof=1",
+            "OK child-proof=1 child-proof=0",
+        ] {
+            assert!(!child_proof_supported(reply), "{reply}");
+        }
+        let child = ChildProof::new(123, 42_000_005).unwrap();
+        let old = claim_verb(SID, 4242, &[Scope::Upgrade], "0.2.0", Some("2.1.325")).unwrap();
+        assert_eq!(
+            claim_child_verb(SID, 4242, &[Scope::Upgrade], "0.2.0", Some("2.1.325"), None),
+            Some(old.clone())
+        );
+        assert_eq!(
+            claim_child_verb(
+                SID,
+                4242,
+                &[Scope::Upgrade],
+                "0.2.0",
+                Some("2.1.325"),
+                Some(&child)
+            ),
+            Some(format!("{old} child=123:42000005"))
+        );
+        for (pid, birth) in [(1, 1), (u32::MAX, 1), (123, 0)] {
+            assert!(ChildProof::new(pid, birth).is_none());
+        }
+    }
+
+    #[test]
+    fn child_claim_birth_keeps_native_units_and_refuses_overflow() {
+        let identity = |birth| crate::procs::ChildIdentity {
+            pid: 123,
+            parent: 42,
+            pgid: 42,
+            session: 42,
+            birth,
+            executable: crate::procs::Executable {
+                path: "/vendor/claude".into(),
+                device: 1,
+                inode: 2,
+            },
+        };
+        assert_eq!(
+            ChildProof::from_identity(&identity(crate::procs::Birth::MacOs {
+                seconds: 42,
+                microseconds: 5
+            })),
+            Some(ChildProof::new(123, 42_000_005).unwrap())
+        );
+        assert_eq!(
+            ChildProof::from_identity(&identity(crate::procs::Birth::Linux(42))),
+            Some(ChildProof::new(123, 42).unwrap())
+        );
+        for birth in [
+            crate::procs::Birth::MacOs {
+                seconds: u64::MAX,
+                microseconds: 0,
+            },
+            crate::procs::Birth::MacOs {
+                seconds: 42,
+                microseconds: 1_000_000,
+            },
+            crate::procs::Birth::Linux(0),
+        ] {
+            assert_eq!(ChildProof::from_identity(&identity(birth)), None);
+        }
+    }
+
+    #[test]
     fn an_older_policy_without_contracts_admits_no_claim() {
         let older = "OK gen=12 effective=on why=config continue=on land=off questions=on";
         assert_eq!(advertised_contract(older), None);
@@ -922,7 +1180,7 @@ mod tests {
         assert!(!rostered("OK contract=2,3"));
     }
 
-    const SID: &str = "s-4d7a2a97";
+    const SID: &str = "tqn5r6e0148";
     const ME: &str = "claude-code-alab@4242";
 
     /// A reply cut from a running aterm (2026-11-12), text keys shortened.
@@ -1191,7 +1449,7 @@ mod tests {
         assert_eq!(
             claim_verb(SID, 4242, &[Scope::Upgrade], "0.1.0", Some("2.1.311")).as_deref(),
             Some(
-                "@s-4d7a2a97 meta set supervisor claude-code-alab@4242 contract=3 scope=upgrade \
+                "@tqn5r6e0148 meta set supervisor claude-code-alab@4242 contract=3 scope=upgrade \
                  version=0.1.0 vendor=2.1.311"
             )
         );
@@ -1206,7 +1464,7 @@ mod tests {
             )
             .as_deref(),
             Some(
-                "@s-4d7a2a97 meta set supervisor claude-code-alab@4242 contract=3 \
+                "@tqn5r6e0148 meta set supervisor claude-code-alab@4242 contract=3 \
                  scope=relaunch,upgrade version=0.1.0+g1a2b3c4"
             )
         );
@@ -1215,7 +1473,7 @@ mod tests {
             assert_eq!(
                 claim_verb(SID, 4242, &[Scope::Upgrade], "0.1.0", Some(vendor)).as_deref(),
                 Some(
-                    "@s-4d7a2a97 meta set supervisor claude-code-alab@4242 contract=3 \
+                    "@tqn5r6e0148 meta set supervisor claude-code-alab@4242 contract=3 \
                      scope=upgrade version=0.1.0"
                 ),
                 "{vendor:?}"
@@ -1309,16 +1567,16 @@ mod tests {
     fn the_release_and_the_reads_are_addressed_to_the_session() {
         assert_eq!(
             release_verb(SID, 4242).as_deref(),
-            Some("@s-4d7a2a97 meta unset supervisor holder=claude-code-alab@4242")
+            Some("@tqn5r6e0148 meta unset supervisor holder=claude-code-alab@4242")
         );
         assert_eq!(
             policy_verb(SID).as_deref(),
-            Some("@s-4d7a2a97 harness policy")
+            Some("@tqn5r6e0148 harness policy")
         );
-        assert_eq!(status_verb(SID).as_deref(), Some("@s-4d7a2a97 status"));
+        assert_eq!(status_verb(SID).as_deref(), Some("@tqn5r6e0148 status"));
         assert_eq!(
             info_verb(SID).as_deref(),
-            Some("@s-4d7a2a97 native-act info")
+            Some("@tqn5r6e0148 native-act info")
         );
     }
 

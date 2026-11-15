@@ -189,6 +189,7 @@ mod tests {
                 build,
                 args: Vec::new(),
                 identity: Some(child()),
+                identity_pending: false,
                 tracker: quiet::Tracker::new(1, opts.poll_ms, opts.quiet_ms),
                 spawned_ms: 1,
                 stopped: false,
@@ -203,6 +204,7 @@ mod tests {
             link: supervise::link::Link::Absent,
             ladder: crate::relaunch::Ladder::new(),
             restart_deferred: None,
+            facts: crate::model_facts::Reader::default(),
         }
     }
     fn runtime(outcome: CommitOutcome) -> (Runtime, Rc<RefCell<Record>>) {

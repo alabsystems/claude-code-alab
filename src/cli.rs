@@ -4,19 +4,20 @@
 //! The command line: the harness's own options, `--version`, and the hand-off
 //! to [`crate::supervise`].
 //!
-//! Every argument goes to the vendor unchanged, except:
+//! Direct launches pass arguments through; managed launches apply [`crate::launch`].
+//! The parser consumes:
 //! * leading `--alab-<name>[=<value>]` words, which are the harness's own and
 //!   are consumed (Claude Code has no `--alab-` flag; an unknown one is refused,
 //!   never passed on);
-//! * `run --` as the first two words after them ([`ENTRY_WORD`]), the envelope
-//!   atpkg's `agents/` twin hands a launch over in: both words are consumed and
-//!   every word after them is the vendor's, whatever it is;
+//! * `run --` or `launch --` as the first two words after them: managed
+//!   permission, bypass, update and usage policy is applied. `launch --`
+//!   always execs the vendor in place, leaving live duties to the host;
 //! * a lone `--version` or `-v` outside that envelope, which prints
 //!   `claude-code-alab <version> (claude <vendor version>)` from the store's
 //!   records, never by running the vendor.
 //!
 //! Two kinds of launch run the vendor alone, exec'd in the harness's place
-//! ([`pass_through`]: the same pid, nothing supervised, not a word to aterm):
+//! ([`pass_through`]: the same pid, no supervision claim):
 //! * inside aterm, `ATERM_NO_HARNESS=1` leaves the harness out ([`left_out`]);
 //! * a launch the harness could never move onto another build
 //!   ([`crate::supervise::live_update_refusal`]: `--alab-no-live-update`, no
@@ -117,6 +118,49 @@ pub const EXIT_VENDOR_MISSING: i32 = 127;
 /// Exit status for a harness usage error.
 pub const EXIT_USAGE: i32 = 2;
 
+/// Vendor command words this build is qualified to lead through its managed
+/// entry. The package manifest must describe this same source declaration.
+/// Native qualification is still in progress, so no word is led yet.
+pub const LEADING_WORDS: &[&str] = &[];
+
+/// Vendor words whose launch policy this build owns before execing the vendor
+/// in place. This grants no lifecycle or terminal supervision capability.
+pub const LAUNCH_WORDS: &[&str] = &[COMMAND];
+
+/// A metadata-only capability request. It must be the complete command line;
+/// unsupported words and malformed requests refuse without opening any state.
+fn capability_query(words: &[OsString]) -> Option<i32> {
+    let first = words.first()?;
+    for (query, supported) in [
+        ("--alab-leads", LEADING_WORDS),
+        ("--alab-launches", LAUNCH_WORDS),
+        ("--alab-primes", crate::prime::CAPABILITIES),
+        ("--alab-inspects", crate::inspect::CAPABILITIES),
+    ] {
+        let bytes = first.as_encoded_bytes();
+        if bytes != query.as_bytes()
+            && !bytes
+                .strip_prefix(query.as_bytes())
+                .is_some_and(|suffix| suffix.starts_with(b"="))
+        {
+            continue;
+        }
+        return Some(
+            if words.len() == 1
+                && first
+                    .to_str()
+                    .and_then(|first| first.strip_prefix(query)?.strip_prefix('='))
+                    .is_some_and(|word| supported.contains(&word))
+            {
+                0
+            } else {
+                1
+            },
+        );
+    }
+    None
+}
+
 /// The variable a harness sets in its vendor child's environment to its own pid.
 /// A harness that finds it naming its own parent was started *as the vendor* by
 /// a harness (the store's binary is a copy of this harness, which the
@@ -177,6 +221,10 @@ pub fn nesting_depth(inherited: Option<&OsStr>) -> Result<u32, String> {
 /// arguments>` (aterm `crates/atpkg/src/platform/mod.rs`, `sh_harness_prelude`),
 /// as it does for the sibling harnesses.
 pub const ENTRY_WORD: &str = "run";
+
+/// Managed launch preparation followed by same-PID vendor exec, without a
+/// supervisor, claim, signal handler or terminal-mode change.
+pub const LAUNCH_ENTRY_WORD: &str = "launch";
 
 /// The variable that leaves the harness out of a launch: the twin sets it to
 /// `1` for `--no-harness` and `--no-alab-harness` and then runs the vendor
@@ -282,10 +330,14 @@ pub fn usage() -> String {
          \n\
          usage: {TOOL} [--alab-<option>…] [{COMMAND} arguments…]\n\
          \x20      {TOOL} [--alab-<option>…] {ENTRY_WORD} -- [{COMMAND} arguments…]\n\
+         \x20      {TOOL} [--alab-<option>…] {LAUNCH_ENTRY_WORD} -- [{COMMAND} arguments…]\n\
+         \x20      {TOOL} prime <settings-defaults|legacy-hooks> --home <absolute-path> --config <absolute-path>\n\
+         \x20      {TOOL} inspect settings-defaults --home <absolute-path> --config <absolute-path> --auto-prime=0|1\n\
          \n\
-         Every argument after the leading --alab- options goes to `{COMMAND}` unchanged.\n\
-         `{ENTRY_WORD} --` is how atpkg's `{COMMAND}` hands a launch over: both words are\n\
-         dropped and every word after them goes to `{COMMAND}`.\n\
+         Direct launches pass arguments after the leading --alab- options to `{COMMAND}`.\n\
+         `{ENTRY_WORD} --` and `{LAUNCH_ENTRY_WORD} --` apply managed permission, usage and update\n\
+         defaults. `{LAUNCH_ENTRY_WORD} --` then execs `{COMMAND}` in place, without supervision.\n\
+         --no-harness skips supervision, usage and account helpers; --yolo selects bypass.\n\
          `{TOOL} --version` prints this harness's version and the vendor's.\n\
          \n\
          harness options:\n\
@@ -309,9 +361,10 @@ pub fn usage() -> String {
 /// Parse the arguments after `argv[0]`.
 ///
 /// The harness's own words lead: `--alab-` options, then, optionally, atpkg's
-/// envelope `run --` ([`ENTRY_WORD`]). After the envelope nothing is the
+/// envelope `run --` or `launch --`. The latter always execs the vendor in
+/// place. After either envelope nothing is the
 /// harness's: an `--alab-` word and a lone `--version` there are the vendor's.
-/// `run` with any other word after it, or none, is not the envelope and goes to
+/// Either entry word with any other word after it, or none, is not the envelope and goes to
 /// the vendor like every other first vendor word (docs/DECISIONS.md, 37).
 ///
 /// # Errors
@@ -347,7 +400,10 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         rest.next();
     }
     let mut args: Vec<OsString> = rest.collect();
-    if args.len() >= 2 && args[0] == ENTRY_WORD && args[1] == "--" {
+    if crate::launch::managed(&args) {
+        if args[0] == LAUNCH_ENTRY_WORD {
+            live_update = false;
+        }
         args.drain(..2);
     } else if args.len() == 1 && (args[0] == "--version" || args[0] == "-v") {
         return Ok(Command::Version);
@@ -396,8 +452,9 @@ pub const LEFT_OUT_REASON: &str = "no-harness";
 /// environment and the harness's forced variables apply as on a supervised
 /// start. [`PARENT_VAR`] is removed, since the vendor is not this harness's
 /// child, and [`DEPTH_VAR`] still counts, so a store entry that leads back to
-/// this harness stops at [`MAX_DEPTH`]. Nothing is said to aterm, and no signal
-/// handling is installed. Returns only by exiting: 127 when the vendor cannot
+/// this harness stops at [`MAX_DEPTH`]. No supervision claim or signal handling
+/// is installed. Managed launches can still use the host's account service,
+/// unless `reason` is [`LEFT_OUT_REASON`]. Returns only by exiting: 127 when the vendor cannot
 /// be run.
 fn pass_through(
     home: &std::path::Path,
@@ -419,13 +476,18 @@ fn pass_through(
         build.number,
         build.version.as_deref().unwrap_or("-")
     ));
-    let mut command = std::process::Command::new(&build.exe);
+    let policy = reason != LEFT_OUT_REASON && !crate::launch::informational(args);
+    let mut command = crate::launch::vendor_command(&build.exe, args, policy);
     command
-        .args(args)
         .envs(build.env.iter().map(|(k, v)| (k, v)))
         .envs(crate::profile::HARNESS_ENV.iter().copied())
         .env_remove(PARENT_VAR)
         .env(DEPTH_VAR, depth.saturating_add(1).to_string());
+    if policy {
+        crate::launch::renderer(&mut command);
+    } else if reason == LEFT_OUT_REASON {
+        command.env(NO_HARNESS_VAR, "1");
+    }
     let error = command.exec();
     say(&format!(
         "{TOOL}: cannot run {}: {error}",
@@ -437,15 +499,26 @@ fn pass_through(
 
 /// The program: parse, resolve the vendor from the store, then run it alone
 /// ([`pass_through`]) or supervise it.
-pub fn main() -> ! {
+/// # Errors
+/// Launch preparation retains unsettled native resources. Only the actual executable
+/// may terminate while holding this error; it supplies no child-end witness.
+pub fn main() -> Result<std::convert::Infallible, crate::sys::ProbeSpawnRefusal> {
     main_with_image_host(crate::supervise::image::default_host)
 }
 
 /// Run the CLI with one explicit authority factory for fresh starts and inherited
 /// image transfers. The caller selects the factory in Rust before any threads or
 /// signal handlers start; command-line arguments and environment cannot select it.
+/// # Errors
+/// As [`main`], retained native launch preparation cannot be settled safely.
 #[doc(hidden)]
-pub fn main_with_image_host(factory: crate::supervise::image::HostFactory) -> ! {
+pub fn main_with_image_host(
+    factory: crate::supervise::image::HostFactory,
+) -> Result<std::convert::Infallible, crate::sys::ProbeSpawnRefusal> {
+    let words: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(status) = capability_query(&words) {
+        std::process::exit(status);
+    }
     crate::supervise::image::early_entry(factory);
     if started_as_vendor(
         std::env::var_os(PARENT_VAR).as_deref(),
@@ -470,7 +543,42 @@ pub fn main_with_image_host(factory: crate::supervise::image::HostFactory) -> ! 
             std::process::exit(EXIT_VENDOR_MISSING);
         }
     };
-    let command = match parse(std::env::args_os().skip(1).collect()) {
+    if let Some(result) = crate::prime::entry(&words) {
+        match result.and_then(|effect| crate::prime::response(&effect)) {
+            Ok(row) => {
+                put(&row);
+                std::process::exit(0);
+            }
+            Err(error) => {
+                say(&format!("{TOOL}: priming unavailable: {error}"));
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
+    if let Some(result) = crate::inspect::entry(&words) {
+        match result.and_then(|report| report.response()) {
+            Ok(document) => {
+                let written = {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(document.as_bytes())
+                        .and_then(|()| out.flush())
+                };
+                if let Err(error) = written {
+                    say(&format!(
+                        "{TOOL}: cannot write inspection response: {error}"
+                    ));
+                    std::process::exit(EXIT_USAGE);
+                }
+                std::process::exit(0);
+            }
+            Err(error) => {
+                say(&format!("{TOOL}: inspection unavailable: {error}"));
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
+    let managed = crate::launch::managed(&words);
+    let command = match parse(words) {
         Ok(c) => c,
         Err(why) => {
             say(&format!("{TOOL}: {why}\n\n{}", usage()));
@@ -501,6 +609,34 @@ pub fn main_with_image_host(factory: crate::supervise::image::HostFactory) -> ! 
             args,
         } => (opts, live_update, args),
     };
+    let (mut args, disabled) = if managed {
+        crate::launch::switches(args)
+    } else {
+        (args, false)
+    };
+    let disabled = disabled
+        || left_out(
+            std::env::var_os(NO_HARNESS_VAR).as_deref(),
+            crate::supervise::image::hosted_by_aterm(),
+        );
+    let informational = crate::launch::informational(&args);
+    if managed && !informational {
+        let update = match crate::launch::self_update(&args) {
+            Ok(update) => update,
+            Err(why) => {
+                say(&format!("{TOOL}: {why}"));
+                journal_refusal(&format!("self-update {why}"));
+                std::process::exit(EXIT_USAGE);
+            }
+        };
+        if let Some(mut update) = update {
+            use std::os::unix::process::CommandExt as _;
+            let error = update.exec();
+            say(&format!("{TOOL}: cannot update claude: {error}"));
+            std::process::exit(EXIT_VENDOR_MISSING);
+        }
+        args = crate::launch::permission_args(args);
+    }
     let home = store::home_dir(std::env::var_os("HOME"));
     let own_exe = std::env::current_exe().ok();
     let Some(home) = home else {
@@ -520,11 +656,11 @@ pub fn main_with_image_host(factory: crate::supervise::image::HostFactory) -> ! 
             std::process::exit(EXIT_VENDOR_MISSING);
         }
     };
-    if left_out(
-        std::env::var_os(NO_HARNESS_VAR).as_deref(),
-        crate::supervise::image::hosted_by_aterm(),
-    ) {
+    if disabled {
         pass_through(&home, &build, &args, depth, LEFT_OUT_REASON);
+    }
+    if managed && !informational {
+        crate::launch::usage_tap(&mut args)?;
     }
     // Decided once, here: before a word to aterm and before any signal handling
     // exists, so the vendor starts in this process as a shell would start it.
@@ -580,6 +716,63 @@ mod tests {
         let args = ["--model", "opus", "--alab-no-live-update", "-p", "hi"];
         assert_eq!(parse(os(&args)), run(Options::default(), &args));
         assert_eq!(parse(Vec::new()), run(Options::default(), &[]));
+    }
+
+    #[test]
+    fn launch_envelope_prepares_but_never_supervises_the_vendor() {
+        for vendor in [
+            &[][..],
+            &["--model", "opus", "a task"],
+            &["--version"],
+            &["--alab-no-live-update", "run", "--", ""],
+        ] {
+            let mut args = vec!["launch", "--"];
+            args.extend_from_slice(vendor);
+            assert_eq!(parse(os(&args)), never_moved(Options::default(), vendor));
+        }
+        assert_eq!(
+            parse(os(&["--alab-poll-ms=50", "launch", "--", "task"])),
+            never_moved(
+                Options {
+                    poll_ms: 50,
+                    ..Options::default()
+                },
+                &["task"]
+            )
+        );
+        for words in [
+            &["launch"][..],
+            &["launch", "a task"],
+            &["--", "launch", "--"],
+        ] {
+            assert_eq!(parse(os(words)), run(Options::default(), words));
+        }
+    }
+
+    #[test]
+    fn launch_capability_grants_no_leading_word_and_requires_exact_metadata_argv() {
+        for (words, status) in [
+            (&["--alab-launches=claude"][..], 0),
+            (&["--alab-primes=claude:settings-defaults"][..], 0),
+            (&["--alab-primes=claude:legacy-hooks"][..], 0),
+            (&["--alab-primes=muse:legacy-hooks"][..], 1),
+            (&["--alab-primes=claude"][..], 1),
+            (&["--alab-primes=muse:settings-defaults"][..], 1),
+            (&["--alab-primes=claude:settings-defaults", "prime"][..], 1),
+            (&["--alab-leads=claude"][..], 1),
+            (&["--alab-launches=muse"][..], 1),
+            (&["--alab-launches=unknown"][..], 1),
+            (&["--alab-launches="][..], 1),
+            (&["--alab-launches"][..], 1),
+            (&["--alab-launches=claude", "launch", "--"][..], 1),
+        ] {
+            assert_eq!(capability_query(&os(words)), Some(status));
+        }
+        use std::os::unix::ffi::OsStringExt as _;
+        assert_eq!(
+            capability_query(&[OsString::from_vec(b"--alab-launches=\xff".to_vec())]),
+            Some(1)
+        );
     }
 
     #[test]

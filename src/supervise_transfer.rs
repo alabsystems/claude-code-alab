@@ -12,6 +12,7 @@
 use super::{Abandoned, Child, Ending, MAX_ABANDONED, Setup, Supervisor};
 use crate::cli::{self, Options};
 use crate::journal::Journal;
+use crate::model_facts;
 use crate::procs::{
     self, Birth, ChildIdentity, ChildObservation, ChildState, Executable, ProcessIdentity,
 };
@@ -29,8 +30,10 @@ use std::path::{Component, Path, PathBuf};
 /// The payload layout. 2: `abandoned` is a bounded ascending list of build
 /// numbers, where 1 carried one optional build. 3: the two flags that said
 /// whether the session could be moved are gone, because a supervisor exists
-/// only for one that can ([`super::live_update_refusal`]).
-pub(super) const SCHEMA: u32 = 3;
+/// only for one that can ([`super::live_update_refusal`]). 4: the model
+/// reader travels ([`crate::model_facts::Reader::put`]), so the new image goes
+/// on reading the child's transcript where the old one stopped.
+pub(super) const SCHEMA: u32 = 4;
 const MAX_PATH: usize = 16 * 1024;
 const MAX_ARG: usize = 128 * 1024;
 const MAX_ARGS: usize = 4096;
@@ -69,6 +72,7 @@ pub(super) struct Saved {
     abandoned: Abandoned,
     background_hold_until: u64,
     background_found: String,
+    facts: model_facts::Reader,
 }
 
 /// The same child may have stopped or ended during exec. Unreaped is only
@@ -324,6 +328,13 @@ fn validate_saved(saved: &Saved) -> io::Result<()> {
     child_shape(&saved.child_identity, &saved.process, saved.child_pid)?;
     build_shape(&saved.child_build, &saved.setup.store)?;
     argv(&saved.child_args)?;
+    if saved
+        .facts
+        .pid()
+        .is_some_and(|pid| i64::from(pid) != i64::from(saved.child_pid))
+    {
+        return Err(invalid("the model reader follows another child"));
+    }
     if saved.stopped || saved.ending != 0 {
         return Err(invalid(
             "only a live unstopped child with no ending can enter transfer",
@@ -391,6 +402,7 @@ fn capture_budget(supervisor: &Supervisor) -> io::Result<()> {
     }
     add(supervisor.noted.len())?;
     add(supervisor.background_found.len())?;
+    add(model_facts::Reader::TRANSFER_BOUND)?;
     Ok(())
 }
 
@@ -457,6 +469,17 @@ pub(super) fn encode(supervisor: &Supervisor, signals: &SignalSnapshot) -> io::R
         abandoned: supervisor.abandoned.clone(),
         background_hold_until: supervisor.background_hold_until,
         background_found: supervisor.background_found.clone(),
+        // A reader still on an earlier child (no look since a relaunch) would
+        // start from nothing at its next look: it crosses as that.
+        facts: if supervisor
+            .facts
+            .pid()
+            .is_none_or(|pid| i64::from(pid) == i64::from(supervisor.child.pid))
+        {
+            supervisor.facts.clone()
+        } else {
+            model_facts::Reader::default()
+        },
     };
     encode_saved(&saved)
 }
@@ -812,6 +835,7 @@ fn encode_fields(saved: &Saved) -> io::Result<Vec<u8>> {
     put_abandoned(&mut encoder, &saved.abandoned)?;
     encoder.u64(saved.background_hold_until)?;
     put_text(&mut encoder, &saved.background_found)?;
+    saved.facts.put(&mut encoder)?;
     Ok(encoder.finish())
 }
 
@@ -846,6 +870,7 @@ pub(super) fn decode(payload: &[u8]) -> io::Result<Saved> {
         abandoned: get_abandoned(&mut decoder)?,
         background_hold_until: decoder.u64()?,
         background_found: get_text(&mut decoder, MAX_TEXT)?,
+        facts: model_facts::Reader::get(&mut decoder)?,
     };
     decoder.finish()?;
     validate_saved(&saved)?;
@@ -964,6 +989,7 @@ impl Saved {
                     build: self.child_build,
                     args: self.child_args,
                     identity: Some(self.child_identity),
+                    identity_pending: false,
                     tracker,
                     spawned_ms: self.spawned_ms,
                     stopped: child_state == ChildState::Stopped,
@@ -982,6 +1008,8 @@ impl Saved {
                 // with neither pending, and the back-off starts over.
                 ladder: crate::relaunch::Ladder::new(),
                 restart_deferred: None,
+                // The model reader goes on where the old image's stopped.
+                facts: self.facts,
             },
         })
     }
@@ -1105,7 +1133,40 @@ mod tests {
             abandoned: Abandoned::from_ascending(&[55, 77]).unwrap(),
             background_hold_until: 5000,
             background_found: "background-work shell".into(),
+            facts: model_facts::Reader::default(),
         }
+    }
+
+    /// A model reader that has read child `pid`'s transcript once: a
+    /// conversation, its floor, a carried read and stated facts.
+    fn reader_of(pid: u32) -> model_facts::Reader {
+        const SID: &str = "7c1e2a90-4b3d-4e5f-8a9b-0c1d2e3f4a5b";
+        let root = std::env::temp_dir().join(".ubd").join(format!(
+            "transfer-facts-{}-{pid}.noindex",
+            std::process::id()
+        ));
+        let project = root.join("projects").join("-work");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(format!("{SID}.jsonl")),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-11-13T10:00:10.000Z\",\"effort\":\"high\",\"message\":{\"model\":\"claude-opus-5-5\"}}\n",
+        )
+        .unwrap();
+        let mut reader = model_facts::Reader::default();
+        let process = model_facts::Process {
+            pid,
+            record: Some((SID, 1_794_563_200_000)),
+            args: &[],
+        };
+        let line = reader
+            .look(&root, &process, 1_794_563_220_000)
+            .map(str::to_owned);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            line.as_deref(),
+            Some("facts model=Opus_5.5 effort=high key=-")
+        );
+        reader
     }
 
     fn header(saved: &Saved) -> Header {
@@ -1168,6 +1229,36 @@ mod tests {
         );
         assert_eq!(saved.termios, original.termios);
         assert_eq!(saved.signals, original.signals);
+    }
+
+    /// The model reader crosses whole (the new image goes on where the old
+    /// one stopped, never reading the child's transcript afresh from its
+    /// start), and only one that follows this child restores. CONTROL: the
+    /// fixture's unread reader crosses as itself.
+    #[test]
+    fn the_model_reader_crosses_and_must_follow_the_child() {
+        let mut saved = fixture();
+        let child = u32::try_from(saved.child_pid).unwrap();
+        let unread = decode(&encode_saved(&saved).unwrap()).unwrap();
+        assert_eq!(
+            (unread.facts.pid(), unread.facts.facts()),
+            (None, &model_facts::ModelFacts::default())
+        );
+        saved.facts = reader_of(child);
+        let payload = encode_saved(&saved).unwrap();
+        let restored = decode(&payload).unwrap();
+        assert_eq!(encode_saved(&restored).unwrap(), payload);
+        assert_eq!(restored.facts.pid(), Some(child));
+        assert_eq!(restored.facts.facts(), saved.facts.facts());
+        assert_eq!(
+            restored.facts.facts().journal_line(),
+            "facts model=Opus_5.5 effort=high key=-"
+        );
+        saved.facts = reader_of(child + 1);
+        assert!(
+            encode_saved(&saved).is_err(),
+            "a reader of another child is refused"
+        );
     }
 
     #[test]

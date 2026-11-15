@@ -87,6 +87,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cli::{EXIT_VENDOR_MISSING, Options, say};
 use crate::journal::Journal;
+use crate::model_facts;
+use crate::procs;
 use crate::profile::{self, COMMAND, SessionRecord, TOOL};
 use crate::quiet::{Look, Tracker, Wait};
 use crate::relaunch::{EXIT_SETTLE, Ladder, abnormal_exit};
@@ -367,6 +369,8 @@ struct Child {
     args: Vec<OsString>,
     /// Missing identity forbids a future image transfer, never ordinary child supervision.
     identity: Option<crate::procs::ChildIdentity>,
+    /// A launch helper still has to exec the exact expected vendor image.
+    identity_pending: bool,
     tracker: Tracker,
     spawned_ms: u64,
     stopped: bool,
@@ -605,6 +609,11 @@ struct Supervisor {
     /// record, or for an own-image move to end); the latest request replaces
     /// an earlier one. While it waits no own-image move is started.
     restart_deferred: Option<Deferred>,
+    /// The model, effort level and top-effort key the child states in its
+    /// transcript, read on each look ([`Supervisor::read_facts`]). An
+    /// own-image move carries it, so the new image goes on reading where this
+    /// one stopped.
+    facts: model_facts::Reader,
 }
 
 /// Run the vendor under supervision; never returns.
@@ -643,6 +652,7 @@ pub fn run_with_image_host(setup: &Setup, factory: image::HostFactory) -> ! {
     // The claim is made, or given up for the session, before the first child
     // exists: aterm never sees an unclaimed child of a harness that will claim.
     let mut link = link::Link::launch(&journal, setup.build.version.as_deref());
+    link.before_spawn(&journal, setup.build.version.as_deref());
     // The claim sequence can take seconds, and a signal caught meanwhile is
     // nobody's but the harness's: no child exists to have it, and one started
     // now would never see it. One that ends a session ends this one before it
@@ -688,7 +698,14 @@ pub fn run_with_image_host(setup: &Setup, factory: image::HostFactory) -> ! {
         link,
         ladder: Ladder::new(),
         restart_deferred: None,
+        facts: model_facts::Reader::default(),
     };
+    // An older host gets the original v3 launch unchanged. A host that can
+    // prove a separate vendor child receives its native identity immediately
+    // after spawn, before any built-in typing duty can use that child.
+    if matches!(&sup.link, link::Link::Held(claimed) if claimed.wants_initial_child()) {
+        sup.link_reannounce();
+    }
     sup.run(&mut pipe, tstp)
 }
 
@@ -705,12 +722,13 @@ fn session_ending(signals: &[libc::c_int]) -> Option<libc::c_int> {
 
 fn spawn(build: &Build, args: &[OsString], opts: &Options, depth: u32) -> std::io::Result<Child> {
     let spawned_ms = now_ms();
-    let proc = std::process::Command::new(&build.exe)
-        .args(args)
+    let mut command = crate::launch::vendor_command(&build.exe, args, true);
+    command
         .envs(build.env.iter().map(|(k, v)| (k, v)))
         .envs(crate::profile::HARNESS_ENV.iter().copied())
-        .envs(crate::cli::child_marks(depth))
-        .spawn()?;
+        .envs(crate::cli::child_marks(depth));
+    crate::launch::renderer(&mut command);
+    let proc = command.spawn()?;
     launched(proc, build, args, opts, spawned_ms)
 }
 
@@ -726,11 +744,20 @@ fn launched(
         .map_err(|_| std::io::Error::other("child pid out of range"))?;
     // The child is reaped with `waitpid` (which also reports stops), never through `proc`.
     drop(proc);
+    let identity = crate::procs::capture_child(child_pid);
+    let identity_pending = identity.as_ref().is_some_and(|identity| {
+        use std::os::unix::fs::MetadataExt as _;
+        !std::fs::metadata(&build.exe).is_ok_and(|expected| {
+            expected.dev() == identity.executable.device
+                && expected.ino() == identity.executable.inode
+        })
+    });
     Ok(Child {
         pid,
         build: build.clone(),
         args: args.to_vec(),
-        identity: crate::procs::capture_child(child_pid),
+        identity,
+        identity_pending,
         tracker: Tracker::new(spawned_ms, opts.poll_ms, opts.quiet_ms),
         spawned_ms,
         stopped: false,
@@ -738,6 +765,26 @@ fn launched(
 }
 
 impl Supervisor {
+    /// A token-route helper may exec the vendor after spawn returned. Pin
+    /// that image only within the original child's exact kernel lifetime;
+    /// own-image transfer keeps its existing immutable image witness thereafter.
+    fn refresh_vendor_identity(&mut self) {
+        if !self.child.identity_pending {
+            return;
+        }
+        let Some(expected) = self.child.identity.as_ref() else {
+            return;
+        };
+        if let Some(fresh) = crate::procs::refresh_child_image(expected, &self.child.build.exe) {
+            self.journal.note(&format!(
+                "vendor-image-pinned pid={} device={} inode={}",
+                fresh.pid, fresh.executable.device, fresh.executable.inode
+            ));
+            self.child.identity = Some(fresh);
+            self.child.identity_pending = false;
+        }
+    }
+
     /// The supervisor's loop: wait for a signal, an event from aterm or the
     /// next look; act on the signals; reap the child; then make the look. It
     /// ends only by ending the process. `early_tstp` is a TSTP caught before
@@ -796,6 +843,9 @@ impl Supervisor {
             let due = now_ms() >= next_look;
             if due {
                 next_look = now_ms().saturating_add(poll);
+                if !self.no_child() && !self.image.blocks_vendor_move() {
+                    self.refresh_vendor_identity();
+                }
                 let mut image = std::mem::take(&mut self.image);
                 image.tick(self, pipe);
                 self.image = image;
@@ -877,8 +927,20 @@ impl Supervisor {
         }
         self.journal.note("stopped following the child");
         sys::stop_self();
-        let _ = self.signal_child(libc::SIGCONT);
-        self.child.stopped = false;
+        // A shell's fg continues the whole group. Consume that native event
+        // before deciding whether a harness-only CONT must wake the child.
+        self.reap();
+        if self.child.stopped
+            && self
+                .child
+                .identity
+                .as_ref()
+                .and_then(procs::observe_child)
+                .is_none_or(|seen| seen.state == procs::ChildState::Stopped)
+        {
+            let _ = self.signal_child(libc::SIGCONT);
+            self.child.stopped = false;
+        }
         if let Ending::ForUpdate { sent, .. } | Ending::ForRestart { sent, .. } = &mut self.ending {
             *sent = Instant::now();
         }
@@ -1423,7 +1485,16 @@ impl Supervisor {
         }
     }
 
-    fn start_launch(&self, plan: &vendor::Plan, launch: &vendor::Launch) -> std::io::Result<Child> {
+    fn start_launch(
+        &mut self,
+        plan: &vendor::Plan,
+        launch: &vendor::Launch,
+    ) -> std::io::Result<Child> {
+        plan.revalidate_for(launch)?;
+        // All callers arrive after the prior child's wait event was consumed.
+        // The server also refuses a begin while its named old child is alive.
+        self.link
+            .before_spawn(&self.journal, launch.build.version.as_deref());
         plan.revalidate_for(launch)?;
         let spawned_ms = now_ms();
         let proc = launch.command().spawn()?;
@@ -1608,9 +1679,11 @@ impl Supervisor {
         }
         let now = now_ms();
         let record = self.record();
-        if record.is_some()
-            || !self.terminal_is_original()
-            || now.saturating_sub(self.child.spawned_ms) > STARTUP_GRACE_MS
+        self.read_facts(record.as_ref(), now);
+        if self.moved.is_some()
+            && (record.is_some()
+                || !self.terminal_is_original()
+                || now.saturating_sub(self.child.spawned_ms) > STARTUP_GRACE_MS)
         {
             self.moved = None;
         }
@@ -1627,37 +1700,6 @@ impl Supervisor {
         };
         if current == self.child.build.number {
             return;
-        }
-        let target = match self.setup.store.current(self.setup.own_exe.as_deref()) {
-            Ok(b) if b.number != self.child.build.number => b,
-            Ok(_) => return,
-            Err(missing) => {
-                self.note_wait(&format!("update-unusable {missing}"));
-                return;
-            }
-        };
-        match self.abandoned.refusal(target.number) {
-            Some(AbandonedRefusal::Build) => {
-                self.note_wait(&format!("wait abandoned build={}", target.number));
-                return;
-            }
-            Some(AbandonedRefusal::Full) => {
-                self.note_wait(&format!(
-                    "wait abandoned-limit build={} is not tried: {MAX_ABANDONED} abandoned builds are remembered and none is forgotten",
-                    target.number
-                ));
-                return;
-            }
-            None => {}
-        }
-        if self.seen_target != Some(target.number) {
-            self.seen_target = Some(target.number);
-            self.journal.note(&format!(
-                "update-seen build={} version={} running-build={}",
-                target.number,
-                target.version.as_deref().unwrap_or("-"),
-                self.child.build.number
-            ));
         }
         // aterm's last safe-point answer was a hold and the link was lost
         // since: nothing moves on the harness's own readings over it before
@@ -1695,6 +1737,43 @@ impl Supervisor {
             self.note_wait(&format!("wait {}", Wait::NoRecord.word()));
             return;
         };
+        // Keep the record/input history above even with no pending update:
+        // losing the aterm claim must not forget whether a turn was submitted
+        // over an unsent draft. A target's ready/provenance/environment files
+        // and executable need no reads while these cheaper gates already hold.
+        // Read them fresh here, with the final current/record/input recheck
+        // below still immediately ahead of SIGTERM.
+        let target = match self.setup.store.current(self.setup.own_exe.as_deref()) {
+            Ok(b) if b.number != self.child.build.number => b,
+            Ok(_) => return,
+            Err(missing) => {
+                self.note_wait(&format!("update-unusable {missing}"));
+                return;
+            }
+        };
+        match self.abandoned.refusal(target.number) {
+            Some(AbandonedRefusal::Build) => {
+                self.note_wait(&format!("wait abandoned build={}", target.number));
+                return;
+            }
+            Some(AbandonedRefusal::Full) => {
+                self.note_wait(&format!(
+                    "wait abandoned-limit build={} is not tried: {MAX_ABANDONED} abandoned builds are remembered and none is forgotten",
+                    target.number
+                ));
+                return;
+            }
+            None => {}
+        }
+        if self.seen_target != Some(target.number) {
+            self.seen_target = Some(target.number);
+            self.journal.note(&format!(
+                "update-seen build={} version={} running-build={}",
+                target.number,
+                target.version.as_deref().unwrap_or("-"),
+                self.child.build.number
+            ));
+        }
         let resume = match self.resume_plan(&record) {
             Ok(resume) => resume,
             Err(why) => {
@@ -1920,6 +1999,24 @@ impl Supervisor {
         }
     }
 
+    /// Follow the model, effort level and top-effort key the child states in
+    /// its transcript ([`model_facts::Reader::look`]), and journal them when
+    /// they change (`facts model=… effort=… key=…`). Until the stream's
+    /// `model` record exists the journal is their only output.
+    fn read_facts(&mut self, record: Option<&SessionRecord>, now: u64) {
+        let Ok(pid) = u32::try_from(self.child.pid) else {
+            return;
+        };
+        let process = model_facts::Process {
+            pid,
+            record: record.map(|r| (r.session_id.as_str(), r.started_at_ms)),
+            args: &self.child.args,
+        };
+        if let Some(line) = self.facts.look(&self.config, &process, now) {
+            self.journal.note(line);
+        }
+    }
+
     /// The child's own record, when it is this child's (pid, start, kind).
     fn record(&self) -> Option<SessionRecord> {
         let pid = u32::try_from(self.child.pid).ok()?;
@@ -2108,6 +2205,7 @@ mod tests {
                 build,
                 args: Vec::new(),
                 identity: None,
+                identity_pending: false,
                 tracker: Tracker::new(1, opts.poll_ms, opts.quiet_ms),
                 spawned_ms: 1,
                 stopped: false,
@@ -2122,6 +2220,7 @@ mod tests {
             link: link::Link::Absent,
             ladder: Ladder::new(),
             restart_deferred: None,
+            facts: model_facts::Reader::default(),
         }
     }
 
@@ -2442,11 +2541,13 @@ mod tests {
         }
         assert_eq!(sup.crash_wake_ms(), Some(2_000));
         sup.link = link::Link::Lost {
-            locator: crate::aterm_wire::Locator::new(state.clone(), "s-1a").expect("a locator"),
+            locator: crate::aterm_wire::Locator::new(state.clone(), "s-0000000000000000001a")
+                .expect("a locator"),
             retry_at_ms: 6_000,
             noted: String::new(),
             claimed: true,
             held: None,
+            generation: None,
         };
         // A lost link is asked nothing before it is claimed again: the loop
         // sleeps to the budget's end, the poll trying the claim meanwhile.

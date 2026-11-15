@@ -270,10 +270,23 @@ fn maybe_option(tok: &str) -> bool {
     tok.len() > 1 && tok.starts_with('-')
 }
 
-/// The launch argv as `(flag, fate, tokens)` triples, `argv[0]` first in `argv`
-/// and skipped; positional words are skipped and `--` ends the scan
-/// (aterm `upgrade.rs:526-575`, `parsed`).
-fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
+/// One option with its original value boundaries and argv position.
+struct ParsedFlag<'a> {
+    name: &'a str,
+    fate: Option<Fate>,
+    tokens: &'a [String],
+    at: usize,
+}
+
+fn parsed(argv: &[String]) -> Vec<ParsedFlag<'_>> {
+    parsed_with(argv, &[], |_| {})
+}
+
+fn parsed_with<'a>(
+    argv: &'a [String],
+    extra_flags: &[&str],
+    mut positional: impl FnMut(&'a str),
+) -> Vec<ParsedFlag<'a>> {
     let mut out = Vec::new();
     let mut i = 1;
     while i < argv.len() {
@@ -282,6 +295,7 @@ fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
             break;
         }
         if !maybe_option(tok) {
+            positional(tok);
             i += 1;
             continue;
         }
@@ -289,7 +303,9 @@ fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
             Some((n, _)) if n.starts_with("--") => (n, true),
             _ => (tok.as_str(), false),
         };
-        let known = flag(name);
+        let known = flag(name).or_else(|| {
+            (!inline && extra_flags.contains(&name)).then_some((Arity::None, Fate::Keep))
+        });
         let start = i;
         i += 1;
         if !inline {
@@ -317,17 +333,53 @@ fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
                 }
             }
         }
-        out.push((name, known.map(|(_, fate)| fate), &argv[start..i]));
+        out.push(ParsedFlag {
+            name,
+            fate: known.map(|(_, fate)| fate),
+            tokens: &argv[start..i],
+            at: start,
+        });
     }
     out
 }
 
+/// Known option names/positions and the first positional word, using the same
+/// value boundaries as resume parsing. Launcher-only switches may add zero-arity
+/// names; vendor arities still have one source. Unknown arity grants no scan.
+pub(crate) struct LaunchWords<'a> {
+    pub flags: Vec<(&'a str, usize)>,
+    pub first: Option<&'a str>,
+}
+
+pub(crate) fn launch_words<'a>(
+    argv: &'a [String],
+    extra_flags: &[&str],
+) -> Option<LaunchWords<'a>> {
+    let mut first = None;
+    let flags = parsed_with(argv, extra_flags, |word| {
+        if first.is_none() {
+            first = Some(word);
+        }
+    });
+    let names = flags
+        .into_iter()
+        .map(|flag| flag.fate.map(|_| (flag.name, flag.at)))
+        .collect::<Option<Vec<_>>>()?;
+    Some(LaunchWords {
+        flags: names,
+        first,
+    })
+}
+
 /// The flags a resume carries, or why none can (aterm `upgrade.rs:490-503`,
-/// `carried`). aterm also drops its own usage-tap `--settings` there; this
-/// harness never adds one, so every `--settings` is the person's and is kept.
+/// `carried`). The managed usage tap is attached only when constructing the
+/// child command; resume parsing sees the person's settings and keeps them.
 fn carried(argv: &[String]) -> Result<Vec<(&str, &[String])>, ArgvRefusal> {
     let mut out = Vec::new();
-    for (name, fate, tokens) in parsed(argv) {
+    for ParsedFlag {
+        name, fate, tokens, ..
+    } in parsed(argv)
+    {
         match fate {
             None => return Err(ArgvRefusal::UnknownFlag(name.to_string())),
             Some(Fate::Refuse) => return Err(ArgvRefusal::NotResumable(name.to_string())),
@@ -355,18 +407,6 @@ pub fn resume_argv(argv: &[String], session_id: &str) -> Result<Vec<String>, Arg
     Ok(out)
 }
 
-/// The permission modes a resume may carry (aterm `relaunch.rs:471-479`,
-/// `PERMISSION_MODES`); a mode outside this list is never carried.
-pub const PERMISSION_MODES: [&str; 7] = [
-    "default",
-    "manual",
-    "acceptEdits",
-    "plan",
-    "auto",
-    "dontAsk",
-    "bypassPermissions",
-];
-
 /// How much of a transcript's end is read for its last permission mode (aterm
 /// `upgrade_drive.rs:6753`, `TAIL_BYTES`). Claude Code writes a
 /// `permission-mode` line with every turn, so the last one is in any tail.
@@ -377,42 +417,36 @@ pub const TRANSCRIPT_TAIL_BYTES: u64 = 262_144;
 /// than one (aterm `upgrade_drive.rs:6762-6777`, `transcript_in`).
 #[must_use]
 pub fn transcript_in(config: &Path, session: &str) -> Option<PathBuf> {
-    if !is_session_id(session) {
-        return None;
-    }
-    let mut found = None;
-    for entry in std::fs::read_dir(config.join("projects")).ok()?.flatten() {
-        let path = entry.path().join(format!("{session}.jsonl"));
-        // Followed through a link, as aterm's `p.is_file()` does: a transcript
-        // not found leaves the launch flags standing and loses the
-        // conversation's own permission mode. `transcript_tail` checks the handle.
-        if std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(path);
-        }
-    }
-    found
+    transcript_lookup::legacy(config, session)
 }
 
-/// The last [`TRANSCRIPT_TAIL_BYTES`] of `path` as text (a cut first line is
-/// harmless: it does not parse, so it is skipped). A link is followed; the
-/// open never blocks, and only a handle that is a regular file is read, so a
-/// FIFO or device (named directly or through a link) gives `None`.
+#[path = "profile_transcript_lookup.rs"]
+mod transcript_lookup;
+pub(crate) use transcript_lookup::bounded as transcript_in_bounded;
+
+/// The transcript at `path` opened for reading, with the handle's own
+/// metadata. A link is followed; the open never blocks, and only a handle that
+/// is a regular file is returned, so a FIFO or device (named directly or
+/// through a link) gives `None`.
 #[must_use]
-pub fn transcript_tail(path: &Path) -> Option<String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
+pub fn open_transcript(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;
-    if !meta.is_file() {
-        return None;
-    }
+    meta.is_file().then_some((file, meta))
+}
+
+/// The last [`TRANSCRIPT_TAIL_BYTES`] of `path` as text (a cut first line is
+/// harmless: it does not parse, so it is skipped), opened as
+/// [`open_transcript`] opens it.
+#[must_use]
+pub fn transcript_tail(path: &Path) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let (mut file, meta) = open_transcript(path)?;
     let len = meta.len();
     file.seek(SeekFrom::Start(len.saturating_sub(TRANSCRIPT_TAIL_BYTES)))
         .ok()?;
@@ -423,9 +457,10 @@ pub fn transcript_tail(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The conversation's last permission mode in a transcript tail: the newest
+/// The conversation's historical last permission mode in a transcript tail: the newest
 /// `{"type":"permission-mode","permissionMode":…}` line naming a known mode
-/// (aterm `relaunch.rs:487-498`, `permission_mode_of`).
+/// (aterm `relaunch.rs:487-498`, `permission_mode_of`). No writer identity or
+/// current-child authority can be inferred from this history.
 #[must_use]
 pub fn permission_mode_of(tail: &str) -> Option<String> {
     tail.lines()
@@ -435,55 +470,81 @@ pub fn permission_mode_of(tail: &str) -> Option<String> {
         .find(|v| v.get("type").and_then(Value::as_str) == Some("permission-mode"))?
         .get("permissionMode")
         .and_then(Value::as_str)
-        .filter(|m| PERMISSION_MODES.contains(m))
+        .filter(|m| crate::permission::Mode::of_setting(m).is_some())
         .map(str::to_owned)
 }
 
 /// `flags` (from [`resume_argv`], the resume pair last) resumed in the
-/// conversation's permission `mode`, verbatim from aterm `relaunch.rs:533-575`
-/// (`with_permission_mode`): with no mode, or still in bypass, the launch's own
+/// conversation's permission `mode`: with no mode, or still in bypass, the launch's own
 /// flags stand; any other mode replaces the launch's permission flags with
 /// `--permission-mode <mode>`, and a launch that allowed bypass keeps it
 /// reachable with `--allow-dangerously-skip-permissions`. A resume never moves
 /// a session into bypass that the launch did not allow, and never back into
-/// bypass from a mode the person chose inside the session.
+/// bypass from a mode the person chose inside the session. Option values and a
+/// literal `--` suffix keep their original boundaries; unknown arity leaves
+/// the input unchanged rather than guessing which words describe posture.
 #[must_use]
 pub fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Vec<String> {
     let Some(mode) = mode.filter(|m| *m != "bypassPermissions") else {
         return flags;
     };
     let mode = if mode == "manual" { "default" } else { mode };
-    // `Vec::new`, not aterm's `with_capacity(len + 3)`: an allocation sized by
-    // the input is an `unbounded_allocation` row on the strict lane.
+    let argv: Vec<String> = std::iter::once(COMMAND.to_string()).chain(flags).collect();
+    let units = parsed(&argv);
+    if units.iter().any(|unit| unit.fate.is_none()) {
+        return argv.into_iter().skip(1).collect();
+    }
     let mut out = Vec::new();
-    let mut tail = Vec::new();
+    let mut insert_at = None;
     let mut bypass_in_cycle = false;
-    let mut it = flags.into_iter();
-    while let Some(f) = it.next() {
-        match f.as_str() {
+    let mut after = 1;
+    for unit in units {
+        out.extend_from_slice(&argv[after..unit.at]);
+        match unit.name {
             "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions" => {
                 bypass_in_cycle = true;
             }
             "--permission-mode" => {
-                bypass_in_cycle |= it.next().is_some_and(|m| m == "bypassPermissions");
+                bypass_in_cycle |= unit.tokens[0] == "--permission-mode=bypassPermissions"
+                    || unit
+                        .tokens
+                        .get(1)
+                        .is_some_and(|mode| mode == "bypassPermissions");
             }
-            a if a.starts_with("--permission-mode=") => {
-                bypass_in_cycle |= a == "--permission-mode=bypassPermissions";
+            "--resume" | "-r" => {
+                insert_at.get_or_insert(out.len());
+                out.extend_from_slice(unit.tokens);
             }
-            "--resume" => {
-                tail.push(f);
-                tail.extend(it.by_ref());
-            }
-            _ => out.push(f),
+            _ => out.extend_from_slice(unit.tokens),
         }
+        after = unit.at + unit.tokens.len();
     }
+    let suffix = &argv[after..];
+    let insert_at = insert_at.unwrap_or_else(|| {
+        out.len()
+            + suffix
+                .iter()
+                .position(|word| word == "--")
+                .unwrap_or(suffix.len())
+    });
+    out.extend_from_slice(suffix);
+    let mut posture = Vec::new();
     if bypass_in_cycle {
-        out.push("--allow-dangerously-skip-permissions".to_string());
+        posture.push("--allow-dangerously-skip-permissions".to_string());
     }
-    out.push("--permission-mode".to_string());
-    out.push(mode.to_string());
-    out.extend(tail);
+    posture.push("--permission-mode".to_string());
+    posture.push(mode.to_string());
+    out.splice(insert_at..insert_at, posture);
     out
+}
+
+/// Whether `argv` (`argv[0]` first) names a model with `--model`, an alias or
+/// an id alike. That pins Claude Code's main-loop model as a `/model` choice
+/// does, so a `/resume` inside the session keeps it (aterm's model reader,
+/// `Switch::pinned` in `footer.rs`; [`crate::model_facts`]).
+#[must_use]
+pub fn pins_model(argv: &[String]) -> bool {
+    parsed(argv).iter().any(|flag| flag.name == "--model")
 }
 
 const ONE_SHOT: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
@@ -494,7 +555,7 @@ const ONE_SHOT: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
 pub fn one_shot(argv: &[String]) -> bool {
     parsed(argv)
         .iter()
-        .any(|(name, _, _)| ONE_SHOT.contains(name))
+        .any(|flag| ONE_SHOT.contains(&flag.name))
 }
 
 #[cfg(test)]
@@ -598,6 +659,21 @@ mod tests {
         assert!(one_shot(&argv(&["--model", "x", "--version"])));
         assert!(!one_shot(&argv(&["--model", "x", "hello"])));
         assert!(!one_shot(&argv(&["--", "-p"])));
+    }
+
+    #[test]
+    fn only_a_model_flag_pins_the_model() {
+        assert!(pins_model(&argv(&["--model", "opus"])));
+        assert!(pins_model(&argv(&["--model=claude-opus-5-5", "hi"])));
+        // CONTROL: the same word as another flag's value, a prompt or past `--`.
+        assert!(!pins_model(&argv(&["--add-dir", "--model"])));
+        assert!(!pins_model(&argv(&[
+            "--fallback-model",
+            "opus",
+            "--model?"
+        ])));
+        assert!(!pins_model(&argv(&["--", "--model", "opus"])));
+        assert!(!pins_model(&argv(&[])));
     }
 
     #[test]
@@ -778,6 +854,92 @@ mod tests {
                 "--resume",
                 "ID"
             ])
+        );
+    }
+
+    #[test]
+    fn a_resume_mode_rewrite_preserves_known_option_values() {
+        for option in ["--model", "--append-system-prompt", "--settings", "--tools"] {
+            for value in [
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+                "--permission-mode=plan",
+                "--resume",
+                "--",
+            ] {
+                let launch = args(&["claude", "--permission-mode", "default", option, value]);
+                let flags = resume_argv(&launch, "ID").expect("known value boundary");
+                assert_eq!(
+                    with_permission_mode(flags, Some("auto")),
+                    args(&[option, value, "--permission-mode", "auto", "--resume", "ID"]),
+                    "{option} {value} is a value, not permission posture"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_resume_mode_rewrite_respects_literal_tail_and_real_posture_order() {
+        assert_eq!(
+            with_permission_mode(
+                args(&[
+                    "--permission-mode=default",
+                    "--model",
+                    "opus",
+                    "--",
+                    "--dangerously-skip-permissions",
+                    "--resume",
+                    "literal",
+                    "--permission-mode=plan",
+                ]),
+                Some("auto")
+            ),
+            args(&[
+                "--model",
+                "opus",
+                "--permission-mode",
+                "auto",
+                "--",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "literal",
+                "--permission-mode=plan",
+            ])
+        );
+        assert_eq!(
+            with_permission_mode(
+                args(&[
+                    "--resume",
+                    "ID",
+                    "--model",
+                    "--dangerously-skip-permissions",
+                    "--permission-mode",
+                    "bypassPermissions",
+                ]),
+                Some("plan")
+            ),
+            args(&[
+                "--allow-dangerously-skip-permissions",
+                "--permission-mode",
+                "plan",
+                "--resume",
+                "ID",
+                "--model",
+                "--dangerously-skip-permissions",
+            ]),
+            "an actual bypass stays reachable without changing the model value"
+        );
+        let unknown = args(&[
+            "--future-value",
+            "--permission-mode",
+            "default",
+            "--resume",
+            "ID",
+        ]);
+        assert_eq!(
+            with_permission_mode(unknown.clone(), Some("auto")),
+            unknown,
+            "unknown option arity cannot authorize a rewrite"
         );
     }
 

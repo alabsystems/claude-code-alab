@@ -119,10 +119,25 @@ fn remaining_at(until: Instant, now: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "control exchange deadline elapsed"))
 }
 
-/// Whether `sid` is an `s-<hex>` session ID: one word that can never be a path or a selector.
+/// A minted aterm tab ID: `t` and ten lower-case Crockford base32 characters,
+/// or the `s-` and twenty lower-case hex digits retained by an older live tab.
+/// Both are single canonical words and cannot name a path or another selector.
 pub(crate) fn session_id(sid: &str) -> bool {
-    sid.strip_prefix("s-")
-        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    match sid.as_bytes() {
+        [b't', tail @ ..] => {
+            tail.len() == 10
+                && tail
+                    .iter()
+                    .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(byte))
+        }
+        [b's', b'-', tail @ ..] => {
+            tail.len() == 20
+                && tail
+                    .iter()
+                    .all(|byte| matches!(*byte, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        _ => false,
+    }
 }
 
 /// A session's rendezvous directory and validated session ID.
@@ -169,10 +184,10 @@ impl Locator {
     /// Name an explicit rendezvous directory and session ID.
     ///
     /// # Errors
-    /// `sid` is not an `s-<hex>` session ID.
+    /// `sid` is not a canonical current or retained older tab ID.
     pub fn new(directory: PathBuf, sid: &str) -> io::Result<Self> {
         if !session_id(sid) {
-            return Err(invalid("the session ID is not s-<hex>"));
+            return Err(invalid("the session ID is not a canonical aterm tab ID"));
         }
         Ok(Self {
             directory,
@@ -389,6 +404,16 @@ fn blank_address_storage() -> libc::sockaddr_storage {
 fn blank_address_storage() -> libc::sockaddr_storage {
     // SAFETY: zero initializes the storage's family, length and padding bytes.
     unsafe { std::mem::zeroed() }
+}
+
+/// Reuse the bounded native Unix connection for an isolated protocol fixture,
+/// without reading a host token or sending authentication words.
+/// # Errors
+/// The path, socket preparation, connection or fixed deadline fails.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fixture_connect_until(path: &Path, until: Instant) -> io::Result<UnixStream> {
+    connect_until(path, until)
 }
 
 fn connect_until(path: &Path, until: Instant) -> io::Result<UnixStream> {
@@ -749,6 +774,52 @@ impl Connection {
         let result = self
             .exchange_line(request, until)
             .and_then(|line| Fields::parse(&line));
+        self.finish(result, until)
+    }
+
+    /// Read an `OK <count>` reply and its exact counted UTF-8 body lines.
+    /// The whole exchange shares one deadline and one aggregate byte bound.
+    /// This reads observations only; a body grants no native mutation authority.
+    ///
+    /// # Errors
+    /// Invalid bounds or local requests are unsent. A refused or malformed reply,
+    /// excessive count or bytes, incomplete body or elapsed deadline poisons the
+    /// connection, so a late body can never answer a later request.
+    pub fn request_body(&mut self, request: &str, max_lines: usize) -> io::Result<Vec<String>> {
+        if max_lines == 0 || max_lines > 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a counted reply needs a positive bounded line count",
+            ));
+        }
+        let until = self.begin(request)?;
+        let result = (|| {
+            let header = self.exchange_line(request, until)?;
+            let count = header
+                .strip_prefix("OK ")
+                .and_then(|count| {
+                    count
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|parsed| parsed.to_string() == count)
+                })
+                .filter(|count| *count <= max_lines)
+                .ok_or_else(|| invalid("reply has no supported canonical body count"))?;
+            let mut body = Vec::with_capacity(count);
+            let mut bytes = 0usize;
+            for _ in 0..count {
+                let line = self.line_until(until)?;
+                bytes = bytes
+                    .checked_add(line.len() + 1)
+                    .filter(|bytes| *bytes <= MAX_LINE_BYTES)
+                    .ok_or_else(|| invalid("counted reply exceeds its aggregate byte bound"))?;
+                body.push(line);
+            }
+            if !self.pending.is_empty() {
+                return Err(invalid("reply exceeds its declared body count"));
+            }
+            Ok(body)
+        })();
         self.finish(result, until)
     }
 
@@ -1399,6 +1470,10 @@ fn validate_custody_socket(raw: RawFd) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "aterm_wire_tab_ids_tests.rs"]
+mod tab_id_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
@@ -1409,7 +1484,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const END: Duration = Duration::from_secs(60);
-    const SID: &str = "s-123abc";
+    const SID: &str = "tqn5r6e0148";
 
     fn pair() -> (Connection, UnixStream) {
         let (client, peer) = UnixStream::pair().expect("Unix pair");
@@ -1686,7 +1761,7 @@ mod tests {
             let request = read_request(&mut peer);
             if !request.is_empty() {
                 assert_eq!(request, format!("subscribe @{SID} events\n"));
-                let _ = peer.write_all(b"OK subscribe 1\nsub 7 s-123abc\n");
+                let _ = peer.write_all(b"OK subscribe 1\nsub 7 tqn5r6e0148\n");
             }
         });
         reset_clock();
@@ -1834,11 +1909,11 @@ mod tests {
     fn subscription_ack_requires_one_bound_target_and_preserves_coalesced_events() {
         for reply in [
             "OK subscribe 0\n",
-            "OK subscribe 2\nsub 1 s-123abc\nsub 2 s-456\n",
+            "OK subscribe 2\nsub 1 tqn5r6e0148\nsub 2 s-456\n",
             "OK subscribe 999999999999999999999999\n",
             "OK subscribe 1\nsub 1 s-456\n",
-            "OK subscribe 1\nsub 01 s-123abc\n",
-            "OK subscribe 1\nsub 1 s-123abc extra\n",
+            "OK subscribe 1\nsub 01 tqn5r6e0148\n",
+            "OK subscribe 1\nsub 1 tqn5r6e0148 extra\n",
         ] {
             let (connection, mut peer) = pair();
             peer.write_all(reply.as_bytes()).unwrap();
@@ -1850,7 +1925,7 @@ mod tests {
             );
         }
         let (connection, mut peer) = pair();
-        peer.write_all(b"OK subscribe 1\nsub 7 s-123abc\nEVENT 7 harness-policy gen=2\nGAP 7 events-dropped=4\n").unwrap();
+        peer.write_all(b"OK subscribe 1\nsub 7 tqn5r6e0148\nEVENT 7 harness-policy gen=2\nGAP 7 events-dropped=4\n").unwrap();
         let mut events = connection
             .subscribe_until(SID, deadline(END).unwrap())
             .unwrap();
@@ -1894,11 +1969,11 @@ mod tests {
         for (reply, header) in [
             (b"OK subscribe 0\n".as_slice(), "OK subscribe 0"),
             (
-                b"OK subscribe 1\nsub 01 s-123abc\n".as_slice(),
+                b"OK subscribe 1\nsub 01 tqn5r6e0148\n".as_slice(),
                 "OK subscribe 1",
             ),
             (
-                b"OK subscribe 1\ntab 7 s-123abc\n".as_slice(),
+                b"OK subscribe 1\ntab 7 tqn5r6e0148\n".as_slice(),
                 "OK subscribe 1",
             ),
             (b"ERRANT\n".as_slice(), "ERRANT"),
@@ -1923,7 +1998,7 @@ mod tests {
             b"EVENT 7 harness-policy gen=3 gen=4\n".as_slice(),
         ] {
             let (connection, mut peer) = pair();
-            peer.write_all(b"OK subscribe 1\nsub 7 s-123abc\nEVENT 7 harness-policy gen=2\n")
+            peer.write_all(b"OK subscribe 1\nsub 7 tqn5r6e0148\nEVENT 7 harness-policy gen=2\n")
                 .unwrap();
             peer.write_all(tail).unwrap();
             let mut events = connection
@@ -1943,7 +2018,7 @@ mod tests {
     fn subscribed(lines: &[u8]) -> (EventReader, UnixStream) {
         let (connection, mut peer) = pair();
         // The row as aterm writes it, session facts after the id.
-        peer.write_all(b"OK subscribe 1\nsub 7 s-123abc role=- attention=- user_title=-\n")
+        peer.write_all(b"OK subscribe 1\nsub 7 tqn5r6e0148 role=- attention=- user_title=-\n")
             .unwrap();
         peer.write_all(lines).unwrap();
         let events = connection
@@ -1964,21 +2039,21 @@ mod tests {
                 .map_err(|e| e.to_string())
         };
         for row in [
-            "sub 7 s-123abc",
-            "sub 7 s-123abc role=- attention=- user_title=-",
-            "sub 7 s-123abc log_seq=4 log_ep=1 log_base=0 role=agent:x",
-            "sub 7 s-123abc later=word",
+            "sub 7 tqn5r6e0148",
+            "sub 7 tqn5r6e0148 role=- attention=- user_title=-",
+            "sub 7 tqn5r6e0148 log_seq=4 log_ep=1 log_base=0 role=agent:x",
+            "sub 7 tqn5r6e0148 later=word",
         ] {
             assert_eq!(ack(row), Ok(()), "{row}");
         }
         for (row, why) in [
             ("sub 7 s-999abc role=-", "names another target"),
-            ("sub 7 role=- s-123abc", "names another target"),
-            ("sub 7 s-123abc s-999abc", "not key=value"),
-            ("sub 7 s-123abc role=- bare", "not key=value"),
-            ("sub x s-123abc", ""),
+            ("sub 7 role=- tqn5r6e0148", "names another target"),
+            ("sub 7 tqn5r6e0148 s-999abc", "not key=value"),
+            ("sub 7 tqn5r6e0148 role=- bare", "not key=value"),
+            ("sub x tqn5r6e0148", ""),
             ("sub 7", "names another target"),
-            ("tab 7 s-123abc", "no sub row"),
+            ("tab 7 tqn5r6e0148", "no sub row"),
         ] {
             let got = ack(row).expect_err(row);
             assert!(got.contains(why), "{row}: {got}");
@@ -2077,7 +2152,7 @@ mod tests {
         ] {
             let (connection, mut peer) = pair();
             peer.write_all(
-                b"OK subscribe 1\nsub 7 s-123abc\nEVENT 7 human\nEVENT 7 restart cause=asked\n",
+                b"OK subscribe 1\nsub 7 tqn5r6e0148\nEVENT 7 human\nEVENT 7 restart cause=asked\n",
             )
             .unwrap();
             peer.write_all(tail).unwrap();
@@ -2119,35 +2194,38 @@ mod tests {
 
     #[test]
     fn the_event_descriptor_is_the_streams_and_polls_readable_only_with_something_to_drain() {
-        let readable = |fd: RawFd| {
+        let readable = |fd: RawFd, timeout_ms| {
             let mut probe = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // SAFETY: probe is one initialized live descriptor, and a zero timeout never waits.
-            let ready = unsafe { libc::poll(&raw mut probe, 1, 0) };
+            // SAFETY: probe is one initialized live descriptor; the timeout only
+            // bounds the wait for the peer write or close to become readable.
+            let ready = unsafe { libc::poll(&raw mut probe, 1, timeout_ms) };
             ready > 0 && probe.revents & (libc::POLLIN | libc::POLLHUP) != 0
         };
         let (mut events, mut peer) = subscribed(b"");
         let fd = events.as_raw_fd();
         assert_eq!(fd, events.stream.as_raw_fd());
         assert!(fd_flags(fd).unwrap() & libc::FD_CLOEXEC != 0);
-        assert!(!readable(fd));
+        assert!(!readable(fd, 0));
         peer.write_all(b"EVENT 7 human\n").unwrap();
-        assert!(readable(fd));
+        assert!(readable(fd, 60_000));
         assert!(events.drain().activity);
-        assert!(!readable(fd));
+        assert!(!readable(fd, 0));
         // The end of the stream is readable too, and the drain reports it.
+        // A close may finish asynchronously: wait for readiness instead of
+        // requiring its notification to be visible in this exact instant.
         drop(peer);
-        assert!(readable(fd));
+        assert!(readable(fd, 60_000));
         assert!(events.drain().ended);
     }
 
     #[test]
     fn partial_events_wait_but_overflow_invalidates_and_closes_the_stream() {
         let (connection, mut peer) = pair();
-        peer.write_all(b"OK subscribe 1\nsub 7 s-123abc\nEVENT 7 harness-pol")
+        peer.write_all(b"OK subscribe 1\nsub 7 tqn5r6e0148\nEVENT 7 harness-pol")
             .unwrap();
         let mut events = connection
             .subscribe_until(SID, deadline(END).unwrap())
@@ -2214,6 +2292,73 @@ mod tests {
         assert!(custody.outcome_unknown());
         assert!(custody.deadline().remaining().is_ok());
         drop(custody);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn counted_observations_consume_the_body_before_the_next_request() {
+        let (mut connection, mut peer) = pair();
+        let server = thread::spawn(move || {
+            assert_eq!(read_request(&mut peer), "text --json process-context\n");
+            for part in ["OK ", "1\n", "{\"rows\":[\"a\",\"b\"]}", "\n"] {
+                peer.write_all(part.as_bytes()).unwrap();
+            }
+            assert_eq!(read_request(&mut peer), "status\n");
+            peer.write_all(b"OK schema=1\n").unwrap();
+        });
+        assert_eq!(
+            connection
+                .request_body("text --json process-context", 1)
+                .unwrap(),
+            ["{\"rows\":[\"a\",\"b\"]}"]
+        );
+        assert_eq!(connection.request_line("status").unwrap(), "OK schema=1");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_or_incomplete_counted_observations_poison_the_connection() {
+        for reply in [
+            "OK 01\n{}\n",
+            "OK -1\n",
+            "OK 2\n{}\n{}\n",
+            "OK 1 extra\n{}\n",
+            "ERR unavailable\n",
+            "OK 1\nunfinished",
+            "OK 1\n{}\nunsolicited\n",
+        ] {
+            let (mut connection, mut peer) = pair();
+            peer.write_all(reply.as_bytes()).unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+            assert!(
+                connection.request_body("text --json", 1).is_err(),
+                "{reply:?}"
+            );
+            assert!(connection.is_poisoned(), "{reply:?}");
+            assert_eq!(
+                connection.request_line("status").unwrap_err().kind(),
+                io::ErrorKind::NotConnected
+            );
+        }
+    }
+
+    #[test]
+    fn counted_observations_keep_one_deadline_for_header_and_all_body_lines() {
+        let (mut connection, mut peer) = pair();
+        reset_clock();
+        connection.clock = advancing_clock;
+        let server = thread::spawn(move || {
+            assert_eq!(read_request(&mut peer), "text --json\n");
+            peer.write_all(b"OK 4\none\ntwo\nthree\nfour\n").unwrap();
+        });
+        assert_eq!(
+            connection
+                .request_body("text --json", 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(connection.is_poisoned());
         server.join().unwrap();
     }
 

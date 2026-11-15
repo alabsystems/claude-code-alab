@@ -66,6 +66,13 @@ pub const INFO_ROSTERED: &str = "OK native-act state=info epoch=d1a48b482e4c6b39
     native-act=1 handoff=blocked clock=monotonic-us \
     own-image=grok-alab:upgrade,muse-alab:upgrade,kimi-alab:upgrade,claude-code-alab:upgrade";
 
+/// The current native host's canonical info grammar on kernels with child proof:
+/// `native_act.rs`'s `Request::Info` inserts `harness_claim::child_capabilities()`
+/// before the roster. The epoch is synthetic; the field order and capability words are not.
+pub const INFO_CURRENT: &str = "OK native-act state=info epoch=d1a48b482e4c6b391c4715137ce246b6 \
+    native-act=1 handoff=close clock=monotonic-us child-proof=1 child-start=1 \
+    own-image=grok-alab:upgrade,muse-alab:upgrade,kimi-alab:upgrade,claude-code-alab:upgrade";
+
 /// What `native-act info` answers today (aterm `d29d3887c4d`, read from a
 /// running aterm on 2026-11-12): no `claude-code-alab` row. A new fake starts
 /// here, so a scenario must opt in to the roster, as a real launch cannot.
@@ -99,6 +106,8 @@ struct Claim {
     scope: String,
     version: Option<String>,
     vendor: Option<String>,
+    child: Option<String>,
+    child_generation: Option<u64>,
 }
 
 /// What a [`FakeAterm`] answers, and what it was asked.
@@ -110,6 +119,7 @@ struct State {
     policy_reply: Option<String>,
     info: String,
     claim_reply: String,
+    start_reply: Option<String>,
     proven: bool,
     status: Vec<(String, String)>,
     claim: Option<Claim>,
@@ -133,6 +143,8 @@ struct State {
     witness: Option<PathBuf>,
     /// For each of `verbs`, whether the witness path existed when it arrived.
     witnessed: Vec<bool>,
+    body_log: Option<PathBuf>,
+    body_counts: Vec<usize>,
 }
 
 impl State {
@@ -177,7 +189,7 @@ impl State {
         let claim = self.claim.as_ref();
         line.push_str(&format!(
             " supervisor_contract={} supervisor_scope={} supervisor_revision={} supervisor={} \
-             supervisor_proven={} supervisor_version={} supervisor_vendor={}",
+             supervisor_proven={} supervisor_version={} supervisor_vendor={} supervisor_child={} supervisor_child_start={}",
             word(claim.and_then(|claim| claim.contract.as_ref())),
             word(claim.map(|claim| &claim.scope)),
             self.revision,
@@ -185,6 +197,8 @@ impl State {
             u8::from(claim.is_some() && self.proven),
             word(claim.and_then(|claim| claim.version.as_ref())),
             word(claim.and_then(|claim| claim.vendor.as_ref())),
+            word(claim.and_then(|claim| claim.child.as_ref())),
+            claim.and_then(|claim|claim.child_generation).unwrap_or(0),
         ));
         line
     }
@@ -208,6 +222,14 @@ impl State {
                 .find_map(|word| word.strip_prefix(key))
                 .map(str::to_string)
         };
+        let child = named("child=");
+        let child_generation = named("child-start=").and_then(|value| value.parse::<u64>().ok());
+        if child.is_none()
+            && child_generation.is_some()
+            && let Some(reply) = &self.start_reply
+        {
+            return reply.clone();
+        }
         self.claim = Some(Claim {
             holder: holder.to_string(),
             connection: id,
@@ -216,6 +238,8 @@ impl State {
                 .unwrap_or_else(|| "relaunch,upgrade,turn-end,approvals,questions,walls".into()),
             version: named("version="),
             vendor: named("vendor="),
+            child,
+            child_generation,
         });
         self.revision += 1;
         "OK".to_string()
@@ -226,6 +250,16 @@ impl State {
         self.verbs.push(verb.to_string());
         self.witnessed
             .push(self.witness.as_ref().is_some_and(|path| path.exists()));
+        self.body_counts.push(
+            self.body_log
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map_or(0, |text| {
+                    text.lines()
+                        .filter(|line| line.starts_with("start\t"))
+                        .count()
+                }),
+        );
         if verb == "harness policy" {
             self.policy_reply
                 .clone()
@@ -281,7 +315,7 @@ impl FakeAterm {
     pub fn new(root: &Path) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let sid = format!("s-{:x}a{n:x}", std::process::id());
+        let sid = format!("t{n:010x}");
         let xdg = root.join("xdg");
         let graph = xdg.join("aterm").join("graph");
         std::fs::create_dir_all(&graph).expect("graph directory");
@@ -310,6 +344,7 @@ impl FakeAterm {
             policy_reply: None,
             info: INFO_UNROSTERED.to_string(),
             claim_reply: "OK".to_string(),
+            start_reply: None,
             proven: true,
             status: QUIET_STATUS
                 .iter()
@@ -327,6 +362,8 @@ impl FakeAterm {
             delay: Duration::ZERO,
             witness: None,
             witnessed: Vec::new(),
+            body_log: None,
+            body_counts: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (accept_state, accept_stop, accept_sid) =
@@ -432,6 +469,27 @@ impl FakeAterm {
     /// not prove.
     pub fn set_claim_reply(&self, reply: &str) {
         lock(&self.state).claim_reply = reply.to_string();
+    }
+
+    /// Refuse only pre-spawn claims, leaving ordinary claims/reannouncements usable.
+    pub fn set_start_reply(&self, reply: Option<&str>) {
+        lock(&self.state).start_reply = reply.map(str::to_string);
+    }
+
+    /// Count vendor body receipts at each request, independently of the wire client.
+    pub fn set_body_log(&self, path: &Path) {
+        lock(&self.state).body_log = Some(path.to_path_buf());
+    }
+
+    /// Every addressed request paired with the vendor starts already observed then.
+    pub fn verbs_with_body_counts(&self) -> Vec<(String, usize)> {
+        let state = lock(&self.state);
+        state
+            .verbs
+            .iter()
+            .cloned()
+            .zip(state.body_counts.iter().copied())
+            .collect()
     }
 
     /// Whether a stored claim reads `supervisor_proven=1`.
@@ -757,7 +815,9 @@ pub fn the_fake_aterm_is_found_and_authenticates_this_crates_client() {
     assert_eq!(fake.connections(), 1);
     // A request must name this session, and an unknown verb is an ordinary error.
     assert_eq!(
-        connection.request_line("@s-ffff status").expect("reply"),
+        connection
+            .request_line("@tzzzzzzzzzz status")
+            .expect("reply"),
         "ERR no such session"
     );
     assert_eq!(
@@ -838,6 +898,12 @@ pub fn the_fake_aterms_info_reply_reads_through_the_roster_guard() {
         &mut connection,
         aterm::info_verb(&fake.sid)
     )));
+    fake.set_info(INFO_CURRENT);
+    let current = ask(&mut connection, aterm::info_verb(&fake.sid));
+    assert_eq!(current, INFO_CURRENT);
+    assert!(aterm::rostered(&current));
+    assert!(aterm::child_proof_supported(&current));
+    assert!(aterm::child_start_supported(&current));
     fake.set_info("ERR usage: native-act");
     assert!(!aterm::rostered(&ask(
         &mut connection,
@@ -846,7 +912,7 @@ pub fn the_fake_aterms_info_reply_reads_through_the_roster_guard() {
     assert!(!connection.is_poisoned());
     // The guard is a read: nothing was claimed by asking.
     assert_eq!(fake.holder(), None);
-    assert_eq!(fake.verbs(), ["native-act info"; 3]);
+    assert_eq!(fake.verbs(), ["native-act info"; 4]);
 }
 
 /// A claim is stored, `status` reads it back proven with its scope, the judge
@@ -1052,7 +1118,7 @@ pub fn events_from_the_fake_aterm_reach_this_crates_reader() {
     assert!(update.fault.is_none() && !update.ended);
 
     // A subscription for another session is refused outright.
-    assert!(EventReader::connect(&socket, "s-ffff", TIMEOUT).is_err());
+    assert!(EventReader::connect(&socket, "tzzzzzzzzzz", TIMEOUT).is_err());
     assert_eq!(fake.subscriptions(), 1);
 }
 

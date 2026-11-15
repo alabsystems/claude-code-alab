@@ -5,7 +5,7 @@
 //!
 //! `claude-alab` runs the **unmodified** vendor `claude` that atpkg installed
 //! (it never ships, forks or patches vendor bytes) as its child on the same
-//! terminal, passes every argument through, follows the child's signals, ends
+//! terminal, applies its managed launch policy, follows the child's signals, ends
 //! the way the child ends, and moves the child onto a newer vendor build
 //! underneath itself at a safe point, resuming the same conversation, without
 //! the harness process exiting.
@@ -16,6 +16,8 @@
 //! * [`supervise`]: the child, its signals, its end, the live update;
 //! * [`quiet`]: the safe point a live update waits for;
 //! * [`profile`]: Claude Code's facts (record, resume grammar, permission mode);
+//! * [`model_facts`]: the model, effort level and top-effort key the child
+//!   states in its transcript, which the supervisor journals;
 //! * [`procs`]: the child's background work, which a safe point waits for;
 //! * [`aterm`]: the aterm client boundary (claim text, reply parsers, the
 //!   safe-point judge), used by the supervisor's link inside an aterm tab;
@@ -37,12 +39,20 @@
 pub mod aterm;
 pub mod aterm_wire;
 pub mod cli;
+pub mod inner_pty;
+pub mod inspect;
 pub mod journal;
 pub mod json;
+pub mod launch;
+pub mod model_facts;
+pub mod permission;
+pub mod prime;
 pub mod procs;
 pub mod profile;
 pub mod quiet;
 pub mod relaunch;
+/// Owned headless SDK control observations; never interactive TUI transition authority.
+pub mod sdk_permission;
 pub mod self_image;
 pub mod store;
 pub mod supervise;

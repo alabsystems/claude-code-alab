@@ -1,8 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A small, strict JSON reader for the one vendor record this harness reads
-//! (Claude Code's `sessions/<pid>.json`, [`crate::profile::SessionRecord`]).
+//! A small, strict JSON reader for the vendor's files this harness reads:
+//! Claude Code's `sessions/<pid>.json` ([`crate::profile::SessionRecord`]) and
+//! the rows of its transcript ([`crate::profile::permission_mode_of`],
+//! [`crate::model_facts`]).
 //!
 //! It parses RFC 8259 JSON into [`Value`] and refuses anything else: trailing
 //! bytes, unpaired surrogates, control bytes in strings, leading zeros, and
@@ -47,6 +49,15 @@ impl Value {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A boolean's value.
+    #[must_use]
+    pub const fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
             _ => None,
         }
     }

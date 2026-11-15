@@ -21,7 +21,7 @@
 //! identity without consuming any wait event; an incomplete read is no proof.
 
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -87,6 +87,88 @@ pub struct ProcessIdentity {
     pub executable: Executable,
 }
 
+/// Exact native executable observation, separate from the supervisor's capsule ABI.
+/// This is an observation, never input or transition authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecIdentity {
+    process: ProcessIdentity,
+    generation: (u64, i32, [u8; 16]),
+}
+
+impl ExecIdentity {
+    /// The process, lifetime and mapped executable observed together.
+    #[must_use]
+    pub fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    /// Whether the same native executable generation is still observable.
+    #[must_use]
+    pub fn current(&self) -> bool {
+        capture_exact_exec(self.process.pid).as_ref() == Some(self)
+    }
+
+    /// Diagnostic native identity; it is not a bearer token.
+    #[must_use]
+    pub fn diagnostic(&self) -> String {
+        format!(
+            "{}@{:?}:{}:{}",
+            self.process.pid, self.process.birth, self.generation.0, self.generation.1
+        )
+    }
+}
+
+/// Capture native exec generation around the complete process observation.
+/// Unknown generation stays unavailable; Linux birth/image equality is not exact exec evidence.
+#[must_use]
+pub fn capture_exact_exec(pid: u32) -> Option<ExecIdentity> {
+    let generation = exec_generation(pid)?;
+    let process = capture_process(pid)?;
+    (exec_generation(pid)? == generation).then_some(ExecIdentity {
+        process,
+        generation,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn exec_generation(pid: u32) -> Option<(u64, i32, [u8; 16])> {
+    // <sys/proc_info.h> proc_uniqidentifierinfo, the same flavor/layout used by
+    // aterm's vetted native process reader. No aterm library is linked here.
+    #[repr(C)]
+    struct Uniq {
+        uuid: [u8; 16],
+        unique: u64,
+        parent_unique: u64,
+        version: i32,
+        original_parent_version: i32,
+        reserved: [u64; 2],
+    }
+    const _: () = assert!(std::mem::size_of::<Uniq>() == 56);
+    let mut value = std::mem::MaybeUninit::<Uniq>::zeroed();
+    let size = i32::try_from(std::mem::size_of::<Uniq>()).ok()?;
+    // SAFETY: flavor17 writes at most size bytes to this correctly laid-out native record.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid).ok()?,
+            17,
+            0,
+            value.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if got != size {
+        return None;
+    }
+    // SAFETY: the kernel returned the complete initialized plain-data record.
+    let value = unsafe { value.assume_init() };
+    (value.unique > 0 && value.version > 0).then_some((value.unique, value.version, value.uuid))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exec_generation(_: u32) -> Option<(u64, i32, [u8; 16])> {
+    None
+}
+
 /// Capture complete live process facts, including this harness's own identity.
 ///
 /// This grants no child wait ownership. Unreaped processes and changing or
@@ -126,6 +208,33 @@ pub enum ChildState {
     /// Exited and still available for the supervisor's normal wait. This is
     /// terminal-event dispatch evidence, never live-session adoption evidence.
     Unreaped,
+}
+
+/// Exact wait lifetime only, without live-image or input authority. A helper's
+/// terminal event remains identifiable when its executable/session is gone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OwnedLifetime {
+    pub(crate) pid: u32,
+    parent: u32,
+    pub(crate) birth: Birth,
+}
+
+impl OwnedLifetime {
+    /// Must be called while the sole thread excludes every signal handler from
+    /// the fork/capture or observe/wait transaction. This never consumes events.
+    pub(crate) fn capture(pid: u32) -> Option<Self> {
+        let before = native_lifetime(pid)?;
+        if before.parent != std::process::id() || !owns_child(pid) {
+            return None;
+        }
+        let after = native_lifetime(pid)?;
+        (before == after).then_some(after)
+    }
+
+    /// Missing or changed native lifetime fails closed, including terminal state.
+    pub(crate) fn current(&self) -> bool {
+        Self::capture(self.pid).as_ref() == Some(self)
+    }
 }
 
 /// Fresh facts about the captured child, including facts unavailable after exit.
@@ -183,6 +292,29 @@ pub fn capture_child(pid: u32) -> Option<ChildIdentity> {
         && owns_child(pid)
         && executable(pid)? == identity.executable)
         .then_some(identity)
+}
+
+/// Pin the expected vendor image after a launch helper execs it in place.
+/// Every lifetime and parentage fact must still be the original child's, and
+/// the newly observed executable must be the exact expected file. This never
+/// authorizes following an arbitrary executable or a reused process id.
+#[must_use]
+pub fn refresh_child_image(expected: &ChildIdentity, target: &Path) -> Option<ChildIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let fresh = capture_child(expected.pid)?;
+    if fresh.pid != expected.pid
+        || fresh.parent != expected.parent
+        || fresh.pgid != expected.pgid
+        || fresh.session != expected.session
+        || fresh.birth != expected.birth
+    {
+        return None;
+    }
+    let target = std::fs::metadata(target).ok()?;
+    (target.is_file()
+        && fresh.executable.device == target.dev()
+        && fresh.executable.inode == target.ino())
+    .then_some(fresh)
 }
 
 /// Observe the same owned child, including its unreaped exit, without consuming events.
@@ -358,7 +490,7 @@ fn owns_child(_pid: u32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn kernel_identity(pid: u32) -> Option<KernelIdentity> {
+fn bsd_identity(pid: u32) -> Option<libc::proc_bsdinfo> {
     let p = libc::pid_t::try_from(pid).ok().filter(|p| *p > 1)?;
     let mut info = libc::proc_bsdinfo::default();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
@@ -371,6 +503,48 @@ fn kernel_identity(pid: u32) -> Option<KernelIdentity> {
     if n != size {
         return None;
     }
+    (info.pbi_pid == pid && info.pbi_ppid > 0 && info.pbi_start_tvsec > 0).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn lifetime_from_bsd(info: &libc::proc_bsdinfo) -> Option<OwnedLifetime> {
+    Some(OwnedLifetime {
+        pid: info.pbi_pid,
+        parent: info.pbi_ppid,
+        birth: Birth::MacOs {
+            seconds: info.pbi_start_tvsec,
+            microseconds: u32::try_from(info.pbi_start_tvusec)
+                .ok()
+                .filter(|us| *us < 1_000_000)?,
+        },
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn native_lifetime(pid: u32) -> Option<OwnedLifetime> {
+    lifetime_from_bsd(&bsd_identity(pid)?)
+}
+
+#[cfg(target_os = "linux")]
+fn native_lifetime(pid: u32) -> Option<OwnedLifetime> {
+    let identity = kernel_identity(pid)?;
+    Some(OwnedLifetime {
+        pid: identity.pid,
+        parent: identity.parent,
+        birth: identity.birth,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn native_lifetime(_pid: u32) -> Option<OwnedLifetime> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_identity(pid: u32) -> Option<KernelIdentity> {
+    let info = bsd_identity(pid)?;
+    let lifetime = lifetime_from_bsd(&info)?;
+    let p = libc::pid_t::try_from(pid).ok()?;
     let state = match info.pbi_status {
         libc::SZOMB => ChildState::Unreaped,
         libc::SSTOP => ChildState::Stopped,
@@ -389,21 +563,12 @@ fn kernel_identity(pid: u32) -> Option<KernelIdentity> {
                 .filter(|s| *s > 0)?,
         )
     };
-    if info.pbi_pid != pid || info.pbi_ppid == 0 || info.pbi_start_tvsec == 0 {
-        return None;
-    }
-    let microseconds = u32::try_from(info.pbi_start_tvusec)
-        .ok()
-        .filter(|us| *us < 1_000_000)?;
     Some(KernelIdentity {
         pid,
         parent: info.pbi_ppid,
         pgid: (info.pbi_pgid > 0).then_some(info.pbi_pgid),
         session,
-        birth: Birth::MacOs {
-            seconds: info.pbi_start_tvsec,
-            microseconds,
-        },
+        birth: lifetime.birth,
         state,
     })
 }
@@ -912,6 +1077,102 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_launch_helper_can_pin_only_its_same_lifetime_expected_vendor_after_exec() {
+        use std::io::{BufRead as _, Write as _};
+        let mut actor = NativeCat {
+            child: Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf 'helper-ready\\n'; IFS= read -r gate; exec /bin/cat",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("launch helper"),
+            reader: None,
+            reaped: false,
+        };
+        let stdout = actor.child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        actor.reader = Some(std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            for _ in 0..2 {
+                let mut line = String::new();
+                let answer = reader.read_line(&mut line).map(|_| line);
+                let _ = send.send(answer);
+            }
+        }));
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap()
+                .unwrap(),
+            "helper-ready\n"
+        );
+        let original = capture_child(actor.child.id()).expect("original helper identity");
+        assert_eq!(
+            refresh_child_image(&original, Path::new("/bin/cat")),
+            None,
+            "helper has not execed the vendor"
+        );
+        actor
+            .child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"go\nvendor-body-proof\n")
+            .unwrap();
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap()
+                .unwrap(),
+            "vendor-body-proof\n"
+        );
+        let fresh = refresh_child_image(&original, Path::new("/bin/cat"))
+            .expect("same child now runs vendor");
+        assert_eq!(fresh.pid, original.pid);
+        assert_eq!(fresh.birth, original.birth);
+        assert_ne!(fresh.executable, original.executable);
+        assert!(observe_child(&fresh).is_some());
+        assert_eq!(
+            observe_child(&original),
+            None,
+            "the old image remains invalid"
+        );
+        assert_eq!(
+            refresh_child_image(&original, Path::new("/bin/sh")),
+            None,
+            "an unrelated image is never adopted"
+        );
+        let mut wrong = original.clone();
+        wrong.birth = match original.birth {
+            Birth::MacOs {
+                seconds,
+                microseconds,
+            } => Birth::MacOs {
+                seconds: seconds + 1,
+                microseconds,
+            },
+            Birth::Linux(ticks) => Birth::Linux(ticks + 1),
+        };
+        assert_eq!(
+            refresh_child_image(&wrong, Path::new("/bin/cat")),
+            None,
+            "a pid with a different lifetime is never adopted"
+        );
+        let mut wrong = original;
+        wrong.parent += 1;
+        assert_eq!(
+            refresh_child_image(&wrong, Path::new("/bin/cat")),
+            None,
+            "changed parentage is never adopted"
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

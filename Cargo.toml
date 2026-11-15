@@ -15,7 +15,7 @@ members = ["."]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates"]
@@ -70,6 +70,23 @@ harness = false
 [[test]]
 name = "image"
 path = "tests/image.rs"
+harness = false
+
+# PTY allocation forks only after proving a genuinely single-threaded process.
+[[test]]
+name = "inner_pty"
+path = "tests/inner_pty.rs"
+harness = false
+
+# The owned SDK channel forks only from a genuinely single-threaded qualifier.
+[[test]]
+name = "sdk_permission"
+path = "tests/sdk_permission.rs"
+harness = false
+
+[[test]]
+name = "interactive_permission"
+path = "tests/interactive_permission.rs"
 harness = false
 
 [dependencies]

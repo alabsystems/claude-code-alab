@@ -13,8 +13,10 @@
 
 use std::io;
 
+pub(crate) mod custody;
 mod probe;
 mod transfer;
+pub use custody::AllSignals;
 pub use probe::{ProbeChild, ProbeSpawnRefusal, exec_exact};
 pub use transfer::{
     DescriptorExecGuard, DescriptorIdentity, HANDLED, INPUT_MODE_RESET, MANAGED, SignalBlock,

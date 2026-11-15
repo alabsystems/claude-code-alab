@@ -51,8 +51,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use claude_code_alab::cli::VERSION;
 
+#[path = "support/child_start.rs"]
+mod child_start;
 #[path = "support/aterm.rs"]
 mod fake_aterm;
+#[path = "support/inspect.rs"]
+mod inspect;
+#[path = "support/launch_host.rs"]
+mod launch_host;
+#[path = "support/launch_query_entry.rs"]
+mod launch_query_entry;
+#[path = "support/prime.rs"]
+mod prime;
 
 const HARNESS: &str = env!("CARGO_BIN_EXE_claude-alab");
 const TMP: &str = env!("CARGO_TARGET_TMPDIR");
@@ -63,7 +73,11 @@ const BUILD_3: u64 = 1_000_009_000_009_000_003;
 static SCENARIO_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
+    launch_host::signal_parent_entry();
+    launch_query_entry::entry();
+    launch_host::entry();
     if let Some(dir) = std::env::var_os("FAKE_CLAUDE_DIR") {
+        launch_host::record_signal_state(&PathBuf::from(&dir), "vendor-signals");
         fake::run(&PathBuf::from(dir));
     }
     // The controller is the only waiter; PTY reader threads never reap. Keep
@@ -80,6 +94,80 @@ fn main() {
     assert_eq!(installed, 0);
     let filter: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let tests: &[(&str, fn())] = &[
+        ("defaults_inspection_is_read_only_explicit_and_keeps_native_entry_guards", inspect::is_read_only_explicit_and_keeps_native_entry_guards),
+        ("defaults_inspection_reports_closed_bounded_unavailable_observations", inspect::reports_closed_bounded_unavailable_observations),
+        (
+            "legacy_cleanup_uses_the_same_guards_and_a_lossless_backup_receipt",
+            prime::legacy_cleanup_uses_the_same_guards_and_a_lossless_backup_receipt,
+        ),
+        (
+            "priming_retains_native_entry_guards_and_reports_only_its_closed_result",
+            prime::retains_native_entry_guards_and_reports_only_its_closed_result,
+        ),
+        (
+            "managed_usage_query_keeps_inherited_wait_policy_and_vendor_signal_state",
+            launch_host::managed_usage_query_keeps_inherited_wait_policy_and_vendor_signal_state,
+        ),
+        (
+            "managed_usage_query_is_bounded_in_the_actual_single_threaded_cli",
+            launch_host::managed_usage_query_is_bounded_in_the_actual_single_threaded_cli,
+        ),
+        (
+            "managed_usage_query_retains_a_foreign_native_wait_at_the_executable_boundary",
+            launch_host::managed_usage_query_retains_a_foreign_native_wait_at_the_executable_boundary,
+        ),
+        (
+            "aterm_child_start_precedes_every_vendor_body_and_keeps_bound_generation_on_reconnect",
+            child_start::precedes_every_vendor_body_and_keeps_bound_generation_on_reconnect,
+        ),
+        (
+            "aterm_child_start_uses_a_fresh_generation_after_an_unannounced_dead_attempt",
+            child_start::uses_a_fresh_generation_after_an_unannounced_dead_attempt,
+        ),
+        (
+            "aterm_a_refused_child_start_drops_authority_and_keeps_vendor_liveness",
+            child_start::a_refused_child_start_drops_authority_and_keeps_vendor_liveness,
+        ),
+        (
+            "managed_launch_owns_arguments_renderer_and_host_services",
+            launch_host::managed_launch_owns_arguments_renderer_and_host_services,
+        ),
+        (
+            "launch_only_executes_the_vendor_in_place_even_inside_a_rostered_aterm",
+            launch_host::launch_only_executes_the_vendor_in_place_even_inside_a_rostered_aterm,
+        ),
+        (
+            "renderer_honors_explicit_config_without_home",
+            launch_host::renderer_honors_explicit_config_without_home,
+        ),
+        (
+            "managed_child_proof_and_image_pinning_follow_the_token_exec",
+            launch_host::managed_child_proof_and_image_pinning_follow_the_token_exec,
+        ),
+        (
+            "managed_update_needs_no_installed_vendor",
+            launch_host::managed_update_needs_no_installed_vendor,
+        ),
+        (
+            "managed_token_route_survives_vendor_replacement",
+            launch_host::managed_token_route_survives_vendor_replacement,
+        ),
+        (
+            "managed_information_queries_never_invoke_host_services",
+            launch_host::managed_information_queries_never_invoke_host_services,
+        ),
+        (
+            "managed_option_values_stay_exact_and_keep_host_services",
+            launch_host::managed_option_values_stay_exact_and_keep_host_services,
+        ),
+        (
+            "managed_host_services_share_the_exact_no_harness_boundary",
+            launch_host::managed_host_services_share_the_exact_no_harness_boundary,
+        ),
+        (
+            "leading_word_metadata_opens_no_host_vendor_or_store_state",
+            launch_host::leading_word_metadata_opens_no_host_vendor_or_store_state,
+        ),
         (
             "version_names_the_harness_and_the_vendor",
             version_names_the_harness_and_the_vendor,
@@ -148,6 +236,14 @@ fn main() {
         (
             "a_tstp_sent_to_the_harness_is_followed",
             a_tstp_sent_to_the_harness_is_followed,
+        ),
+        (
+            "a_continued_vendor_does_not_receive_a_second_cont",
+            a_continued_vendor_does_not_receive_a_second_cont,
+        ),
+        (
+            "a_harness_only_cont_continues_its_stopped_vendor",
+            a_harness_only_cont_continues_its_stopped_vendor,
         ),
         (
             "relaunches_on_a_new_build_with_the_resume_argv",
@@ -222,6 +318,14 @@ fn main() {
             a_relaunch_resumes_the_conversations_permission_mode,
         ),
         (
+            "a_relaunch_preserves_option_values_that_spell_permission_flags",
+            a_relaunch_preserves_option_values_that_spell_permission_flags,
+        ),
+        (
+            "the_journal_names_the_childs_model_effort_and_key",
+            the_journal_names_the_childs_model_effort_and_key,
+        ),
+        (
             "a_broken_stderr_does_not_lose_the_session",
             a_broken_stderr_does_not_lose_the_session,
         ),
@@ -284,6 +388,10 @@ fn main() {
         (
             "a_malformed_adoption_follows_the_last_of_several_children",
             a_malformed_adoption_follows_the_last_of_several_children,
+        ),
+        (
+            "aterm_native_child_target_follows_the_first_start_restarts_and_vendor_moves",
+            aterm_native_child_target_follows_the_first_start_restarts_and_vendor_moves,
         ),
         (
             "aterm_claim_precedes_the_first_vendor_start",
@@ -742,6 +850,8 @@ impl Scenario {
             .env_remove("ATERM_PARENT_SESSION_ID")
             // Nor may it inherit that tab's `claude --no-harness`.
             .env_remove("ATERM_NO_HARNESS")
+            .env_remove("ATERM_HARNESS_HOST")
+            .env_remove("ALAB_TEST_HOST_IMAGE")
             .env_remove("CLAUDE_ALAB_PID")
             .env_remove("CLAUDE_ALAB_DEPTH");
         cmd
@@ -1380,6 +1490,7 @@ fn int_and_quit_belong_to_the_child() {
     let s = Scenario::new("int");
     let pty = Pty::open();
     let (_child, pid) = start_grouped(&s, &pty);
+    await_record(&s, 0);
     // INT and QUIT sent to the harness alone are dropped: neither it nor the child acts.
     signal(pid, libc::SIGINT);
     signal(pid, libc::SIGQUIT);
@@ -1410,6 +1521,9 @@ fn passed_on(sig: i32, word: &str, code: i32, name: &str) {
     let s = Scenario::new(name);
     let pty = Pty::open();
     let (_child, pid) = start_grouped(&s, &pty);
+    // The early start receipt precedes handler setup. The interactive record
+    // proves the fake can answer the forwarded signal with its own exit code.
+    await_record(&s, 0);
     let mut owned = Vec::new();
     s.with_owned_groups(|leader| owned.push(leader.pid));
     assert_eq!(owned, [pid as u32], "a live owned leader permits cleanup");
@@ -1507,6 +1621,80 @@ fn a_tstp_sent_to_the_harness_is_followed() {
         Some(Status::Exited(4)),
         "{}",
         s.report()
+    );
+}
+
+fn a_continued_vendor_does_not_receive_a_second_cont() {
+    let s = Scenario::new("cont-once");
+    s.put("mode", "cont-count");
+    let pty = Pty::open();
+    let (_child, pid) = start_grouped(&s, &pty);
+    let vendor = s.starts()[0].pid;
+    s.put("command", "stop");
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Stopped)
+    );
+    // A group CONT can schedule the vendor before its harness. Make that
+    // ordering explicit: the first handler ran before continuing the harness.
+    signal(vendor, libc::SIGCONT);
+    assert!(wait_until(Duration::from_secs(60), || s
+        .log()
+        .iter()
+        .any(|line| line == "cont-count 1")));
+    assert_eq!(pty.icanon(), Some(false));
+    signal(pid, libc::SIGCONT);
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Continued)
+    );
+    assert!(wait_until(Duration::from_secs(60), || s
+        .journal()
+        .contains(" continued\n")));
+    s.put("command", "cont-fence");
+    assert!(wait_until(Duration::from_secs(60), || s
+        .log()
+        .iter()
+        .any(|line| line.starts_with("cont-fence "))));
+    assert!(
+        s.log().iter().any(|line| line == "cont-fence 1"),
+        "one native continuation must run one vendor handler{}",
+        s.report()
+    );
+    assert_eq!(
+        pty.icanon(),
+        Some(false),
+        "no second handler changes the vendor's modes"
+    );
+    s.put("command", "exit:4");
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Exited(4))
+    );
+}
+
+fn a_harness_only_cont_continues_its_stopped_vendor() {
+    let s = Scenario::new("cont-harness");
+    let pty = Pty::open();
+    let (_child, pid) = start_grouped(&s, &pty);
+    s.put("command", "stop");
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Stopped)
+    );
+    signal(pid, libc::SIGCONT);
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Continued)
+    );
+    assert!(wait_until(Duration::from_secs(60), || s
+        .log()
+        .iter()
+        .any(|line| line == "continued")));
+    s.put("command", "exit:4");
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Exited(4))
     );
 }
 
@@ -1721,8 +1909,22 @@ fn never_relaunches_while_the_child_is_busy() {
     s.put("status", "busy");
     let pty = Pty::open();
     let (_child, pid) = start_on_pty(&s, &pty, &[]);
+    let ready = s.store.join(format!("{BUILD_2}.ready"));
+    let valid_ready = std::fs::read(&ready).expect("target ready");
+    std::fs::write(&ready, "unfinished\n").expect("unfinished target");
     s.set_current(BUILD_2);
-    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        wait_until(Duration::from_secs(60), || s
+            .journal()
+            .contains("wait busy")),
+        "the busy gate did not hold before inspecting the pending build{}",
+        s.report()
+    );
+    assert!(
+        !s.journal().contains("update-unusable"),
+        "the busy session needlessly inspected the pending build{}",
+        s.report()
+    );
     assert_eq!(s.starts().len(), 1, "relaunched a busy child{}", s.report());
     assert!(
         !s.log().iter().any(|l| l == "signal TERM"),
@@ -1731,10 +1933,24 @@ fn never_relaunches_while_the_child_is_busy() {
     );
     assert!(s.journal().contains("wait busy"), "{}", s.report());
     assert_eq!(wait_status(pid, Duration::ZERO), None);
-    // The turn ends: once idle has settled, the update goes through.
+    // The turn ends: only now inspect the pending build, and refuse it until
+    // its ready marker admits it. No metadata read before the hold may be cached.
     s.put("status", "idle");
     assert!(
-        wait_until(Duration::from_secs(15), || s.starts().len() >= 2),
+        wait_until(Duration::from_secs(60), || s
+            .journal()
+            .contains("update-unusable")),
+        "the target was not validated once the busy gate cleared{}",
+        s.report()
+    );
+    assert!(
+        !s.log().iter().any(|l| l == "signal TERM"),
+        "the unfinished target ended the running child{}",
+        s.report()
+    );
+    std::fs::write(&ready, valid_ready).expect("finish target");
+    assert!(
+        wait_until(Duration::from_secs(60), || s.starts().len() >= 2),
         "no relaunch once idle{}",
         s.report()
     );
@@ -1915,6 +2131,7 @@ fn runs_in_place(
     let s = Scenario::new(name);
     let fake = rostered_aterm(&s);
     let (_pty, _child, pid) = start_unmoved(&s, &fake, stdin, args, raw);
+    await_record(&s, 0);
     assert_ran_in_place(&s, 0, pid, reason, 1);
     assert_eq!(s.starts()[0].args, got, "every vendor argument, unchanged");
     assert_eq!(
@@ -2345,6 +2562,104 @@ fn a_relaunch_resumes_the_conversations_permission_mode() {
     );
 }
 
+fn a_relaunch_preserves_option_values_that_spell_permission_flags() {
+    let s = Scenario::new("permission-value");
+    let project = s.home.join(".claude/projects/-scenario-work");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        project.join(format!("{SID}.jsonl")),
+        format!(
+            "{{\"type\":\"permission-mode\",\"permissionMode\":\"auto\",\"sessionId\":\"{SID}\"}}\n"
+        ),
+    )
+    .expect("transcript");
+    let pty = Pty::open();
+    let launch = [
+        "--permission-mode",
+        "default",
+        "--append-system-prompt",
+        "--dangerously-skip-permissions",
+    ];
+    let (_child, pid) = start_on_pty(&s, &pty, &launch);
+    let _first = await_record(&s, 0);
+    assert_eq!(s.starts()[0].args, launch);
+    s.set_current(BUILD_2);
+    let _second = await_record(&s, 1);
+    assert_eq!(
+        s.starts()[1].args,
+        [
+            "--append-system-prompt",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "auto",
+            "--resume",
+            SID,
+        ],
+        "the new mode changes posture without consuming another flag's value{}",
+        s.report()
+    );
+    end_session(&s, pid);
+}
+
+/// The supervisor journals the model, effort level and top-effort key its
+/// child states in its transcript, one `facts` line per change. A row from
+/// before the child started (the conversation's older model and level) is not
+/// the child's: the first line names the child's own model and no level, and
+/// no line names the older model. Rows appended later move the facts.
+fn the_journal_names_the_childs_model_effort_and_key() {
+    let s = Scenario::new("model-facts");
+    let project = s.home.join(".claude/projects/-scenario-work");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let transcript = project.join(format!("{SID}.jsonl"));
+    // Stamped after the child's start whenever this runs.
+    let later = "2099-01-01T00:00:00.000Z";
+    std::fs::write(
+        &transcript,
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"2020-01-01T00:00:00.000Z\",\"effort\":\"low\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n\
+             {{\"type\":\"assistant\",\"timestamp\":\"{later}\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n"
+        ),
+    )
+    .expect("transcript");
+    let pty = Pty::open();
+    let (_child, pid) = start_on_pty(&s, &pty, &[]);
+    await_record(&s, 0);
+    await_journal(
+        &s,
+        Duration::from_secs(10),
+        "facts model=Opus_5.5 effort=- key=-",
+    );
+    // Both rows in one write, so no look sees one without the other.
+    let rows = format!(
+        "{{\"type\":\"attachment\",\"timestamp\":\"{later}\",\"attachment\":{{\"type\":\"ultra_effort_enter\"}}}}\n\
+         {{\"type\":\"assistant\",\"timestamp\":\"{later}\",\"effort\":\"high\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n"
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("transcript")
+        .write_all(rows.as_bytes())
+        .expect("append");
+    await_journal(
+        &s,
+        Duration::from_secs(10),
+        "facts model=Opus_5.5 effort=high key=on",
+    );
+    let journal = s.journal();
+    assert!(
+        !journal.contains("Fable") && !journal.contains("effort=low"),
+        "a row from before the child started is not its own{}",
+        s.report()
+    );
+    assert_eq!(
+        journal.matches(" facts ").count(),
+        2,
+        "one line per change{}",
+        s.report()
+    );
+    end_session(&s, pid);
+}
+
 fn a_broken_stderr_does_not_lose_the_session() {
     let s = Scenario::new("broken-stderr");
     // stderr is a pipe nobody reads any more: every write to it fails (EPIPE).
@@ -2752,6 +3067,54 @@ fn end_session(s: &Scenario, pid: i32) {
         "{}",
         s.report()
     );
+}
+
+/// A negotiated host names the real vendor lifetime, not the harness or the
+/// record's approximate startedAt. Every new child replaces the old target.
+fn aterm_native_child_target_follows_the_first_start_restarts_and_vendor_moves() {
+    let s = Scenario::new("aterm-child-proof");
+    let fake = rostered_aterm(&s);
+    fake.set_info(&format!("{INFO_ROSTERED} child-proof=1"));
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    let assert_child = |vendor: &str, child: i32| {
+        let identity = claude_code_alab::procs::capture_process(u32::try_from(child).unwrap())
+            .expect("live vendor native identity");
+        let birth = match identity.birth {
+            claude_code_alab::procs::Birth::MacOs {
+                seconds,
+                microseconds,
+            } => seconds * 1_000_000 + u64::from(microseconds),
+            claude_code_alab::procs::Birth::Linux(ticks) => ticks,
+        };
+        let expected = format!("{} child={child}:{birth}", claim_text(pid, vendor));
+        assert!(
+            wait_until(Duration::from_secs(60), || asked(&fake, &expected) == 1),
+            "missing native child target {expected}{}",
+            s.report()
+        );
+    };
+    let first = await_record(&s, 0);
+    assert_child("9.9.1", first);
+    assert_eq!(
+        asked(&fake, &claim_text(pid, "9.9.1")),
+        1,
+        "the initial claim precedes spawn"
+    );
+    fake.event("restart cause=asked");
+    let second = await_record(&s, 1);
+    assert_ne!(second, first);
+    assert_child("9.9.1", second);
+    s.set_current(BUILD_2);
+    let third = await_record(&s, 2);
+    assert_ne!(third, second);
+    assert_child("9.9.2", third);
+    assert_eq!(
+        claims_sent(&fake),
+        4,
+        "one initial claim and one for each child"
+    );
+    end_session(&s, pid);
 }
 
 /// The whole claim sequence is over before the vendor exists, in order, and
@@ -4789,6 +5152,17 @@ fn aterm_a_policy_back_on_without_an_event_is_claimed_again() {
         "never claimed again{}",
         s.report()
     );
+    // The server stores its holder before the client finishes guarded_claim's
+    // status proof. Observe client completion separately before its journal.
+    assert!(
+        wait_until(Duration::from_secs(60), || s
+            .journal()
+            .matches(" aterm claimed ")
+            .count()
+            == 2),
+        "client did not finish the reclaimed claim{}",
+        s.report()
+    );
     let journal = s.journal();
     assert_eq!(
         journal.matches(" aterm claimed ").count(),
@@ -5167,6 +5541,9 @@ fn aterm_a_claim_made_again_after_a_look_released_it_is_journalled() {
         s.report()
     );
     await_journal(&s, Duration::from_secs(5), "wait unread-input");
+    // The build change woke the look. Retire it before reclaiming so the
+    // cleanup command cannot race an unrelated vendor replacement.
+    s.set_current(BUILD_1);
     fake.set_policy_quietly(POLICY_ON);
     assert!(
         wait_until(Duration::from_secs(15), || fake.holder() == holder),
@@ -5649,7 +6026,7 @@ fn the_twin_envelope_reaches_the_vendor_with_exactly_those_arguments() {
                 "-p",
             ],
         ),
-        (&["run", "--"], &[]),
+        (&["run", "--"], &["--dangerously-skip-permissions"]),
         (
             &["--alab-poll-ms=40", "run", "--", "--alab-poll-ms=41", "-c"],
             &["--alab-poll-ms=41", "-c"],
@@ -5775,13 +6152,14 @@ fn no_harness_is_read_only_as_one_and_only_inside_aterm() {
     let mut supervised = 0;
     let mut no_terminal = 0;
     // Left out: each way a launch is inside aterm, with and without the envelope.
-    for (inside, args) in [
-        (("ATERM_CHILD", "1"), &args[..]),
-        (("TERM_PROGRAM", "aterm"), &args[..]),
-        (("ATERM_SESSION_ID", "s"), &args[..]),
+    for (inside, args, managed) in [
+        (("ATERM_CHILD", "1"), &args[..], true),
+        (("TERM_PROGRAM", "aterm"), &args[..], true),
+        (("ATERM_SESSION_ID", "s"), &args[..], true),
         (
             ("ATERM_CHILD", "1"),
             &["--alab-poll-ms=40", "--model", "x y"][..],
+            false,
         ),
     ] {
         let env = [
@@ -5797,7 +6175,12 @@ fn no_harness_is_read_only_as_one_and_only_inside_aterm() {
             start.pid, pid,
             "the vendor took the harness's place: {env:?}"
         );
-        assert_eq!(start.args, ["--model", "x y"], "{env:?}");
+        let expected = if managed {
+            &["--dangerously-skip-permissions", "--model", "x y"][..]
+        } else {
+            &["--model", "x y"][..]
+        };
+        assert_eq!(start.args, expected, "managed={managed} {env:?}");
         assert_eq!(start.shim, format!("{BUILD_1}"), "the build's shim env");
         assert_eq!(
             marks(&s).last().map(String::as_str),
@@ -5821,7 +6204,11 @@ fn no_harness_is_read_only_as_one_and_only_inside_aterm() {
         let (pid, code, start) = launch_with(&s, &args, env);
         no_terminal += 1;
         assert_eq!(code, Some(7), "{env:?}{}", s.report());
-        assert_eq!(start.args, ["--model", "x y"], "{env:?}");
+        assert_eq!(
+            start.args,
+            ["--dangerously-skip-permissions", "--model", "x y"],
+            "{env:?}"
+        );
         assert_ran_in_place(&s, at, pid, "no-tty", 1);
     }
     // On a terminal it is supervised: the vendor is the harness's child and
@@ -5832,7 +6219,11 @@ fn no_harness_is_read_only_as_one_and_only_inside_aterm() {
         supervised += 1;
         assert_eq!(status, Some(Status::Exited(7)), "{env:?}{}", s.report());
         assert_ne!(start.pid, pid, "the vendor is the harness's child: {env:?}");
-        assert_eq!(start.args, ["--model", "x y"], "{env:?}");
+        assert_eq!(
+            start.args,
+            ["--dangerously-skip-permissions", "--model", "x y"],
+            "{env:?}"
+        );
         assert_eq!(
             marks(&s).last().cloned(),
             Some(format!("marks\tCLAUDE_ALAB_PID={pid}\tCLAUDE_ALAB_DEPTH=1")),
@@ -5907,7 +6298,12 @@ fn no_harness_in_an_aterm_tab_says_nothing_to_aterm() {
     let (_child, pid) = spawn_on_pty(&s, &pty, cmd, None);
     let starts = s.starts();
     assert_eq!(starts[0].pid, pid, "exec'd in place{}", s.report());
-    assert_eq!(starts[0].args, ["--model", "opus"], "{}", s.report());
+    assert_eq!(
+        starts[0].args,
+        ["--dangerously-skip-permissions", "--model", "opus"],
+        "{}",
+        s.report()
+    );
     assert!(
         wait_until(Duration::from_secs(10), || !marks(&s).is_empty()),
         "{}",
@@ -6105,9 +6501,14 @@ mod fake {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     static LAST: AtomicI32 = AtomicI32::new(0);
+    static CONT: AtomicU64 = AtomicU64::new(0);
 
     extern "C" fn on_signal(sig: libc::c_int) {
-        LAST.store(sig, Ordering::Relaxed);
+        if sig == libc::SIGCONT {
+            CONT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            LAST.store(sig, Ordering::Relaxed);
+        }
     }
 
     fn now_ms() -> u64 {
@@ -6237,6 +6638,7 @@ mod fake {
         }
         // SAFETY: `isatty` only inspects fd 0.
         let tty = unsafe { libc::isatty(0) } == 1;
+        let mut original_modes = None;
         if tty {
             // Raw mode, as a TUI runs: keys arrive one by one, no signals from keys.
             // The modes found at start are logged first: a relaunched child must
@@ -6245,12 +6647,16 @@ mod fake {
             unsafe {
                 let mut t: libc::termios = std::mem::zeroed();
                 if libc::tcgetattr(0, &raw mut t) == 0 {
+                    original_modes = Some(t);
                     let icanon = t.c_lflag & libc::ICANON != 0;
                     log(dir, &format!("modes icanon={}", u8::from(icanon)));
                     libc::cfmakeraw(&raw mut t);
                     libc::tcsetattr(0, libc::TCSANOW, &raw const t);
                 }
             }
+        }
+        if mode.trim() == "cont-count" {
+            handle(libc::SIGCONT);
         }
         let mut background: Vec<std::process::Child> = Vec::new();
         // While deaf, typed input waits unread in the terminal's input queue.
@@ -6262,7 +6668,22 @@ mod fake {
         let started = now_ms();
         let mut status = String::new();
         let deadline = Instant::now() + Duration::from_secs(90);
+        let mut continued = 0;
         loop {
+            let count = CONT.load(Ordering::Relaxed);
+            if count != continued {
+                continued = count;
+                if count > 1 {
+                    // A duplicate handler can change terminal state after
+                    // the first resume. The harness must send no duplicate,
+                    // rather than later clobber that handler's chosen modes.
+                    let original = original_modes.as_ref().expect("terminal modes");
+                    // SAFETY: fd 0 is this fake's terminal; the modes came
+                    // from tcgetattr before this fake entered raw mode.
+                    assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, original) }, 0);
+                }
+                log(dir, &format!("cont-count {count}"));
+            }
             let want = std::fs::read_to_string(dir.join("status"))
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| "idle".to_string());
@@ -6282,9 +6703,10 @@ mod fake {
                     end(dir, 43);
                 }
                 libc::SIGTERM => {
-                    log(dir, "signal TERM");
                     let ignore = std::fs::read_to_string(dir.join("term"))
                         .is_ok_and(|t| t.trim() == "ignore");
+                    // The controller may change the disposition after this receipt.
+                    log(dir, "signal TERM");
                     if !ignore {
                         end(dir, 70);
                     }
@@ -6298,7 +6720,9 @@ mod fake {
             if let Ok(cmd) = std::fs::read_to_string(dir.join("command")) {
                 let _ = std::fs::remove_file(dir.join("command"));
                 let cmd = cmd.trim();
-                if let Some(code) = cmd.strip_prefix("exit:") {
+                if cmd == "cont-fence" {
+                    log(dir, &format!("cont-fence {}", CONT.load(Ordering::Relaxed)));
+                } else if let Some(code) = cmd.strip_prefix("exit:") {
                     end(dir, code.parse().expect("exit code"));
                 } else if let Some(code) = cmd.strip_prefix("crash:") {
                     // A crash: gone with this code, the session record left

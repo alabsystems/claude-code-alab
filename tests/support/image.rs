@@ -603,7 +603,13 @@ mod native {
             precommit,
         })
         .expect("single-threaded fixture hook installation");
-        cli::main_with_image_host(factory)
+        match cli::main_with_image_host(factory) {
+            Ok(never) => match never {},
+            Err(retained) => {
+                std::mem::forget(retained);
+                std::process::exit(70);
+            }
+        }
     }
 
     static TERM: AtomicBool = AtomicBool::new(false);
@@ -939,7 +945,7 @@ mod native {
                 let error = io::Error::last_os_error();
                 let _owner = ProofOwner {
                     child: None,
-                    signals: Some(block),
+                    signals: Some(ProofMask::Managed(block)),
                 };
                 return Err(error);
             }
@@ -1269,39 +1275,85 @@ mod native {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         Ok(path)
     }
+    enum ProofMask {
+        Managed(sys::SignalBlock),
+        All(sys::AllSignals),
+    }
+    impl ProofMask {
+        fn restore(&mut self) -> io::Result<()> {
+            match self {
+                Self::Managed(block) => block.restore(),
+                Self::All(block) => block.restore(),
+            }
+        }
+    }
     struct ProofOwner {
         child: Option<sys::ProbeChild>,
-        signals: Option<sys::SignalBlock>,
+        signals: Option<ProofMask>,
+    }
+    fn spawn_proof_owner(
+        path: &Path,
+        args: &[OsString],
+        changes: &[(OsString, OsString)],
+    ) -> io::Result<ProofOwner> {
+        let mut owner = ProofOwner {
+            child: None,
+            signals: None,
+        };
+        match sys::ProbeChild::spawn(path, args, changes) {
+            Ok(child) => owner.child = Some(child),
+            Err(refused) => {
+                owner.child = refused.child.map(|child| *child);
+                owner.signals = refused.signals.map(|block| ProofMask::All(*block));
+                return Err(refused.error);
+            }
+        }
+        Ok(owner)
+    }
+    fn lost_proof_owner(_held: &mut ProofOwner) -> ! {
+        // This is the dev test executable's terminal boundary, never a library
+        // recovery path. exit skips Drop, retaining child/mask receipt and all
+        // immutable worlds through terminal failure without another signal.
+        let _ = writeln!(
+            io::stderr(),
+            "copied-image cleanup refused: original wait custody lost; every world/image retained"
+        );
+        std::process::exit(70)
     }
     impl Drop for ProofOwner {
         fn drop(&mut self) {
             let detector = Instant::now() + HANG;
             let mut warned = false;
             loop {
+                if self
+                    .child
+                    .as_ref()
+                    .is_some_and(sys::ProbeChild::ownership_lost)
+                {
+                    lost_proof_owner(self);
+                }
                 if let Some(block) = self.signals.as_mut()
                     && block.restore().is_ok()
                 {
                     self.signals = None;
                 }
                 if let Some(child) = self.child.as_mut()
-                    && child.pid().is_some()
+                    && child.pending()
                 {
                     let _ = child.cancel();
-                    if child
-                        .try_wait()
-                        .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
-                    {
-                        eprintln!(
-                            "copied-image cleanup lost terminal proof (ECHILD); stale ownership relinquished"
-                        );
-                        self.child = None;
+                    if !child.ownership_lost() {
+                        let _ = child.try_wait();
                     }
                 }
+                if self
+                    .child
+                    .as_ref()
+                    .is_some_and(sys::ProbeChild::ownership_lost)
+                {
+                    lost_proof_owner(self);
+                }
                 if self.signals.is_none()
-                    && self
-                        .child
-                        .as_ref()
-                        .is_none_or(|child| child.pid().is_none())
+                    && self.child.as_ref().is_none_or(|child| !child.pending())
                 {
                     break;
                 }
@@ -1315,6 +1367,65 @@ mod native {
             }
         }
     }
+    extern "C" fn steal_probe_wait(_: libc::c_int) {
+        let mut status = 0;
+        // SAFETY: this private negative-control role deliberately steals its
+        // only child's terminal event; it returns no settlement authority.
+        unsafe {
+            libc::waitpid(-1, &raw mut status, libc::WNOHANG);
+        }
+    }
+
+    fn lose_proof_owner() -> io::Result<()> {
+        require_controller_wait_ownership()?;
+        let mut owner = spawn_proof_owner(Path::new("/usr/bin/true"), &[], &[])?;
+        until("lost-owner child terminal event", || {
+            Ok(sys::child_has_ended(owner.child.as_ref().unwrap().pid().unwrap()).then_some(()))
+        })?;
+        // SAFETY: initialized writable native action and explicit unmanaged signal
+        // in this isolated test role, which terminates through owner cleanup.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = steal_probe_wait as *const () as usize;
+        // SAFETY: valid action; delivering this process's own signal runs only the
+        // deliberate reaper above while its original owner receipt stays held.
+        unsafe {
+            libc::sigemptyset(&raw mut action.sa_mask);
+            if libc::sigaction(libc::SIGUSR1, &raw const action, std::ptr::null_mut()) != 0
+                || libc::raise(libc::SIGUSR1) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        require(
+            owner.child.as_mut().unwrap().try_wait().is_err(),
+            "reaper must remove actual wait custody",
+        )?;
+        drop(owner);
+        Err(invalid("lost ProofOwner returned without terminal refusal"))
+    }
+
+    fn proof_owner_refuses_lost_wait_at_terminal(exe: &Path) -> io::Result<()> {
+        let mut owner = spawn_proof_owner(exe, &["--fixture-lost-proof-owner".into()], &[])?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let status = until("lost-owner terminal refusal", || {
+            let child = owner.child.as_mut().unwrap();
+            child.drain_total(&mut out, &mut err, 64 * 1024)?;
+            child.try_wait()
+        })?;
+        owner
+            .child
+            .as_mut()
+            .unwrap()
+            .drain_total(&mut out, &mut err, 64 * 1024)?;
+        require(
+            status.code() == Some(70)
+                && String::from_utf8_lossy(&err).contains("original wait custody lost"),
+            "lost probe receipt must fail terminally, never report settled success",
+        )?;
+        println!("image: lost-wait cleanup control passed; terminal refusal=70");
+        Ok(())
+    }
     fn body_proof(
         path: &Path,
         args: &[OsString],
@@ -1323,10 +1434,6 @@ mod native {
         root: &Path,
     ) -> io::Result<()> {
         require_controller_wait_ownership()?;
-        let mut owner = ProofOwner {
-            child: None,
-            signals: None,
-        };
         let changes = [
             ("HOME".into(), home.as_os_str().to_owned()),
             (
@@ -1335,14 +1442,7 @@ mod native {
             ),
             ("XDG_STATE_HOME".into(), root.join("state").into_os_string()),
         ];
-        match sys::ProbeChild::spawn(path, args, &changes) {
-            Ok(child) => owner.child = Some(child),
-            Err(refused) => {
-                owner.child = refused.child;
-                owner.signals = refused.signals;
-                return Err(refused.error);
-            }
-        }
+        let mut owner = spawn_proof_owner(path, args, &changes)?;
         let child = owner
             .child
             .as_mut()
@@ -1913,6 +2013,9 @@ mod native {
             _ => {}
         }
         let private_args: Vec<_> = std::env::args_os().skip(1).collect();
+        if private_args == [OsString::from("--fixture-lost-proof-owner")] {
+            return lose_proof_owner();
+        }
         if private_args == [OsString::from("--fixture-exact-env-hop")] {
             require_controller_wait_ownership()?;
             let _block = sys::SignalBlock::managed()?;
@@ -1931,6 +2034,7 @@ mod native {
             return Ok(());
         }
         let (args, requested) = super::qualification_args();
+        proof_owner_refuses_lost_wait_at_terminal(&exe)?;
         if !requested {
             println!(
                 "NOT RUN: different-image qualification requires OLD_IMAGE OLD_COMPILED_VERSION PERSISTENT_NATIVE_WORLD; no execution proof claimed"
@@ -1960,6 +2064,9 @@ mod native {
             "Native world must be an absolute owned .ubd/*.noindex path",
         )?;
         std::fs::create_dir_all(&root)?;
+        // Native executable paths resolve aliases such as /tmp to /private/tmp.
+        // Derive every fixture path from the same physical world directory.
+        let root = root.canonicalize()?;
         for case in [
             Case::Busy,
             Case::ExecFailure,
