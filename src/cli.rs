@@ -515,6 +515,8 @@ pub fn main() -> Result<std::convert::Infallible, crate::sys::ProbeSpawnRefusal>
 pub fn main_with_image_host(
     factory: crate::supervise::image::HostFactory,
 ) -> Result<std::convert::Infallible, crate::sys::ProbeSpawnRefusal> {
+    use std::io::IsTerminal as _;
+    let original_stdout_terminal = std::io::stdout().is_terminal();
     let words: Vec<_> = std::env::args_os().skip(1).collect();
     if let Some(status) = capability_query(&words) {
         std::process::exit(status);
@@ -543,6 +545,25 @@ pub fn main_with_image_host(
             std::process::exit(EXIT_VENDOR_MISSING);
         }
     };
+    if let Some(result) = crate::folder_trust::entry(&words) {
+        let request = match result {
+            Ok(request) => request,
+            Err(why) => {
+                say(&format!("{TOOL}: {why}"));
+                std::process::exit(EXIT_USAGE)
+            }
+        };
+        let outcome = request.run()?;
+        if let crate::folder_trust::Outcome::Interrupted { signal } = outcome {
+            std::process::exit(128 + signal);
+        }
+        let response = crate::folder_trust::response(&outcome);
+        let written = std::io::stdout().lock().write_all(response.as_bytes());
+        if written.is_err() {
+            std::process::exit(EXIT_USAGE)
+        }
+        std::process::exit(0);
+    }
     if let Some(result) = crate::prime::entry(&words) {
         match result.and_then(|effect| crate::prime::response(&effect)) {
             Ok(row) => {
@@ -660,10 +681,24 @@ pub fn main_with_image_host(
         pass_through(&home, &build, &args, depth, LEFT_OUT_REASON);
     }
     if managed && !informational {
+        let trust = crate::folder_trust::settle(&build, &args, original_stdout_terminal)?;
+        if !matches!(&trust, crate::folder_trust::Outcome::Skipped(_)) {
+            Journal::new(
+                std::env::var_os("XDG_STATE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref(),
+                Some(&home),
+                std::process::id(),
+            )
+            .note(&trust.description());
+        }
+        if let crate::folder_trust::Outcome::Interrupted { signal } = trust {
+            std::process::exit(128 + signal);
+        }
         crate::launch::usage_tap(&mut args)?;
     }
-    // Decided once, here: before a word to aterm and before any signal handling
-    // exists, so the vendor starts in this process as a shell would start it.
+    // Launch preparation has restored the caller's signal policy. Only a
+    // resumable terminal session proceeds to resident supervision below.
     if let Some(reason) =
         crate::supervise::live_update_refusal(live_update, crate::sys::stdin_is_terminal(), &args)
     {

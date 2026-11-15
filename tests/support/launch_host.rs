@@ -135,6 +135,33 @@ pub(super) fn entry() {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        [
+            "harness",
+            "launch-trust",
+            "gate",
+            "--cwd-hex",
+            cwd,
+            "--vendor-hex",
+            vendor,
+            "--session",
+            session,
+            "--stdout-tty",
+            "1",
+        ] => {
+            assert!(
+                session
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)),
+                "private fixture session is a plain JSON word"
+            );
+            // These older launch controls deliberately have no configured
+            // folder policy. A closed unread observation leaves their vendor
+            // dialog behavior alone and starts no attestation child.
+            println!(
+                "{{\"schema\":1,\"operation\":\"folder-trust-gate\",\"status\":\"unread\",\"cwd_hex\":\"{cwd}\",\"vendor_hex\":\"{vendor}\",\"session\":\"{session}\",\"stdout_tty\":true,\"rule\":null,\"reason\":\"fixture-policy-unconfigured\"}}"
+            );
+            std::process::exit(0);
+        }
         ["renderer-probe"] => {
             let mut command = Command::new("vendor-must-not-run");
             claude_code_alab::launch::renderer(&mut command);
@@ -1077,10 +1104,56 @@ pub(super) fn launch_only_executes_the_vendor_in_place_even_inside_a_rostered_at
             .contains(&"--dangerously-skip-permissions".into())
     );
     let calls = std::fs::read_to_string(s.fake.join("host-log")).expect("host calls");
+    let calls = calls.lines().collect::<Vec<_>>();
     assert_eq!(
-        calls.lines().count(),
-        2,
-        "tap setup and same-PID token exec: {calls}"
+        calls.len(),
+        3,
+        "closed cold-policy observation, tap setup and same-PID token exec: {calls:?}"
+    );
+    let native_hex = |path: &Path| {
+        use std::fmt::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut text = String::new();
+        for byte in path.as_os_str().as_bytes() {
+            write!(&mut text, "{byte:02x}").unwrap();
+        }
+        text
+    };
+    let session = fake
+        .env()
+        .into_iter()
+        .find(|(key, _)| *key == "ATERM_PARENT_SESSION_ID")
+        .map(|(_, value)| value)
+        .unwrap();
+    assert_eq!(
+        calls[0].split('\t').collect::<Vec<_>>(),
+        [
+            "harness",
+            "launch-trust",
+            "gate",
+            "--cwd-hex",
+            &native_hex(&s.work.canonicalize().unwrap()),
+            "--vendor-hex",
+            &native_hex(
+                &s.store
+                    .join(BUILD_1.to_string())
+                    .join("bin/claude")
+                    .canonicalize()
+                    .unwrap()
+            ),
+            "--session",
+            &session,
+            "--stdout-tty",
+            "1"
+        ]
+    );
+    assert!(
+        calls[1].starts_with("harness\ttap\t--launch\t--\t"),
+        "{calls:?}"
+    );
+    assert!(
+        calls[2].starts_with("harness\taccounts\ttoken-run\t--auto\t--\t"),
+        "{calls:?}"
     );
     s.set_current(BUILD_2);
     s.put("command", "exit:5");

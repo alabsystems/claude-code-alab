@@ -95,8 +95,11 @@ pub(super) const RECLAIM_HOLD_MS: u64 = 45_000;
 pub(super) const LATER_RETRY_MS: u64 = 1_000;
 
 /// The duties the claim takes: bringing a crashed child back on its
-/// conversation, and moving the child onto another vendor build. Nothing this
-/// harness does not do.
+/// conversation, and moving the child onto another vendor build. Only the
+/// duties a build ships: a duty named here is one aterm's built-in engine
+/// stops performing for the session, so the four typing duties
+/// ([`Scope::types`]) join it only with the code that performs them, which
+/// [`crate::typing`]'s client does not yet.
 const SCOPES: [Scope; 2] = [Scope::Relaunch, Scope::Upgrade];
 
 /// [`SCOPES`] as the claim spells them: `relaunch,upgrade`.
@@ -208,12 +211,34 @@ fn child_start_ask(
     step: &str,
     request: Option<String>,
 ) -> Result<String, Failure> {
-    let left = deadline
-        .checked_duration_since(Instant::now())
+    child_start_ask_at(conn, deadline, Instant::now(), step, request)
+}
+
+fn child_start_ask_at(
+    conn: &mut Connection,
+    deadline: Instant,
+    now: Instant,
+    step: &str,
+    request: Option<String>,
+) -> Result<String, Failure> {
+    deadline
+        .checked_duration_since(now)
         .filter(|left| !left.is_zero())
         .ok_or_else(|| Failure::Gone("child-start deadline".to_string()))?;
-    conn.set_timeout(left);
-    ask(conn, step, request)
+    let request = request.ok_or_else(|| Failure::Refused(format!("{step} request-unsendable")))?;
+    conn.request_line_until(&request, deadline)
+        .map_err(|error| Failure::Gone(format!("{step} {error}")))
+}
+
+#[cfg(test)]
+pub(crate) fn child_start_ask_control(
+    conn: &mut Connection,
+    deadline: Instant,
+    now: Instant,
+    step: &str,
+    request: Option<String>,
+) -> Result<String, ()> {
+    child_start_ask_at(conn, deadline, now, step, request).map_err(|_| ())
 }
 
 /// One fresh `harness policy`.
@@ -770,6 +795,14 @@ impl Claimed {
     }
 }
 
+/// Known native lifetime metadata, independently of optional generation support.
+/// The host still reproves the actual child and image; this grants no input authority.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct KnownChild {
+    child: aterm::ChildProof,
+    generation: Option<u64>,
+}
+
 /// What the supervisor has of aterm.
 pub(super) enum Link {
     /// Nothing, for the rest of the session: the harness is outside aterm, the
@@ -800,9 +833,9 @@ pub(super) enum Link {
         /// stands until aterm answers again: a proven claim, or a refusal,
         /// which is aterm's newer word.
         held: Option<String>,
-        /// A generation acknowledged for this exact child, retained on request
-        /// reconnect so a live child keeps its original pre-spawn output floor.
-        generation: Option<(aterm::ChildProof, u64)>,
+        /// The known child, including proof-only hosts with no start generation.
+        /// A missing observation is not evidence that this lifetime ended.
+        known: Option<KnownChild>,
     },
 }
 
@@ -835,7 +868,21 @@ impl Link {
                     Err(failure) => failure,
                 }
             }
-            _ => return,
+            Self::Held(claimed) => {
+                // Every caller arrives after its prior child's owned end. This is
+                // an explicit new attempt, not a temporarily unavailable observation.
+                claimed.child = None;
+                claimed.generation = None;
+                claimed.child_pending = claimed.child_proof;
+                claimed.last_hold = None;
+                return;
+            }
+            Self::Lost { known, held, .. } => {
+                *known = None;
+                *held = None;
+                return;
+            }
+            Self::Absent => return,
         };
         let why = failure.why().to_string();
         if let Self::Held(claimed) = std::mem::replace(self, Self::Absent) {
@@ -849,7 +896,7 @@ impl Link {
                 noted: why.clone(),
                 claimed: true,
                 held: None,
-                generation: None,
+                known: None,
             };
         }
         journal.note(&format!("aterm child-start unclaimed {why}"));
@@ -905,7 +952,7 @@ impl Link {
                     noted: why,
                     claimed: false,
                     held: None,
-                    generation: None,
+                    known: None,
                 }
             }
             (Err(failure), _) => {
@@ -998,7 +1045,10 @@ impl Supervisor {
             // Only a standing claim's answer holds: a released claim's looks
             // were already the harness's own.
             held: claimed.last_hold.clone().filter(|_| claimed.standing),
-            generation: claimed.child.zip(claimed.generation),
+            known: claimed.child.map(|child| KnownChild {
+                child,
+                generation: claimed.generation,
+            }),
         };
     }
 
@@ -1007,7 +1057,14 @@ impl Supervisor {
     /// ([`Claimed::policy_due_ms`]). Each is bounded by [`REQUEST_TIMEOUT`] per
     /// step and stops at the first step that fails.
     pub(super) fn link_tick(&mut self) {
-        let now = now_ms();
+        self.link_tick_with(now_ms(), live_child_proof);
+    }
+
+    fn link_tick_with(
+        &mut self,
+        now: u64,
+        mut native_child: impl FnMut(libc::pid_t) -> Option<aterm::ChildProof>,
+    ) {
         let no_child = self.no_child();
         match &mut self.link {
             Link::Absent => {}
@@ -1017,24 +1074,29 @@ impl Supervisor {
                 noted,
                 claimed,
                 held,
-                generation,
+                known,
             } => {
                 if now < *retry_at_ms {
                     return;
                 }
                 let vendor = self.child.build.version.as_deref();
-                let child = (!no_child)
-                    .then(|| live_child_proof(self.child.pid))
-                    .flatten();
+                let child = (!no_child).then(|| native_child(self.child.pid)).flatten();
+                if no_child {
+                    // Ending::Crashed is a positively consumed owned terminal event.
+                    // It permits a no-child reclaim without consulting a reaped pid.
+                    *known = None;
+                } else if known.is_some_and(|saved| child != Some(saved.child)) {
+                    return;
+                }
                 match claim(
                     locator,
                     std::process::id(),
                     VERSION,
                     vendor,
                     child,
-                    generation
-                        .filter(|(saved, _)| Some(*saved) == child)
-                        .map(|(_, generation)| generation),
+                    known
+                        .filter(|saved| Some(saved.child) == child)
+                        .and_then(|saved| saved.generation),
                     REQUEST_TIMEOUT,
                 ) {
                     Ok(claimed) => {
@@ -1092,7 +1154,7 @@ impl Supervisor {
             }
         }
         if !self.no_child() && matches!(&self.link, Link::Held(claimed) if claimed.child_pending) {
-            self.link_reannounce();
+            self.link_reannounce_with(&mut native_child);
         }
     }
 
@@ -1212,10 +1274,17 @@ impl Supervisor {
     /// The child was relaunched: announce the claim again with the build it now
     /// runs, so `supervisor_vendor=` stays true. A refusal loses the link.
     pub(super) fn link_reannounce(&mut self) {
+        self.link_reannounce_with(&mut live_child_proof);
+    }
+
+    fn link_reannounce_with(
+        &mut self,
+        native_child: &mut impl FnMut(libc::pid_t) -> Option<aterm::ChildProof>,
+    ) {
         if self.no_child() {
             return;
         }
-        let child = live_child_proof(self.child.pid);
+        let child = native_child(self.child.pid);
         let Link::Held(claimed) = &mut self.link else {
             return;
         };
@@ -1275,6 +1344,13 @@ impl Supervisor {
         self.link.release();
     }
 }
+
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "android")
+))]
+#[path = "supervise_link_child_tests.rs"]
+mod child_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1420,6 +1496,9 @@ mod tests {
     #[test]
     fn the_claim_takes_relaunch_and_upgrade_and_nothing_else() {
         assert_eq!(scope_words(), "relaunch,upgrade");
+        // No typing duty: aterm's engine keeps turn ends, approvals, questions
+        // and walls until a build performs them.
+        assert!(!SCOPES.into_iter().any(Scope::types));
         assert_eq!(
             aterm::claim_verb(
                 "s-0000000000000000001a",

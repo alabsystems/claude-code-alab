@@ -302,6 +302,7 @@ fn settle_tap(mut child: crate::sys::ProbeChild) -> Result<(), crate::sys::Probe
         error,
         child: Some(Box::new(child)),
         signals: None,
+        signal_pipe: None,
     })
 }
 
@@ -310,7 +311,17 @@ fn bounded_output(
     args: &[OsString],
     timeout: Duration,
 ) -> Result<Option<String>, crate::sys::ProbeSpawnRefusal> {
-    let mut child = match crate::sys::ProbeChild::spawn(executable, args, &[]) {
+    bounded_output_limit(executable, args, &[], timeout, 64 * 1024)
+}
+
+pub(crate) fn bounded_output_limit(
+    executable: &Path,
+    args: &[OsString],
+    changes: &[(OsString, OsString)],
+    timeout: Duration,
+    maximum: usize,
+) -> Result<Option<String>, crate::sys::ProbeSpawnRefusal> {
+    let mut child = match crate::sys::ProbeChild::spawn(executable, args, changes) {
         Ok(child) => child,
         Err(mut refusal) => {
             if let Some(mask) = refusal.signals.as_mut() {
@@ -335,9 +346,7 @@ fn bounded_output(
             if Instant::now() >= deadline {
                 return None;
             }
-            child
-                .drain_total(&mut output, &mut errors, 64 * 1024)
-                .ok()?;
+            child.drain_total(&mut output, &mut errors, maximum).ok()?;
             if Instant::now() >= deadline {
                 return None;
             }

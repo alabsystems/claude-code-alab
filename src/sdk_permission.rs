@@ -148,6 +148,11 @@ impl std::fmt::Debug for StartFailure {
 impl StartFailure {
     /// Attempt explicit bounded reconciliation. A false result retains every unsettled role.
     pub fn settle(&mut self) -> bool {
+        // A caller-provided prelaunch scope has its own propagation contract.
+        // This SDK error reconciler must not discard that independent resource.
+        if self.refusal.signal_pipe.is_some() {
+            return false;
+        }
         if self
             .refusal
             .signals
@@ -274,13 +279,17 @@ fn reply(value: &Value, id: &str, request: Request) -> io::Result<Option<Reply>>
 }
 
 fn request_id() -> io::Result<String> {
+    request_nonce("alab-mode-")
+}
+
+pub(crate) fn request_nonce(prefix: &str) -> io::Result<String> {
     let mut random = [0; 32];
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open("/dev/urandom")?
         .read_exact(&mut random)?;
-    let mut id = String::from("alab-mode-");
+    let mut id = String::from(prefix);
     for byte in random {
         use std::fmt::Write as _;
         let _ = write!(id, "{byte:02x}");
@@ -451,6 +460,7 @@ impl Session {
                 error: invalid("SDK source did not become the expected native image"),
                 child: Some(Box::new(session.child)),
                 signals: None,
+                signal_pipe: None,
             },
             evidence: Some(Box::new(FailureEvidence {
                 records: session.records,

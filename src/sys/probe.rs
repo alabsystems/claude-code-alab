@@ -173,6 +173,9 @@ pub struct ProbeSpawnRefusal {
     /// An original mask which could not yet be restored. Boxed because a native
     /// `sigset_t` is 128 bytes on Linux, which would bloat every probe `Result`.
     pub signals: Option<Box<AllSignals>>,
+    /// A prelaunch managed-signal scope retained while child or restoration
+    /// custody is unresolved. It must not be dropped before the terminal boundary.
+    pub signal_pipe: Option<Box<super::SignalPipe>>,
 }
 
 impl From<io::Error> for ProbeSpawnRefusal {
@@ -181,6 +184,7 @@ impl From<io::Error> for ProbeSpawnRefusal {
             error,
             child: None,
             signals: None,
+            signal_pipe: None,
         }
     }
 }
@@ -205,7 +209,7 @@ impl ProbeChild {
         args: &[OsString],
         changes: &[(OsString, OsString)],
     ) -> Result<Self, ProbeSpawnRefusal> {
-        Self::spawn_io(executable, args, changes, false, None)
+        Self::spawn_io(executable, args, changes, false, None, false)
     }
 
     /// The same retained wait ownership with a private nonblocking input writer.
@@ -217,7 +221,21 @@ impl ProbeChild {
         args: &[OsString],
         changes: &[(OsString, OsString)],
     ) -> Result<Self, ProbeSpawnRefusal> {
-        Self::spawn_io(executable, args, changes, true, None)
+        Self::spawn_io(executable, args, changes, true, None, false)
+    }
+
+    /// A duplex probe whose terminal receipt also settles its original group.
+    /// Unsupported group backends refuse before fork; post-birth failures retain
+    /// the actual child and any un-restored signal mask.
+    /// # Errors
+    /// As [`Self::spawn_duplex`], or native group custody is unavailable.
+    pub fn spawn_duplex_cohort(
+        executable: &Path,
+        args: &[OsString],
+        changes: &[(OsString, OsString)],
+    ) -> Result<Self, ProbeSpawnRefusal> {
+        super::probe_group::available()?;
+        Self::spawn_io(executable, args, changes, true, None, true)
     }
 
     /// Run an isolated test image on a caller-owned private terminal, retaining
@@ -232,7 +250,7 @@ impl ProbeChild {
         changes: &[(OsString, OsString)],
         slave: BorrowedFd<'_>,
     ) -> Result<Self, ProbeSpawnRefusal> {
-        Self::spawn_io(executable, args, changes, false, Some(slave))
+        Self::spawn_io(executable, args, changes, false, Some(slave), false)
     }
 
     fn spawn_io(
@@ -241,13 +259,18 @@ impl ProbeChild {
         changes: &[(OsString, OsString)],
         duplex: bool,
         terminal: Option<BorrowedFd<'_>>,
+        group_required: bool,
     ) -> Result<Self, ProbeSpawnRefusal> {
         let mut custody = OwnedChild::empty();
+        if group_required {
+            custody.require_group();
+        }
         if let Err(error) = custody.exclude() {
             return Err(ProbeSpawnRefusal {
                 error,
                 child: None,
                 signals: custody.all_signals.take().map(Box::new),
+                signal_pipe: None,
             });
         }
         let preparation = (|| -> io::Result<_> {
@@ -390,6 +413,7 @@ impl ProbeChild {
                     error,
                     child: None,
                     signals,
+                    signal_pipe: None,
                 });
             }
         };
@@ -406,6 +430,7 @@ impl ProbeChild {
                     )),
                     child: None,
                     signals: custody.all_signals.take().map(Box::new),
+                    signal_pipe: None,
                 }),
             };
         }
@@ -475,6 +500,13 @@ impl ProbeChild {
         match child
             .custody
             .start(pid)
+            .and_then(|()| {
+                if group_required {
+                    child.custody.prepare_group()
+                } else {
+                    Ok(())
+                }
+            })
             .and_then(|()| child.custody.restore())
         {
             Ok(()) => Ok(child),
@@ -482,6 +514,7 @@ impl ProbeChild {
                 error,
                 child: Some(Box::new(child)),
                 signals: None,
+                signal_pipe: None,
             }),
         }
     }
@@ -496,7 +529,10 @@ impl ProbeChild {
     /// ownership remains pending and never becomes a successful reap.
     #[must_use]
     pub fn pending(&self) -> bool {
-        self.custody.pid.is_some() || self.custody.lost || self.custody.all_signals.is_some()
+        self.custody.pid.is_some()
+            || self.custody.lost
+            || self.custody.all_signals.is_some()
+            || self.custody.group_pending()
     }
 
     /// Whether another reaper or an unavailable/changed native lifetime has
@@ -674,5 +710,27 @@ impl ProbeChild {
     /// Ownership cannot be proved or the signal fails. No unrelated pid is signaled.
     pub fn cancel(&mut self) -> io::Result<()> {
         self.custody.poll(true).map(|_| ())
+    }
+
+    /// Poll the original child and original group through their retained native
+    /// ownership. A root wait alone is never a successful cohort receipt.
+    /// # Errors
+    /// Group custody was not requested, native reads fail, or wait custody is lost.
+    pub fn try_wait_cohort(&mut self) -> io::Result<Option<ExitStatus>> {
+        if !self.custody.is_group() {
+            return Err(invalid("probe was not spawned with cohort custody"));
+        }
+        self.try_wait()
+    }
+
+    /// Cancel only the retained original group. Darwin never sends a numeric
+    /// signal after the root reap; Linux uses an original descriptor-bound group.
+    /// # Errors
+    /// As [`Self::try_wait_cohort`], or the original group signal fails.
+    pub fn cancel_cohort(&mut self) -> io::Result<()> {
+        if !self.custody.is_group() {
+            return Err(invalid("probe was not spawned with cohort custody"));
+        }
+        self.cancel()
     }
 }

@@ -1,0 +1,7 @@
+# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (byte offsets into the store's 2.1.304 binary, docs/SPEC-claude-accounts-resets-2026-10-02.md §0: the claiming line @257467001 (`_Ae`'s `if(u)` @257467096: the Dialog under the confirmation's own title, one dim child, `hideInputGuide`)), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; the same Dialog component in 2.1.304), the values are invented · OPEN: replace with a capture (SPEC §6) · the weekly reset's confirmation taken: its title over `Resetting your limits…`, no input guide
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Use a weekly reset?
+
+   Resetting your limits… this usually takes a few seconds

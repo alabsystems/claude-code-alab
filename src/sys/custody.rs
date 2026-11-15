@@ -94,6 +94,8 @@ pub(crate) struct OwnedChild {
     pub(crate) lost: bool,
     identity: Option<OwnedLifetime>,
     pub(crate) all_signals: Option<AllSignals>,
+    group_required: bool,
+    group: Option<super::probe_group::Group>,
 }
 
 impl OwnedChild {
@@ -104,7 +106,52 @@ impl OwnedChild {
             lost: false,
             identity: None,
             all_signals: None,
+            group_required: false,
+            group: None,
         }
+    }
+
+    pub(crate) fn require_group(&mut self) {
+        self.group_required = true;
+    }
+
+    pub(crate) fn group_pending(&self) -> bool {
+        self.group_required && self.group.as_ref().is_none_or(|group| group.pending())
+    }
+
+    pub(crate) fn is_group(&self) -> bool {
+        self.group_required
+    }
+
+    /// Establish and capture this exact child's own group under the unbroken
+    /// native fork/wait exclusion. A post-birth failure retains all custody.
+    pub(crate) fn prepare_group(&mut self) -> io::Result<()> {
+        if self.group.is_some() {
+            return Ok(());
+        }
+        let pid = self
+            .pid
+            .ok_or_else(|| invalid("no child to bind a probe group"))?;
+        self.exclude()?;
+        self.current(pid)?;
+        // SAFETY: this remains this process's exact unreaped child. Both sides
+        // may set the same group before exec; an exec race is checked natively.
+        let changed = unsafe { libc::setpgid(pid, pid) };
+        let change_error = (changed != 0).then(io::Error::last_os_error);
+        let observed = self
+            .identity
+            .as_ref()
+            .and_then(OwnedLifetime::observation)
+            .ok_or_else(|| invalid("probe group native observation unavailable"))?;
+        if observed.pgid != Some(pid as u32) {
+            return Err(
+                change_error.unwrap_or_else(|| invalid("probe does not lead its own group"))
+            );
+        }
+        let group = super::probe_group::Group::capture(pid)?;
+        self.current(pid)?;
+        self.group = Some(group);
+        Ok(())
     }
 
     pub(crate) fn exclude(&mut self) -> io::Result<()> {
@@ -188,6 +235,9 @@ impl OwnedChild {
     /// One protected, nonblocking native observe/wait/optional-kill transaction.
     /// All handlers remain excluded until the exact wait and signal have finished.
     pub(crate) fn poll(&mut self, kill: bool) -> io::Result<Option<libc::c_int>> {
+        if self.group_required {
+            return self.poll_group(kill);
+        }
         self.restore()?;
         if self.lost {
             return Err(invalid("child wait ownership was lost"));
@@ -225,6 +275,93 @@ impl OwnedChild {
                         return Err(error);
                     }
                 }
+            }
+            Ok(None)
+        })();
+        self.restore()?;
+        result
+    }
+
+    /// Settle the actual child and its original process group. This is not a
+    /// proof about escaped descendants, consumed input, or drained output.
+    pub(crate) fn poll_group(&mut self, kill: bool) -> io::Result<Option<libc::c_int>> {
+        self.restore()?;
+        if self.lost {
+            return Err(invalid("probe group lost its original wait ownership"));
+        }
+        if !self.group_required {
+            return Err(invalid("probe was not created with group custody"));
+        }
+        self.exclude()?;
+        let result = (|| {
+            self.prepare_group()?;
+            if let Some(pid) = self.pid {
+                self.current(pid)?;
+                let observed = self
+                    .identity
+                    .as_ref()
+                    .and_then(OwnedLifetime::observation)
+                    .ok_or_else(|| invalid("probe terminal observation unavailable"))?;
+                if observed.state == crate::procs::ChildState::Unreaped
+                    && self.group.as_ref().expect("prepared group").may_reap()?
+                {
+                    self.current(pid)?;
+                    let mut status = 0;
+                    // SAFETY: all handlers are excluded on the sole native thread;
+                    // the exact native child and its non-consuming end were proved.
+                    let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+                    if waited == pid {
+                        self.pid = None;
+                        self.status = Some(status);
+                    } else if waited < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ECHILD) {
+                            self.lost = true;
+                            self.pid = None;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            // A Darwin reap relinquishes numeric signal custody. Only absence
+            // observation remains valid then; Linux retains its original pidfd.
+            if kill && self.group_pending() && (self.pid.is_some() || cfg!(target_os = "linux")) {
+                if let Some(pid) = self.pid {
+                    self.current(pid)?;
+                }
+                match self
+                    .group
+                    .as_ref()
+                    .expect("prepared group")
+                    .cancel(self.pid.is_some())
+                {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => return Err(error),
+                }
+                if let Some(pid) = self.pid {
+                    self.current(pid)?;
+                    let observed = self
+                        .identity
+                        .as_ref()
+                        .and_then(OwnedLifetime::observation)
+                        .ok_or_else(|| invalid("probe terminal observation unavailable"))?;
+                    if observed.state != crate::procs::ChildState::Unreaped {
+                        // SAFETY: the exact unreaped native child remains pinned
+                        // under all-handler exclusion, even if it left its group.
+                        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+                            let error = io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::ESRCH) {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(status) = self.status
+                && self.group.as_mut().expect("prepared group").finish()?
+            {
+                return Ok(Some(status));
             }
             Ok(None)
         })();

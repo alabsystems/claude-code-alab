@@ -15,6 +15,7 @@ use std::io;
 
 pub(crate) mod custody;
 mod probe;
+mod probe_group;
 mod transfer;
 pub use custody::AllSignals;
 pub use probe::{ProbeChild, ProbeSpawnRefusal, exec_exact};

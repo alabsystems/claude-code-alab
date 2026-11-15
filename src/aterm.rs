@@ -35,10 +35,12 @@
 //!   releases a claim that does not read so ([`release_verb`]).
 //! * **Fail closed.** A field a judgement needs that is absent or malformed
 //!   holds; no parser here supplies a default.
-//! * **Type only through the fence.** Any `send`/`key`/`paste`/`turn` the
-//!   harness ever sends carries `if-supervisor=claude-code-alab@<pid>`
-//!   (`crates/aterm-gui/src/control_input.rs:352-415`), so a write after the
-//!   claim is lost can never land. Nothing here types.
+//! * **Type only through the fence.** Every `send`, `key` and `turn` the
+//!   harness sends carries the claim's holder, its `supervisor_revision` and
+//!   the typing duty it performs, with the person's count it was judged at
+//!   (`if-supervisor=`, `if-supervisor-revision=`, `harness-duty=`,
+//!   `if-human=`; [`crate::typing`]), so a write after the claim moved can
+//!   never land. Nothing here types, and the claim takes no typing duty yet.
 
 use std::fmt;
 use std::time::Duration;
@@ -91,25 +93,68 @@ const VENDOR_MAX: usize = 64;
 /// The longest value a journal line repeats from a reply.
 const JOURNAL_WORD_MAX: usize = 64;
 
-/// One duty a contract-3 claim takes from aterm's built-in engine. Only the two
-/// this harness's roster row may ever allow are named; their order is aterm's
-/// canonical one (`contract.rs`, `Scope::ALL`).
+/// One duty a contract-3 claim takes from aterm's built-in engine, every one
+/// aterm names, in its canonical order (`contract.rs`, `Scope`). A claim names
+/// only the duties a build performs (`SCOPES` in `src/supervise_link.rs`); the
+/// four typing duties are named here so that a typed write can say which one it
+/// performs ([`crate::typing`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// Relaunching the child on the same conversation after a crash.
     Relaunch,
     /// Moving the child onto another vendor build at a safe point.
     Upgrade,
+    /// Continuations, Cruise, Land, NEEDS YOU, limit and usage resumes.
+    TurnEnd,
+    /// Permission boxes, folder trust, plan boxes.
+    Approvals,
+    /// Question dialogs and prose questions.
+    Questions,
+    /// Usage, context, login and API-retry walls.
+    Walls,
 }
 
 impl Scope {
+    /// Every duty, in aterm's order (`contract.rs`, `Scope::ALL`).
+    pub const ALL: [Self; 6] = [
+        Self::Relaunch,
+        Self::Upgrade,
+        Self::TurnEnd,
+        Self::Approvals,
+        Self::Questions,
+        Self::Walls,
+    ];
+
     /// The wire word (`contract.rs`, `Scope::word`).
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
             Self::Relaunch => "relaunch",
             Self::Upgrade => "upgrade",
+            Self::TurnEnd => "turn-end",
+            Self::Approvals => "approvals",
+            Self::Questions => "questions",
+            Self::Walls => "walls",
         }
+    }
+
+    /// The duty a wire word names exactly (`contract.rs`, `Scope::from_word`).
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.word() == word)
+    }
+
+    /// Whether a typed write may name this duty. aterm admits typed supervisor
+    /// input only for `turn-end`, `approvals`, `questions` and `walls`;
+    /// `relaunch` and `upgrade` grant no typing
+    /// (`aterm/crates/aterm-gui/src/session_timeline.rs`,
+    /// `SupervisorInputFence::authorize`).
+    #[must_use]
+    pub const fn types(self) -> bool {
+        matches!(
+            self,
+            Self::TurnEnd | Self::Approvals | Self::Questions | Self::Walls
+        )
     }
 }
 
@@ -333,7 +378,8 @@ pub fn claim_child_start_verb(
 }
 
 /// Acknowledged pending authority, read back before a claimed fork. Duplicate
-/// barrier fields, a named child or a missing proof never establish the barrier.
+/// authority fields, a scope set other than the claimed relaunch and upgrade
+/// duties, a named child or a missing proof never establish the barrier.
 #[must_use]
 pub fn child_start_pending(reply: &str, holder: &str, generation: u64) -> bool {
     if generation == 0 {
@@ -342,20 +388,45 @@ pub fn child_start_pending(reply: &str, holder: &str, generation: u64) -> bool {
     let Ok(status) = Status::parse(reply) else {
         return false;
     };
-    let one = |key: &str, expected: &str| {
+    let unique = |key: &str| {
         let mut values = reply
             .split_ascii_whitespace()
             .filter_map(|word| word.strip_prefix(key));
-        values.next() == Some(expected) && values.next().is_none()
+        let value = values.next()?;
+        values.next().is_none().then_some(value)
+    };
+    for key in [
+        "schema=",
+        "supervisor=",
+        "supervisor_proven=",
+        "supervisor_scope=",
+        "supervisor_revision=",
+        "supervisor_child_start=",
+        "supervisor_child=",
+    ] {
+        if unique(key).is_none() {
+            return false;
+        }
+    }
+    let Some(named) = unique("supervisor_scope=").and_then(|scopes| {
+        scopes
+            .split(',')
+            .map(Scope::from_word)
+            .collect::<Option<Vec<_>>>()
+    }) else {
+        return false;
     };
     status.held_by(holder)
+        && named.len() == 2
+        && named.contains(&Scope::Relaunch)
+        && named.contains(&Scope::Upgrade)
         && status.takes(Scope::Relaunch)
         && status.takes(Scope::Upgrade)
         && status
             .supervisor_revision
             .is_some_and(|revision| revision > 0)
-        && one("supervisor_child_start=", &generation.to_string())
-        && one("supervisor_child=", "-")
+        && unique("supervisor_child_start=") == Some(generation.to_string().as_str())
+        && unique("supervisor_child=") == Some("-")
 }
 
 /// The host's unique canonical child generation, including a completed bound
@@ -781,7 +852,8 @@ pub struct Status {
     /// `SupervisorAuthority::wire_fields`).
     pub supervisor_scope: Vec<String>,
     /// `supervisor_revision=`: the claim cell's revision, which moves with every
-    /// claim, release and replacement.
+    /// claim, release and replacement. A typed write names it
+    /// (`if-supervisor-revision=`), and aterm refuses one it no longer is.
     pub supervisor_revision: Option<u64>,
     /// `agent=`: the agent's phase as aterm's reader sees it (`idle` at rest).
     pub agent: Option<String>,
@@ -790,6 +862,12 @@ pub struct Status {
     pub composer: Option<String>,
     /// `human_ms=`.
     pub human: Human,
+    /// `human_seq=`: how many gestures a person has made in the session. A typed
+    /// write names the count it was judged at (`if-human=`), and aterm skips one
+    /// a gesture has moved past (`aterm/crates/aterm-gui/src/control_input.rs`,
+    /// `LeadingInputOptions::if_human`). `None` when absent or not canonical
+    /// decimal.
+    pub human_seq: Option<u64>,
     /// `hand=`: who drives the session (`-` for nobody).
     pub hand: Option<String>,
     /// `hold=`: `1` while a halt stands on the session.
@@ -840,6 +918,7 @@ impl Status {
                     .map_or(Human::Unknown, |ms| Human::Ago(Duration::from_millis(ms))),
                 None => Human::Unknown,
             },
+            human_seq: fields.get("human_seq").and_then(canonical_u64),
             hand: word("hand"),
             hold: word("hold"),
             input: word("input"),
@@ -1363,6 +1442,7 @@ mod tests {
                 agent: Some("idle".to_string()),
                 composer: Some("empty".to_string()),
                 human: Human::Ago(Duration::from_millis(2_154_931)),
+                human_seq: Some(1474),
                 hand: Some("-".to_string()),
                 hold: Some("0".to_string()),
                 input: Some("clear".to_string()),
@@ -1382,6 +1462,44 @@ mod tests {
     }
 
     #[test]
+    fn every_duty_is_spelled_as_aterm_spells_it_and_only_the_four_typing_duties_type() {
+        let words: Vec<&str> = Scope::ALL.into_iter().map(Scope::word).collect();
+        assert_eq!(
+            words,
+            [
+                "relaunch",
+                "upgrade",
+                "turn-end",
+                "approvals",
+                "questions",
+                "walls"
+            ]
+        );
+        for scope in Scope::ALL {
+            assert_eq!(Scope::from_word(scope.word()), Some(scope));
+        }
+        for word in ["", "turn_end", "Walls", "relaunch,upgrade", "turn-end "] {
+            assert_eq!(Scope::from_word(word), None, "{word:?}");
+        }
+        let typing: Vec<Scope> = Scope::ALL.into_iter().filter(|s| s.types()).collect();
+        assert_eq!(
+            typing,
+            [
+                Scope::TurnEnd,
+                Scope::Approvals,
+                Scope::Questions,
+                Scope::Walls
+            ]
+        );
+        // The canonical order is the derived one, so a sorted scope list is
+        // spelled in aterm's order.
+        let mut sorted = Scope::ALL;
+        sorted.reverse();
+        sorted.sort();
+        assert_eq!(sorted, Scope::ALL);
+    }
+
+    #[test]
     fn a_status_reply_states_no_claim_and_no_fact_it_does_not_carry() {
         let bare = Status::parse("OK schema=1").unwrap();
         assert_eq!(
@@ -1394,6 +1512,7 @@ mod tests {
                 agent: None,
                 composer: None,
                 human: Human::Unknown,
+                human_seq: None,
                 hand: None,
                 hold: None,
                 input: None,
@@ -1427,7 +1546,9 @@ mod tests {
                 Human::Unknown,
                 "{value:?}"
             );
+            assert_eq!(garbled("human_seq", value).human_seq, None, "{value:?}");
         }
+        assert_eq!(garbled("human_seq", "0").human_seq, Some(0));
         for (reply, why) in [
             ("ERR no such session", "reply=ERR:no"),
             ("", "reply=(empty)"),

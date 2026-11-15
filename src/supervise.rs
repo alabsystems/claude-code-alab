@@ -100,6 +100,8 @@ use crate::sys::{self, ChildEvent, SignalPipe, Termios};
 pub mod image;
 #[path = "supervise_link.rs"]
 mod link;
+#[cfg(test)]
+pub(crate) use link::child_start_ask_control as child_start_ask_at;
 #[path = "supervise_transfer.rs"]
 mod transfer;
 #[path = "supervise_vendor.rs"]
@@ -2176,7 +2178,7 @@ mod tests {
 
     /// A supervisor over a child that cannot be signalled (pid 0 names no
     /// process; [`sys::kill`] refuses it), journalling to `state`.
-    fn supervisor_of_an_unsignallable_child(state: &Path) -> Supervisor {
+    pub(super) fn supervisor_of_an_unsignallable_child(state: &Path) -> Supervisor {
         let opts = Options::default();
         let build = Build {
             number: 1,
@@ -2348,7 +2350,7 @@ mod tests {
     }
 
     /// A crash being answered, as [`Supervisor::crash_begins`] leaves it.
-    fn crashed(event: ChildEvent) -> Ending {
+    pub(super) fn crashed(event: ChildEvent) -> Ending {
         Ending::Crashed {
             event,
             crash: Crash {
@@ -2547,7 +2549,7 @@ mod tests {
             noted: String::new(),
             claimed: true,
             held: None,
-            generation: None,
+            known: None,
         };
         // A lost link is asked nothing before it is claimed again: the loop
         // sleeps to the budget's end, the poll trying the claim meanwhile.

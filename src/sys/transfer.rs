@@ -711,6 +711,9 @@ pub struct SignalPipe {
     ignored: u8,
     /// The launch mask's managed membership, indexed by HANDLED.
     prior_mask: u8,
+    active: bool,
+    restore_block: Option<super::AllSignals>,
+    restore_caught: Vec<libc::c_int>,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -765,6 +768,9 @@ impl SignalPipe {
             previous,
             ignored,
             prior_mask: block.bits,
+            active: true,
+            restore_block: None,
+            restore_caught: Vec::new(),
             _thread: PhantomData,
         };
         block.restore()?;
@@ -776,6 +782,9 @@ impl SignalPipe {
     /// # Errors
     /// Thread quiescence, pipe identity, ownership or descriptor flags cannot be established.
     pub fn prepare_exec(&mut self) -> io::Result<SignalExecGuard<'_>> {
+        if !self.active || self.restore_block.is_some() {
+            return Err(invalid("signal scope is restored or restoring"));
+        }
         ensure_single_threaded()?;
         let mut block = SignalBlock::block()?;
         let fds = self.fds();
@@ -899,6 +908,9 @@ impl SignalPipe {
                 previous,
                 ignored: saved.ignored,
                 prior_mask: saved.prior_mask,
+                active: true,
+                restore_block: None,
+                restore_caught: Vec::new(),
                 _thread: PhantomData,
             },
             block,
@@ -938,7 +950,7 @@ impl SignalPipe {
     /// The read endpoint, where caught signals wait as bytes.
     #[must_use]
     pub fn read_fd(&self) -> RawFd {
-        self.fds()[0]
+        self.read.as_ref().map_or(-1, AsRawFd::as_raw_fd)
     }
 
     /// The managed signals the launch mask blocks, indexed by [`HANDLED`].
@@ -947,28 +959,84 @@ impl SignalPipe {
     pub const fn prior_mask(&self) -> u8 {
         self.prior_mask
     }
+
+    pub(crate) fn retain_caught(&mut self, earlier: &[libc::c_int]) {
+        let mut caught = earlier.to_vec();
+        caught.append(&mut self.restore_caught);
+        self.restore_caught = caught;
+    }
+
+    /// Drain caught signals, restore the original dispositions and close private
+    /// descriptors under all-handler exclusion, then restore the original mask.
+    /// A failure retains every still-live descriptor and the native mask guard.
+    /// # Errors
+    /// Native quiescence, handler ownership, action or mask restoration fails.
+    pub fn restore_checked(&mut self) -> io::Result<Vec<libc::c_int>> {
+        if !self.active {
+            let caught = finish_signal_restore(&mut self.restore_caught, || {
+                if let Some(block) = self.restore_block.as_mut() {
+                    block.restore()?;
+                }
+                Ok(())
+            })?;
+            self.restore_block = None;
+            return Ok(caught);
+        }
+        if self.restore_block.is_none() {
+            self.restore_block = Some(super::AllSignals::block()?);
+        }
+        ensure_single_threaded()?;
+        if PIPE_WRITE.load(Ordering::Relaxed) != self.fds()[1] {
+            return Err(invalid("this scope no longer owns the signal handler"));
+        }
+        for (sig, old) in self.previous.iter().rev() {
+            replace_action(*sig, old)?;
+        }
+        self.restore_caught.extend(queued_on(self.read_fd()));
+        PIPE_WRITE.store(-1, Ordering::Relaxed);
+        self.active = false;
+        drop(self.read.take());
+        drop(self.write.take());
+        self.previous.clear();
+        let caught = finish_signal_restore(&mut self.restore_caught, || {
+            self.restore_block
+                .as_mut()
+                .expect("restoration block retained")
+                .restore()
+        })?;
+        self.restore_block = None;
+        Ok(caught)
+    }
 }
+
+fn finish_signal_restore(
+    caught: &mut Vec<libc::c_int>,
+    restore: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Vec<libc::c_int>> {
+    restore()?;
+    Ok(std::mem::take(caught))
+}
+
+#[cfg(test)]
+#[path = "signal_scope_tests.rs"]
+mod signal_scope_tests;
 
 impl Drop for SignalPipe {
     fn drop(&mut self) {
-        let Ok(mut block) = SignalBlock::block() else {
+        if self.restore_checked().is_err() {
             if let Some(read) = self.read.take() {
                 std::mem::forget(read);
             }
             if let Some(write) = self.write.take() {
                 std::mem::forget(write);
             }
-            return;
-        };
-        if PIPE_WRITE.load(Ordering::Relaxed) == self.fds()[1] {
-            PIPE_WRITE.store(-1, Ordering::Relaxed);
-            for (sig, old) in self.previous.iter().rev() {
-                let _ = replace_action(*sig, old);
+            if let Some(block) = self.restore_block.take() {
+                // The abandoned pipe's descriptors are deliberately kept, so
+                // its handlers cannot touch recycled descriptors. Unlike a live
+                // returned refusal, Drop owns no future mask-restoration receipt.
+                drop(block);
             }
         }
-        drop(self.read.take());
-        drop(self.write.take());
-        let _ = block.restore();
     }
 }
 

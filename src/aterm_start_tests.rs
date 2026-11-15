@@ -51,3 +51,65 @@ fn a_claimed_start_needs_proven_pending_status_without_a_previous_child() {
     }
     assert!(!child_start_pending(status, "claude-code-alab@4243", 1));
 }
+
+const PENDING: &str = "OK schema=1 supervisor=claude-code-alab@4242 supervisor_proven=1 supervisor_scope=relaunch,upgrade supervisor_revision=7 supervisor_child_start=1 supervisor_child=-";
+
+#[test]
+fn c3_barrier_scopes_are_closed_unique_and_exactly_the_claimed_duties() {
+    for scopes in [
+        "relaunch,upgrade,upgrade",
+        "relaunch,upgrade,unknown",
+        "relaunch,upgrade,questions",
+    ] {
+        let reply = PENDING.replace("relaunch,upgrade", scopes);
+        assert!(
+            Status::parse(&reply).is_ok(),
+            "ordinary status remains lenient"
+        );
+        assert!(
+            !child_start_pending(&reply, "claude-code-alab@4242", 1),
+            "{reply}"
+        );
+    }
+    assert!(!child_start_pending(
+        &format!("{PENDING} supervisor_scope=relaunch,upgrade"),
+        "claude-code-alab@4242",
+        1,
+    ));
+    let reordered = PENDING.replace("relaunch,upgrade", "upgrade,relaunch");
+    assert!(child_start_pending(&reordered, "claude-code-alab@4242", 1));
+}
+
+#[test]
+fn c3_barrier_authority_fields_are_unique_even_when_their_values_match() {
+    for repeated in [
+        "schema=1",
+        "supervisor=claude-code-alab@4242",
+        "supervisor_proven=1",
+        "supervisor_scope=relaunch,upgrade",
+        "supervisor_revision=7",
+        "supervisor_child_start=1",
+        "supervisor_child=-",
+    ] {
+        let reply = format!("{PENDING} {repeated}");
+        assert!(
+            !child_start_pending(&reply, "claude-code-alab@4242", 1),
+            "{reply}"
+        );
+    }
+}
+
+#[test]
+fn c3_barrier_raw_scope_segments_cannot_be_empty() {
+    for scopes in [
+        "relaunch,upgrade,",
+        ",relaunch,upgrade",
+        "relaunch,,upgrade",
+    ] {
+        let reply = PENDING.replace("relaunch,upgrade", scopes);
+        assert!(
+            !child_start_pending(&reply, "claude-code-alab@4242", 1),
+            "{reply}"
+        );
+    }
+}

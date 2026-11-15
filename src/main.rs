@@ -13,7 +13,7 @@ fn main() {
             let retained = std::mem::ManuallyDrop::new(retained);
             let _ = writeln!(
                 std::io::stderr(),
-                "claude-alab: usage helper custody remains unsettled: {}",
+                "claude-alab: launch preparation custody remains unsettled: {}",
                 retained.error
             );
             std::process::exit(70);

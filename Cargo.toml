@@ -11,11 +11,17 @@
 # ALAB_HARNESS_VERSION +g<sha> build stamp; patch is always 0.
 
 [workspace]
-members = ["."]
+# vendor/ holds sealed copies of aterm's crates (docs/DECISIONS.md, 41): path
+# dependencies, never members, so this workspace's tests, lints and format
+# are not run over them, and tests/vendored.rs holds them to aterm's bytes.
+# No `members` key: this package is the one member anyway, and an explicit
+# `members = ["."]` names every path under the root, which overrides
+# `exclude` and made the copies members.
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates"]
@@ -89,8 +95,19 @@ name = "interactive_permission"
 path = "tests/interactive_permission.rs"
 harness = false
 
+# Explicit private no-model workspace-trust experiment, using the same native operation.
+[[test]]
+name = "folder_trust"
+path = "tests/folder_trust.rs"
+harness = false
+
 [dependencies]
 libc = "0.2"
+# aterm's turn-end readers and press guard, and its screen reader, which
+# brings the agent name table (vendor/aterm-agent-names) with it. Sealed
+# copies written by aterm's `verify vendor-out`; never edited here.
+alab-policy = { path = "vendor/alab-policy" }
+aterm-phase = { path = "vendor/aterm-phase" }
 
 [lints]
 workspace = true

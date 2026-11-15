@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! **aterm-phase**.
+
+pub mod agents_panel;
+pub mod agy;
+pub mod anchors;
+pub mod answered;
+pub mod auto_mode;
+pub mod autocompact;
+pub mod chrome_intro;
+pub mod codex;
+pub mod command;
+pub mod credits;
+pub mod disk_full;
+pub mod grok;
+pub mod harness_version;
+pub mod kimi;
+pub mod login;
+pub mod muse;
+pub mod panel;
+pub mod phase;
+pub mod prompt;
+pub mod question;
+pub mod reader;
+pub mod reset;
+pub mod retry_after;
+pub mod survey;
+mod text;
+pub mod turn;
+pub mod wall;
+mod wrap;
+
+#[cfg(test)]
+#[path = "../tests/support/vendor_drift.rs"]
+mod vendor_drift;
+#[cfg(all(test, unix))]
+#[path = "../tests/support/vendor_files.rs"]
+mod vendor_files;
+
+pub use anchors::{ANCHORS, anchor, anchor_text};
+pub use autocompact::{Offer, OfferFocus};
+pub use command::{CLAUDE_EXIT_WORDS, DraftCommand, draft_command};
+pub use credits::{ModelWeek, UsageSighting, WeekModel, usage_sighting};
+pub use harness_version::{
+    CliHarness, HarnessVersion, cli_build_later, cli_version_build, cli_version_core,
+    cli_version_later, cli_version_offered,
+};
+pub use login::{
+    LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,
+    login_over_limit, login_screen,
+};
+pub use panel::{
+    PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
+};
+pub use phase::{
+    ApiRetryRow, RetryCause, api_retry_row, background_only, background_rest, background_rest_seen,
+    background_wait_seen, busy_seen, busy_signal, busy_zone_start, context_left, delegated_shown,
+    limit_notice, notice_reset, opened_by_own_wake, shells_running, title_live, title_rests,
+    title_runs, transcript_end, turn_over_background, worker_phase, worker_phase_seen,
+};
+pub use prompt::{
+    Opt, Origin, PromptKind, PromptV2, Role, footer_keys, parse_prompt, parse_prompt_v2,
+    prompt_box_first_row, prompt_box_span,
+};
+pub use question::{
+    FreeText, QuestionDialog, QuestionFocus, QuestionForm, QuestionOption, QuestionText,
+    Recommended,
+};
+pub use reader::{
+    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GenericReader, GrokReader, KimiReader,
+    MuseReader, Program, RETIRED_AGENT, RETIRED_AGENTS, Reading, ScreenReader, identify,
+    live_zone_reaches_above, live_zone_start, may_host_agent, program_of, read, read_at, read_seen,
+    retired_agent, shell_alone,
+};
+pub use reset::{
+    ConfirmRead, ResetConfirm, ResetDrawn, ResetLine, ResetPending, ResetRow, ResetSight,
+    ResetSighting, reset_confirm, reset_limit_name, reset_limit_names, reset_line, reset_pending,
+    reset_row, reset_sighting, reset_title, spends_reset, uses_a_reset,
+};
+pub use retry_after::retry_after;
+pub use survey::{SurveyBlock, SurveyKind, survey_block};
+pub use turn::{
+    BannerBuild, CardPlace, CardWords, LaunchCard, LaunchCardRead, WAND_FLARE_DARK,
+    WAND_FLARE_LIGHT, WAND_FLARE_TOLERANCE, answered_prompt, continuation_suggestion, goal_active,
+    idle_compacted, interrupted, launch_card, launch_card_held, launch_card_place,
+    launch_card_read, launch_card_scan, launch_card_scrolled, launch_card_scrolled_unmoved,
+    launch_card_unmoved, launch_card_version, launch_card_words, said_tail, said_whole,
+    turn_history_stop, turn_said_before, turn_whole, wand_flare,
+};
+pub use wall::{
+    AutoContinue, Placement, SinceLimit, Wall, WordsAbove, auto_continue_end, auto_continue_toast,
+    classify_wall, left_wall, limit_words_above, login_expires_in, login_restored,
+    memory_banner_head, since_limit, wall,
+};
+pub use wrap::line_start;

@@ -19,9 +19,32 @@ Install Claude Code with `aterm pkg install claude`. Without it, `claude-alab`
 says so and exits 127.
 
 `claude-alab launch -- <arguments>` applies the managed launch defaults and
-then execs Claude Code in the same process. It installs no supervisor or
-signal handlers and leaves aterm's live duties with aterm. This separate
+then execs Claude Code in the same process. It installs no supervisor and
+restores any temporary prelaunch signal scope before the final exec. It leaves
+aterm's live duties with aterm. This separate
 entry lets launch policy move independently of full lifecycle qualification.
+
+For a managed interactive launch whose original standard output is a terminal,
+the owner can settle cold folder trust before asking for usage settings. The
+host supplies a read-only folder-policy/session decision; the selected vendor
+receives one private `initialize.workspaceTrust` request with project hooks and
+MCP servers disabled. There is no model prompt. Its five-second admission budget
+is separate from the usage query's two-second budget. A recorded result requires
+actual native cohort settlement and a fresh read of the exact profile key.
+Unsettled native custody prevents the vendor launch. Settled refusals leave
+Claude Code's own dialog behavior intact. The completed observation is written
+to this owner's journal; it does not manufacture a host approvals-ledger row.
+Managed termination/stop signals during the cold operation request native
+retirement before their original dispositions are restored and replayed.
+Inherited ignores and blocked signals remain in force; resize and continue do
+not cancel the launch. An unsupported original child-reaper policy declines
+before any fork. This does not guarantee cleanup after SIGKILL or a machine failure.
+
+`claude-alab trust folder --vendor <absolute-path> --stdout-tty 0|1 -- <arguments>`
+uses the same operation for an explicitly selected vendor and environment.
+It performs no fresh managed-build lookup. Native attestation refuses where
+the original cohort cannot be safely owned; this is no interactive mode lease
+or proof that arbitrary descendants which escaped the cohort have ended.
 
 ## What it does
 
@@ -91,9 +114,14 @@ When aterm advertises native child proof and a pre-spawn barrier, the harness
 announces a fresh generation before each initial start, restart, vendor update,
 and fallback. It confirms the pending claim before spawning and then binds the
 exact native child lifetime to that generation. A request reconnect retains a
-continuing child's generation. If the bounded barrier exchange fails, it drops
-the claim and starts Claude without asserting authority; older hosts keep their
-existing launch behavior. Own-image transfer inside aterm remains unqualified.
+continuing child's generation and known native identity. The identity is also
+retained on hosts that serve child proof without the generation extension. An
+unavailable or different native observation defers reclaim; the original owned
+child's confirmed end or the next explicit start boundary retires that knowledge.
+The pre-spawn status, begin and readback steps share one original 500 ms deadline.
+If that bounded exchange fails, it drops the claim and starts Claude without
+asserting authority; older hosts keep their existing launch behavior. Own-image
+transfer inside aterm remains unqualified.
 
 The metadata-only `--alab-launches=<vendor-word>` and
 `--alab-leads=<vendor-word>` queries describe launch policy ownership and full
@@ -242,6 +270,14 @@ targo fmt --check
 
 The tests run the real binary on a real pseudo-terminal against a scripted
 stand-in for Claude Code, and against a stand-in for aterm's control socket.
+
+`vendor/` holds copies of three aterm crates the harness builds with (the
+turn-end readers, the screen reader and the agent name table), not Claude Code.
+aterm writes them: each source file and fixture a library's build reads, byte
+for byte as in aterm, and a `Cargo.toml` of aterm's making that builds the
+library alone. Their tests, and files only a test reads, stay in aterm.
+`vendor/VENDORED` lists each file's digest, and `tests/vendored.rs` fails on
+any copy edited here.
 
 ## License
 

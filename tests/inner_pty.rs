@@ -679,13 +679,17 @@ fn a_panicking_native_read_restores_mask_and_keeps_child_custody() {
 }
 
 fn probe_pipe_endpoints_preserve_child_stdio() {
+    assert_probe_role("--probe-stdio", b"blocking-probe-stdio\n");
+}
+
+fn signal_pipe_drop_does_not_strand_the_thread_mask_when_quiescence_is_lost() {
+    assert_probe_role("--signal-drop-after-thread", b"signal-drop-mask-restored\n");
+}
+
+fn assert_probe_role(role: &str, expected: &[u8]) {
     use claude_code_alab::sys::ProbeChild;
-    let mut child = ProbeChild::spawn(
-        &std::env::current_exe().unwrap(),
-        &["--probe-stdio".into()],
-        &[],
-    )
-    .unwrap();
+    let mut child =
+        ProbeChild::spawn(&std::env::current_exe().unwrap(), &[role.into()], &[]).unwrap();
     let readers_nonblocking = child.output_fds().all(|fd| {
         // SAFETY: these descriptors are borrowed from the still-owned probe.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -706,7 +710,7 @@ fn probe_pipe_endpoints_preserve_child_stdio() {
             {
                 if status.success()
                     && readers_nonblocking
-                    && output == b"blocking-probe-stdio\n"
+                    && output == expected
                     && errors.is_empty()
                 {
                     return Ok(());
@@ -736,7 +740,221 @@ fn probe_pipe_endpoints_preserve_child_stdio() {
     result.unwrap();
 }
 
+fn cohort_wait_does_not_confuse_leader_exit_with_group_end() {
+    use claude_code_alab::sys::ProbeChild;
+    let mut child = ProbeChild::spawn_duplex_cohort(
+        &std::env::current_exe().unwrap(),
+        &["--probe-cohort-root".into()],
+        &[],
+    )
+    .unwrap();
+    let pid = child.pid().unwrap();
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    let until = Instant::now() + HANG;
+    let result = (|| -> io::Result<()> {
+        loop {
+            child.drain_total(&mut output, &mut errors, 4096)?;
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: the test owns this exact unreaped child. WNOWAIT preserves
+            // its event, and WNOHANG makes this a bounded observation.
+            let read = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if read < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: waitid initialized this record on its successful return.
+            let exited = unsafe { info.assume_init().si_pid() } == pid;
+            if exited && output == b"probe-cohort-member\n" {
+                break;
+            }
+            if Instant::now() >= until {
+                return Err(io::Error::other("cohort role hang detector"));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..3 {
+            if child.try_wait_cohort()?.is_some() || !child.pending() {
+                return Err(io::Error::other(
+                    "leader exit falsely settled its live original group",
+                ));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(io::Error::other("cohort role stderr"));
+        }
+        Ok(())
+    })();
+    let cleanup = Instant::now() + HANG;
+    if child.cancel_cohort().is_err() {
+        std::mem::forget(child);
+        std::process::exit(70);
+    }
+    let mut status = None;
+    while child.pending() {
+        match child.try_wait_cohort() {
+            Ok(Some(ended)) => status = Some(ended),
+            Ok(None) => {}
+            Err(_) => {
+                std::mem::forget(child);
+                std::process::exit(70);
+            }
+        }
+        if Instant::now() >= cleanup {
+            std::mem::forget(child);
+            std::process::exit(70);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    result.unwrap();
+    if status.is_none() {
+        status = child.try_wait_cohort().unwrap();
+    }
+    assert!(
+        status.is_some_and(|ended| ended.success()),
+        "the leader's own status survives cleanup"
+    );
+}
+
+fn cancelling_an_ended_lone_root_keeps_its_actual_wait_status() {
+    use claude_code_alab::sys::ProbeChild;
+    let mut child = ProbeChild::spawn_duplex_cohort(
+        &std::env::current_exe().unwrap(),
+        &["--probe-stdio".into()],
+        &[],
+    )
+    .unwrap();
+    let pid = child.pid().unwrap();
+    let until = Instant::now() + HANG;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: the test owns this exact child; WNOWAIT leaves its terminal
+        // event for cancel_cohort's actual owning wait, and WNOHANG never blocks.
+        let read = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(read, 0, "lone root terminal observation");
+        // SAFETY: the successful native call initialized this zeroed record.
+        if unsafe { info.assume_init().si_pid() } == pid {
+            break;
+        }
+        assert!(Instant::now() < until, "lone root exit hang detector");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let cancellation = child.cancel_cohort();
+    let mut status = None;
+    while child.pending() {
+        match child.try_wait_cohort() {
+            Ok(Some(ended)) => status = Some(ended),
+            Ok(None) => {}
+            Err(_) => {
+                std::mem::forget(child);
+                std::process::exit(70);
+            }
+        }
+        if Instant::now() >= until {
+            std::mem::forget(child);
+            std::process::exit(70);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if status.is_none() {
+        status = child.try_wait_cohort().unwrap();
+    }
+    assert!(
+        cancellation.is_ok(),
+        "ended lone root cancellation: {cancellation:?}"
+    );
+    assert!(status.is_some_and(|ended| ended.success()));
+}
+
+fn a_stolen_root_wait_never_settles_or_signals_a_probe_cohort() {
+    use claude_code_alab::sys::ProbeChild;
+    let mut child = ProbeChild::spawn_duplex_cohort(
+        &std::env::current_exe().unwrap(),
+        &["--probe-stdio".into()],
+        &[],
+    )
+    .unwrap();
+    let pid = child.pid().unwrap();
+    let until = Instant::now() + HANG;
+    loop {
+        let mut status = 0;
+        // SAFETY: this negative control deliberately consumes the exact original
+        // child's wait outside its library receipt; it never waits for another pid.
+        let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+        if waited == pid {
+            break;
+        }
+        assert!(waited >= 0, "external owning wait failed");
+        assert!(Instant::now() < until, "stolen wait hang detector");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(child.try_wait_cohort().is_err());
+    assert!(child.cancel_cohort().is_err());
+    assert!(child.pending() && child.ownership_lost());
+    // This fixed role cannot fork and its actual owning wait above ended it.
+    // Dropping the descriptors does not relabel the disarmed receipt as settled.
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--signal-drop-after-thread") {
+        claude_code_alab::sys::ensure_single_threaded().unwrap();
+        let before = mask();
+        let pipe = claude_code_alab::sys::SignalPipe::install().unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (stop, release) = std::sync::mpsc::channel();
+        let auxiliary = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            release.recv_timeout(HANG).unwrap();
+        });
+        ready.recv_timeout(HANG).unwrap();
+        // The native auxiliary thread remains alive across Drop. No quiescence
+        // proof is available, so its handler descriptors must stay unreused,
+        // while this thread's original signal mask still needs restoring.
+        drop(pipe);
+        let after = mask();
+        stop.send(()).unwrap();
+        auxiliary.join().unwrap();
+        same_mask(before, after);
+        println!("signal-drop-mask-restored");
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--probe-cohort-root") {
+        // SAFETY: this fixed native role starts single-threaded and performs no
+        // child-side Rust work until after fork returns into its ordinary role.
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0);
+        if forked == 0 {
+            // SAFETY: the fixed member ignores TERM to exercise cohort KILL.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+            println!("probe-cohort-member");
+            loop {
+                // SAFETY: pause waits for a native signal and retains no pointers.
+                unsafe {
+                    libc::pause();
+                }
+            }
+        }
+        // SAFETY: the isolated leader exits while its member remains alive;
+        // no Rust destruction is required by this fixed role.
+        unsafe {
+            libc::_exit(0);
+        }
+    }
     if std::env::args().nth(1).as_deref() == Some("--probe-stdio") {
         let blocking = [1, 2].into_iter().all(|fd| {
             // SAFETY: native read of this isolated child role's standard output descriptors.
@@ -767,5 +985,9 @@ fn main() {
     closed_standard_input_refuses_before_fork_and_restores_the_mask();
     a_panicking_native_read_restores_mask_and_keeps_child_custody();
     probe_pipe_endpoints_preserve_child_stdio();
-    eprintln!("inner_pty: 17 process-isolated controls passed");
+    signal_pipe_drop_does_not_strand_the_thread_mask_when_quiescence_is_lost();
+    cohort_wait_does_not_confuse_leader_exit_with_group_end();
+    cancelling_an_ended_lone_root_keeps_its_actual_wait_status();
+    a_stolen_root_wait_never_settles_or_signals_a_probe_cohort();
+    eprintln!("inner_pty: 21 process-isolated controls passed");
 }

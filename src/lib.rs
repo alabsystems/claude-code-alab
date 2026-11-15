@@ -22,7 +22,11 @@
 //! * [`aterm`]: the aterm client boundary (claim text, reply parsers, the
 //!   safe-point judge), used by the supervisor's link inside an aterm tab;
 //! * [`aterm_wire`]: direct transport to aterm's control socket (the link's
-//!   request connection and event stream) and connection custody;
+//!   request connection and event stream), connection custody, and the
+//!   spelling of a fenced typed write;
+//! * [`typing`]: the fenced typing client, which types only under the claim's
+//!   holder, revision and duty and the person's count (no claim takes a
+//!   typing duty yet, so nothing calls it);
 //! * [`relaunch`]: aterm's exit classification and crash back-off, which
 //!   decide a crash relaunch and a restart aterm asks for;
 //! * [`self_image`]: the harness's own build in the atpkg store, selected and
@@ -39,6 +43,7 @@
 pub mod aterm;
 pub mod aterm_wire;
 pub mod cli;
+pub mod folder_trust;
 pub mod inner_pty;
 pub mod inspect;
 pub mod journal;
@@ -59,4 +64,11 @@ pub mod supervise;
 pub mod sys;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+extern crate self as claude_code_alab;
+/// The existing integration socket fixture, also used by native unit controls.
+#[cfg(test)]
+#[path = "../tests/support/aterm.rs"]
+pub mod test_aterm;
 pub mod transfer_capsule;
+pub mod typing;

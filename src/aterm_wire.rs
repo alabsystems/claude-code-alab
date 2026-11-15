@@ -15,6 +15,10 @@
 //! unknown outcome, not permission to repeat an act. The socket stays owned
 //! until dropped or explicitly exported into bounded, non-writing custody:
 //! a claim may have committed before its ACK was lost.
+//!
+//! It also spells the three typed writes, `send`, `key` and `turn`, each under
+//! the fence aterm judges it by ([`TypedFence`]): [`send_verb`], [`key_verb`]
+//! and [`turn_verb`]. Spelling one types nothing; [`crate::typing`] sends them.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -27,7 +31,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::aterm::Restart;
+use crate::aterm::{Restart, Scope};
 
 const MAX_TOKEN_BYTES: usize = 256;
 const MAX_GRAPH_BYTES: usize = 16 * 1024;
@@ -620,6 +624,12 @@ impl Connection {
         self.timeout = timeout;
     }
 
+    /// The bound each exchange on this connection has now ([`Connection::set_timeout`]).
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Whether an earlier exchange made this connection unusable.
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
@@ -749,6 +759,17 @@ impl Connection {
         self.finish(result, until)
     }
 
+    /// Use the caller's original deadline for one step of a bounded transaction.
+    pub(crate) fn request_line_until(
+        &mut self,
+        request: &str,
+        until: Instant,
+    ) -> io::Result<String> {
+        self.prepare(request)?;
+        let result = self.exchange_line(request, until);
+        self.finish(result, until)
+    }
+
     fn exchange_line(&mut self, request: &str, until: Instant) -> io::Result<String> {
         self.write_until(format!("{request}\n").as_bytes(), until)
             .and_then(|()| self.line_until(until))
@@ -786,6 +807,36 @@ impl Connection {
     /// excessive count or bytes, incomplete body or elapsed deadline poisons the
     /// connection, so a late body can never answer a later request.
     pub fn request_body(&mut self, request: &str, max_lines: usize) -> io::Result<Vec<String>> {
+        self.counted(request, max_lines, false)
+            .map(|(_, body)| body)
+    }
+
+    /// Send one request whose `OK` reply counts the lines after it, as `turn`'s
+    /// does (`OK <n> turn submitted=… seq=…`, then the `<n>` rows it settled on),
+    /// and read the header and exactly those lines. An `ERR` header is a reply
+    /// with no body. The whole exchange shares one deadline and one aggregate
+    /// byte bound, as [`Connection::request_body`]'s.
+    ///
+    /// # Errors
+    /// As [`Connection::request_body`], except that an `ERR` header and words
+    /// after the count are answers, not errors.
+    pub fn request_counted(
+        &mut self,
+        request: &str,
+        max_lines: usize,
+    ) -> io::Result<(String, Vec<String>)> {
+        self.counted(request, max_lines, true)
+    }
+
+    /// The one reader of a counted reply. `worded` admits an `ERR` header with
+    /// no body and words after an `OK` header's count; without it the header
+    /// is exactly `OK <count>`.
+    fn counted(
+        &mut self,
+        request: &str,
+        max_lines: usize,
+        worded: bool,
+    ) -> io::Result<(String, Vec<String>)> {
         if max_lines == 0 || max_lines > 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -795,8 +846,15 @@ impl Connection {
         let until = self.begin(request)?;
         let result = (|| {
             let header = self.exchange_line(request, until)?;
+            if worded && (header == "ERR" || header.starts_with("ERR ")) {
+                return Ok((header, Vec::new()));
+            }
             let count = header
                 .strip_prefix("OK ")
+                .and_then(|rest| {
+                    let (count, words) = rest.split_once(' ').unwrap_or((rest, ""));
+                    (worded || words.is_empty()).then_some(count)
+                })
                 .and_then(|count| {
                     count
                         .parse::<usize>()
@@ -818,7 +876,7 @@ impl Connection {
             if !self.pending.is_empty() {
                 return Err(invalid("reply exceeds its declared body count"));
             }
-            Ok(body)
+            Ok((header, body))
         })();
         self.finish(result, until)
     }
@@ -1025,6 +1083,142 @@ pub fn percent_decode(value: &str) -> io::Result<String> {
         decoded.push((high << 4) | low);
     }
     String::from_utf8(decoded).map_err(|_| invalid("decoded field is not UTF-8"))
+}
+
+/// What a typed write names: the claim it is made under and the person's count it
+/// was judged at. aterm judges all four again when it makes the write: the claim
+/// under the session's meta lock, the count under the terminal lock the write is
+/// made under (`aterm/crates/aterm-gui/src/control_input.rs`,
+/// `take_leading_options` and `input_if_fenced_observed`; `session_timeline.rs`,
+/// `SupervisorInputFence::authorize`):
+///
+/// * `if-supervisor=<holder>`, `if-supervisor-revision=<n>` and
+///   `harness-duty=<scope>`, together and once each, or the whole write is
+///   `ERR usage: typed supervisor input takes …`. The holder must be the
+///   standing contract-3 claim's, the revision its `status supervisor_revision=`,
+///   the duty one the claim takes and a typing duty ([`Scope::types`]), and the
+///   write must come on the connection that made the claim; otherwise it is
+///   `ERR denied supervisor input authority`, nothing written.
+/// * `if-human=<n>`, the `human_seq=` the write was judged at: a person's
+///   gesture since skips it (`OK skipped reason=person seq=<n>`, or a turn's
+///   `OK 0 turn skipped reason=person … submitted=0 …`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypedFence<'a> {
+    /// The claim's holder, `claude-code-alab@<pid>` ([`crate::aterm::holder`]).
+    pub holder: &'a str,
+    /// The claim's `supervisor_revision=` as `status` read it.
+    pub revision: u64,
+    /// The typing duty the write performs.
+    pub duty: Scope,
+    /// The `human_seq=` the write was judged at.
+    pub human_seq: u64,
+}
+
+impl TypedFence<'_> {
+    /// The leading words that name the claim, in the order aterm's own engine
+    /// writes them (`aterm/crates/aterm-agent/src/harness/upgrade_drive.rs`,
+    /// `authority_words`). `None` for a duty that grants no typing or a holder
+    /// that is not one wire word.
+    fn authority(&self) -> Option<String> {
+        let holder_ok = !self.holder.is_empty()
+            && self.holder != "-"
+            && self
+                .holder
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b'=');
+        (self.duty.types() && holder_ok).then(|| {
+            format!(
+                "if-supervisor={} if-supervisor-revision={} harness-duty={}",
+                self.holder,
+                self.revision,
+                self.duty.word()
+            )
+        })
+    }
+}
+
+/// The quiet that settles a typed turn's screen, `idle=`: what aterm's own engine
+/// gives its turns (`aterm/crates/aterm-agent/src/supervise/run.rs`, `TURN_IDLE`
+/// and `TURN_TIMEOUT`).
+pub const TURN_IDLE_MS: u64 = 600;
+/// The whole turn's bound, `timeout=` ([`TURN_IDLE_MS`]).
+pub const TURN_TIMEOUT_MS: u64 = 2_500;
+
+/// Whether `text` can be typed as one line: not empty or blank, and no control
+/// character (a request is one line, and `turn` drops a control character where
+/// `send` would write it as typed).
+fn typable(text: &str) -> bool {
+    !text.trim().is_empty() && !text.chars().any(char::is_control)
+}
+
+/// `@<sid> send <fence> if-human=<n> -- <text>`: `text` written as typed, under
+/// `fence`. aterm answers `OK seq=<n>`; `send` writes a trailing `\n` (the two
+/// characters) as Enter (`aterm/crates/aterm-types/src/control_verbs.rs`, the
+/// `send` entry), and `--` ends the options, so a text that looks like one is
+/// typed as text. `None`, nothing to send, when `sid` is not a session ID,
+/// `fence` names no typing authority, or `text` is not [`typable`].
+#[must_use]
+pub fn send_verb(sid: &str, fence: &TypedFence<'_>, text: &str) -> Option<String> {
+    if !session_id(sid) || !typable(text) {
+        return None;
+    }
+    let authority = fence.authority()?;
+    Some(format!(
+        "@{sid} send {authority} if-human={} -- {text}",
+        fence.human_seq
+    ))
+}
+
+/// `@<sid> key <fence> if-human=<n> <name>`: one named key (`enter`, `esc`,
+/// `1`, `ctrl+c`) pressed under `fence`. aterm answers `OK seq=<n>`. `None`
+/// when `sid` is not a session ID, `fence` names no typing authority, or `key`
+/// is not one word of at most 32 ASCII graphic bytes that no option reads as
+/// its own (no `=`, not `--`).
+#[must_use]
+pub fn key_verb(sid: &str, fence: &TypedFence<'_>, key: &str) -> Option<String> {
+    let key_ok = !key.is_empty()
+        && key.len() <= 32
+        && key != "--"
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'=');
+    if !session_id(sid) || !key_ok {
+        return None;
+    }
+    let authority = fence.authority()?;
+    Some(format!(
+        "@{sid} key {authority} if-human={} {key}",
+        fence.human_seq
+    ))
+}
+
+/// `@<sid> turn <fence> submit=guarded:<guard> if-human=<n> idle=<ms> timeout=<ms> -- <text>`:
+/// `text` typed and submitted with Enter, the Enter pressed only while the
+/// cursor's row matches `guard` and no person has made a gesture since
+/// `if-human=`, both judged under the terminal lock that press is written under
+/// (`aterm/crates/aterm-types/src/verb_page/turn.rs`, "submit" and "fences").
+/// The fence words are the turn's leading run and the rest its options
+/// (`control_verbs.rs`, `TURN_OPTIONS`), which `--` ends. aterm answers
+/// `OK <n> turn submitted=<0|1> … seq=<n> id=<n> …` and the `<n>` rows it
+/// settled on, `OK 0 turn skipped reason=<why> …`, or an `ERR`.
+///
+/// `None` when `sid` is not a session ID, `fence` names no typing authority,
+/// `text` is not [`typable`], or `guard` is not one nonempty word of at most
+/// [`alab_policy::guard::MAX_GUARD_BYTES`].
+#[must_use]
+pub fn turn_verb(sid: &str, fence: &TypedFence<'_>, guard: &str, text: &str) -> Option<String> {
+    let guard_ok = !guard.is_empty()
+        && guard.len() <= alab_policy::guard::MAX_GUARD_BYTES
+        && !guard.chars().any(|c| c.is_whitespace() || c.is_control());
+    if !session_id(sid) || !typable(text) || !guard_ok {
+        return None;
+    }
+    let authority = fence.authority()?;
+    Some(format!(
+        "@{sid} turn {authority} submit=guarded:{guard} if-human={} idle={TURN_IDLE_MS} \
+         timeout={TURN_TIMEOUT_MS} -- {text}",
+        fence.human_seq
+    ))
 }
 
 /// What a nonblocking event drain observed. Every loss or fault requires fresh policy.
@@ -1472,6 +1666,10 @@ fn validate_custody_socket(raw: RawFd) -> io::Result<()> {
 #[cfg(test)]
 #[path = "aterm_wire_tab_ids_tests.rs"]
 mod tab_id_tests;
+
+#[cfg(test)]
+#[path = "aterm_wire_child_deadline_tests.rs"]
+mod child_deadline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2339,6 +2537,64 @@ mod tests {
                 connection.request_line("status").unwrap_err().kind(),
                 io::ErrorKind::NotConnected
             );
+        }
+    }
+
+    #[test]
+    fn a_worded_counted_reply_keeps_its_header_and_an_err_has_no_body() {
+        let (mut connection, mut peer) = pair();
+        let server = thread::spawn(move || {
+            assert_eq!(read_request(&mut peer), "turn -- hi\n");
+            peer.write_all(b"OK 2 turn submitted=1 status=settled seq=9 id=3\n\xe2\x9d\xaf hi\n\n")
+                .unwrap();
+            assert_eq!(read_request(&mut peer), "turn -- hi\n");
+            peer.write_all(b"ERR key delivery failed\n").unwrap();
+            assert_eq!(read_request(&mut peer), "turn -- hi\n");
+            peer.write_all(b"OK 0 turn skipped reason=person submitted=0 seq=9 id=4\n")
+                .unwrap();
+            assert_eq!(read_request(&mut peer), "status\n");
+            peer.write_all(b"OK schema=1\n").unwrap();
+        });
+        assert_eq!(
+            connection.request_counted("turn -- hi", 4).unwrap(),
+            (
+                "OK 2 turn submitted=1 status=settled seq=9 id=3".to_string(),
+                vec!["\u{276f} hi".to_string(), String::new()]
+            )
+        );
+        assert_eq!(
+            connection.request_counted("turn -- hi", 4).unwrap(),
+            ("ERR key delivery failed".to_string(), Vec::new())
+        );
+        assert_eq!(
+            connection.request_counted("turn -- hi", 4).unwrap(),
+            (
+                "OK 0 turn skipped reason=person submitted=0 seq=9 id=4".to_string(),
+                Vec::new()
+            )
+        );
+        assert!(!connection.is_poisoned());
+        assert_eq!(connection.request_line("status").unwrap(), "OK schema=1");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_worded_counted_reply_without_a_count_or_over_its_bound_poisons_the_connection() {
+        for reply in [
+            "OK turn submitted=1\n",
+            "OK 01 turn\nx\n",
+            "OK 5 turn\n",
+            "OK 1 turn\nx\ny\n",
+            "OK\n",
+        ] {
+            let (mut connection, mut peer) = pair();
+            peer.write_all(reply.as_bytes()).unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+            assert!(
+                connection.request_counted("turn -- hi", 4).is_err(),
+                "{reply:?}"
+            );
+            assert!(connection.is_poisoned(), "{reply:?}");
         }
     }
 

@@ -235,6 +235,22 @@ impl OwnedLifetime {
     pub(crate) fn current(&self) -> bool {
         Self::capture(self.pid).as_ref() == Some(self)
     }
+
+    /// Observe an owned wait lifetime without requiring a live executable.
+    /// The caller excludes reapers throughout these non-consuming reads.
+    pub(crate) fn observation(&self) -> Option<ChildObservation> {
+        if !self.current() {
+            return None;
+        }
+        let read = kernel_identity(self.pid)?;
+        (read.parent == self.parent && read.birth == self.birth && self.current()).then_some(
+            ChildObservation {
+                state: read.state,
+                pgid: read.pgid,
+                session: read.session,
+            },
+        )
+    }
 }
 
 /// Fresh facts about the captured child, including facts unavailable after exit.
@@ -543,28 +559,37 @@ fn native_lifetime(_pid: u32) -> Option<OwnedLifetime> {
 #[cfg(target_os = "macos")]
 fn kernel_identity(pid: u32) -> Option<KernelIdentity> {
     let info = bsd_identity(pid)?;
-    let lifetime = lifetime_from_bsd(&info)?;
-    let p = libc::pid_t::try_from(pid).ok()?;
+    kernel_identity_from_bsd(&info, |pid| {
+        let p = libc::pid_t::try_from(pid).ok()?;
+        // SAFETY: getsid is a read-only query and reports errors as a negative pid.
+        u32::try_from(unsafe { libc::getsid(p) })
+            .ok()
+            .filter(|s| *s > 0)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_identity_from_bsd(
+    info: &libc::proc_bsdinfo,
+    read_session: impl FnOnce(u32) -> Option<u32>,
+) -> Option<KernelIdentity> {
+    let lifetime = lifetime_from_bsd(info)?;
     let state = match info.pbi_status {
         libc::SZOMB => ChildState::Unreaped,
         libc::SSTOP => ChildState::Stopped,
         libc::SRUN | libc::SSLEEP => ChildState::Live,
         _ => return None,
     };
-    // XNU getsid uses proc_find, which excludes zombies. Preserve that unknown
-    // as None instead of substituting the previously captured session.
+    // XNU getsid excludes zombies, including a child that exits after this BSD
+    // snapshot. Its missing session cannot erase the native lifetime/state.
+    // Live image/session identity still requires an actual session below.
     let session = if state == ChildState::Unreaped {
         None
     } else {
-        // SAFETY: getsid is a read-only query and reports errors as a negative pid.
-        Some(
-            u32::try_from(unsafe { libc::getsid(p) })
-                .ok()
-                .filter(|s| *s > 0)?,
-        )
+        read_session(lifetime.pid).filter(|s| *s > 0)
     };
     Some(KernelIdentity {
-        pid,
+        pid: lifetime.pid,
         parent: info.pbi_ppid,
         pgid: (info.pbi_pgid > 0).then_some(info.pbi_pgid),
         session,
@@ -572,6 +597,10 @@ fn kernel_identity(pid: u32) -> Option<KernelIdentity> {
         state,
     })
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "procs_bsd_tests.rs"]
+mod bsd_tests;
 
 #[cfg(target_os = "linux")]
 fn kernel_identity(pid: u32) -> Option<KernelIdentity> {

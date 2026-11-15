@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+# Written by `targo --unverified verify vendor-out` from aterm's crates/aterm-phase/Cargo.toml: rerun it there, never
+# edit this copy (../VENDORED holds each file's digest).
+
+[package]
+name = "aterm-phase"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Andrew Yates"]
+description = "aterm — the worker-phase reader: busy | prompt | limited | idle | question, the context indicator and the approval box, read from one screen of a Claude Code, Codex, agy or Muse Code session; shared by `aterm drive phase` and the server's agent verdict"
+publish = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+# The copy's one target. Its tests and doctests run in aterm, beside the files
+# they read.
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+bench = false
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+ignore_without_reason = "warn"
+
+[lints.rust]
+unexpected_cfgs = { check-cfg = ["cfg(trust_verify)", "cfg(trust_seals)", "cfg(trust_binding)"], level = "warn" }
+unsafe_op_in_unsafe_fn = "warn"
+
+[dependencies]
+alab-policy = { path = "../alab-policy" }
+aterm-agent-names = { path = "../aterm-agent-names" }

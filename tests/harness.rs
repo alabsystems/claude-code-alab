@@ -24,8 +24,10 @@
 //! The `aterm_*` scenarios start the harness in its tab ([`start_in_aterm`]):
 //! the claim before the first vendor start, the safe point on aterm's word, the
 //! fallback to the harness's own readings, the relaunch of a crashed vendor and
-//! the restart aterm asks for. Its self-tests, listed last, drive it through
-//! this crate's own client with no harness process.
+//! the restart aterm asks for. The `aterm_typed_*` scenarios and its
+//! self-tests, listed last, drive it through this crate's own client with no
+//! harness process: the fenced typing client, which no claim of the harness
+//! uses yet, and the transport and readers the claim does.
 //!
 //! For the crash scenarios the fake vendor takes three things beyond Claude
 //! Code's own behaviour: the command `crash:<code>` (exit with that code and
@@ -55,6 +57,8 @@ use claude_code_alab::cli::VERSION;
 mod child_start;
 #[path = "support/aterm.rs"]
 mod fake_aterm;
+#[path = "support/folder_trust.rs"]
+mod folder_trust;
 #[path = "support/inspect.rs"]
 mod inspect;
 #[path = "support/launch_host.rs"]
@@ -73,6 +77,7 @@ const BUILD_3: u64 = 1_000_009_000_009_000_003;
 static SCENARIO_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
+    folder_trust::entry();
     launch_host::signal_parent_entry();
     launch_query_entry::entry();
     launch_host::entry();
@@ -94,6 +99,12 @@ fn main() {
     assert_eq!(installed, 0);
     let filter: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let tests: &[(&str, fn())] = &[
+        ("cold_native_owner_settles_trust_before_usage_and_preserves_in_place_launch",folder_trust::cold_native_owner_settles_trust_before_usage_and_preserves_in_place_launch),
+        ("cold_native_trailing_partial_is_not_a_recorded_exchange",folder_trust::cold_native_trailing_partial_is_not_a_recorded_exchange),
+        ("cold_native_refusals_never_become_recorded_or_run_in_nonterminal_launches",folder_trust::cold_native_refusals_never_become_recorded_or_run_in_nonterminal_launches),
+        ("cold_native_linger_and_inherited_writer_keep_the_owned_cohort_until_retired",folder_trust::cold_native_linger_and_inherited_writer_keep_the_owned_cohort_until_retired),
+        ("cold_native_interrupts_retire_the_sdk_before_original_signal_propagation",folder_trust::cold_native_interrupts_retire_the_sdk_before_original_signal_propagation),
+        ("cold_native_signal_scope_preserves_ignore_block_resize_and_continue",folder_trust::cold_native_signal_scope_preserves_ignore_block_resize_and_continue),
         ("defaults_inspection_is_read_only_explicit_and_keeps_native_entry_guards", inspect::is_read_only_explicit_and_keeps_native_entry_guards),
         ("defaults_inspection_reports_closed_bounded_unavailable_observations", inspect::reports_closed_bounded_unavailable_observations),
         (
@@ -624,6 +635,22 @@ fn main() {
         (
             "aterm_a_crash_whose_build_was_taken_away_in_the_pause_is_passed_on",
             aterm_a_crash_whose_build_was_taken_away_in_the_pause_is_passed_on,
+        ),
+        (
+            "aterm_typed_write_carries_the_fence",
+            fake_aterm::aterm_typed_write_carries_the_fence,
+        ),
+        (
+            "aterm_typed_write_at_a_stale_revision_rereads_status_and_does_not_retry_blind",
+            fake_aterm::aterm_typed_write_at_a_stale_revision_rereads_status_and_does_not_retry_blind,
+        ),
+        (
+            "aterm_typed_write_after_a_persons_key_is_skipped_and_waits_the_grace",
+            fake_aterm::aterm_typed_write_after_a_persons_key_is_skipped_and_waits_the_grace,
+        ),
+        (
+            "aterm_typed_text_is_guarded_on_the_composer_row",
+            fake_aterm::aterm_typed_text_is_guarded_on_the_composer_row,
         ),
         (
             "the_fake_aterm_is_found_and_authenticates_this_crates_client",
