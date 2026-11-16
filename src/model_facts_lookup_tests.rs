@@ -12,7 +12,7 @@ fn bounded_look(reader: &mut Reader, world: &World, id: &str, now: &str, steps: 
         record: Some((id, ms(START).unwrap())),
         args: &[],
     };
-    reader.look_with_budget(&world.config, &process, ms(now).unwrap(), steps);
+    let _ = reader.look_with_budget(&world.config, &process, ms(now).unwrap(), steps);
 }
 
 fn unread(reader: &Reader) {
@@ -144,7 +144,7 @@ fn true_absence_keeps_a_clear_but_a_read_refusal_never_believes_carried_facts() 
     };
     std::fs::remove_file(world.config.join("projects")).unwrap();
     std::fs::create_dir(world.config.join("projects")).unwrap();
-    unreadable.look_with_budget(
+    let _ = unreadable.look_with_budget(
         &world.config,
         &other,
         ms("2026-09-28T15:01:30Z").unwrap(),
@@ -155,7 +155,7 @@ fn true_absence_keeps_a_clear_but_a_read_refusal_never_believes_carried_facts() 
         (Said::Unsaid, Said::Unsaid, Said::Unsaid)
     );
     other.pid = PID;
-    unreadable.look_with_budget(
+    let _ = unreadable.look_with_budget(
         &world.config,
         &other,
         ms("2026-09-28T15:01:40Z").unwrap(),

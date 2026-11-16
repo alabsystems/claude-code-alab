@@ -956,6 +956,15 @@ impl Drop for World {
     }
 }
 
+fn look_update<'a>(
+    reader: &'a mut Reader,
+    world: &World,
+    process: &Process<'_>,
+    now: &str,
+) -> Update<'a> {
+    reader.look(&world.config, process, ms(now).expect("now"))
+}
+
 /// One look by `reader` of process [`PID`], started at `started`, in `session`.
 fn look_from(
     reader: &mut Reader,
@@ -971,8 +980,8 @@ fn look_from(
         record: Some((session, ms(started).expect("start"))),
         args: if pinned { &pinning } else { &[] },
     };
-    reader
-        .look(&world.config, &process, ms(now).expect("now"))
+    look_update(reader, world, &process, now)
+        .journal_line
         .map(str::to_owned)
 }
 
@@ -994,6 +1003,165 @@ fn words(reader: &Reader) -> (Said<String>, Said<String>, Said<bool>) {
 
 fn session(reader: &Reader) -> &SessionRead {
     reader.session.as_ref().expect("a session read")
+}
+
+#[test]
+fn typed_unknown_state_changes_do_not_need_a_new_journal_line() {
+    const S: &str = "00000000-0000-4000-8000-000000000106";
+    let world = World::new("typed-unknown");
+    let mut reader = Reader::default();
+    let process = Process {
+        pid: PID,
+        record: Some((S, ms(START).unwrap())),
+        args: &[],
+    };
+    let update = reader.look_with_budget(
+        &world.config,
+        &process,
+        ms("2026-09-28T15:01:00Z").unwrap(),
+        0,
+    );
+    assert!(update.facts_changed, "Unsaid and Unread are distinct facts");
+    assert_eq!(update.facts.model, Said::Unread);
+    assert_eq!(update.facts.effort, Said::Unread);
+    assert_eq!(update.facts.key, Said::Unread);
+    assert_eq!(update.journal_line, None, "both journal as '-'");
+
+    let update = reader.look_with_budget(
+        &world.config,
+        &process,
+        ms("2026-09-28T15:01:00.500Z").unwrap(),
+        0,
+    );
+    assert!(
+        !update.facts_changed,
+        "the paced refusal states nothing new"
+    );
+    assert_eq!(update.journal_line, None);
+    assert_eq!(session(&reader).lookups, 1);
+
+    let other = Process {
+        pid: PID + 1,
+        record: None,
+        args: &[],
+    };
+    let update = look_update(&mut reader, &world, &other, "2026-09-28T15:01:01Z");
+    assert!(update.facts_changed, "a new process starts Unsaid");
+    assert_eq!(update.facts.model, Said::Unsaid);
+    assert_eq!(update.facts.effort, Said::Unsaid);
+    assert_eq!(update.facts.key, Said::Unsaid);
+    assert_eq!(
+        update.journal_line, None,
+        "the journal still has no new text"
+    );
+
+    let update = look_update(&mut reader, &world, &other, "2026-09-28T15:01:02Z");
+    assert!(!update.facts_changed);
+    assert_eq!(update.journal_line, None);
+}
+
+#[test]
+fn typed_model_names_remain_distinct_when_their_journal_words_match() {
+    const S: &str = "00000000-0000-4000-8000-000000000107";
+    let world = World::new("typed-model-name");
+    let mut reader = Reader::default();
+    let process = Process {
+        pid: PID,
+        record: Some((S, ms(START).unwrap())),
+        args: &[],
+    };
+    world.write(
+        S,
+        &[
+            &command_at("model", "2026-09-28T15:00:10Z"),
+            &result_at(
+                "2026-09-28T15:00:11Z",
+                "Set model to `Opus 5.5` with `high` effort",
+            ),
+        ],
+    );
+    let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:00Z");
+    assert!(update.facts_changed);
+    assert_eq!(update.facts.model, is("Opus 5.5"));
+    assert_eq!(
+        update.journal_line,
+        Some("facts model=Opus_5.5 effort=high key=-")
+    );
+
+    world.append(
+        S,
+        &body(&[
+            &command_at("model", "2026-09-28T15:01:10Z"),
+            &result_at(
+                "2026-09-28T15:01:11Z",
+                "Set model to `Opus_5.5` with `high` effort",
+            ),
+        ]),
+    );
+    let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:12Z");
+    assert!(update.facts_changed, "the exact stated model changed");
+    assert_eq!(update.facts.model, is("Opus_5.5"));
+    assert_eq!(update.facts.effort, is("high"));
+    assert_eq!(
+        update.journal_line, None,
+        "space normalization hides this change"
+    );
+
+    world.append(
+        S,
+        &body(&[&answer_at("Opus_5.5", "2026-09-28T15:01:13Z", Some("high"))]),
+    );
+    let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:14Z");
+    assert!(!update.facts_changed, "a new row can state the same facts");
+    assert_eq!(update.journal_line, None);
+    assert_eq!(session(&reader).appends, 2);
+
+    let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:15Z");
+    assert!(!update.facts_changed, "an unchanged source changes nothing");
+    assert_eq!(update.journal_line, None);
+    assert_eq!(session(&reader).appends, 2);
+}
+
+#[test]
+fn private_model_choice_bookkeeping_is_not_a_typed_fact_change() {
+    const S: &str = "00000000-0000-4000-8000-000000000108";
+    let world = World::new("typed-choice");
+    let mut reader = Reader::default();
+    let process = Process {
+        pid: PID,
+        record: Some((S, ms(START).unwrap())),
+        args: &[],
+    };
+    world.write(
+        S,
+        &[&answer_at(
+            "claude-opus-5-5",
+            "2026-09-28T15:00:10Z",
+            Some("high"),
+        )],
+    );
+    let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:00Z");
+    assert!(update.facts_changed);
+    assert!(!update.facts.chose);
+    world.append(
+        S,
+        &body(&[
+            &command_at("model", "2026-09-28T15:01:10Z"),
+            &result_at(
+                "2026-09-28T15:01:11Z",
+                "Set model to `Opus 5.5` with `high` effort",
+            ),
+        ]),
+    );
+    let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:12Z");
+    assert!(update.facts.chose, "the choice will affect a later resume");
+    assert_eq!(update.facts.model, is("Opus 5.5"));
+    assert_eq!(update.facts.effort, is("high"));
+    assert!(
+        !update.facts_changed,
+        "the three public facts stayed the same"
+    );
+    assert_eq!(update.journal_line, None);
 }
 
 /// THE TRANSCRIPT IS READ AGAIN ONLY WHEN IT MOVED: an unchanged file is not
@@ -1244,7 +1412,9 @@ fn another_process_starts_from_nothing() {
         args: &[],
     };
     assert_eq!(
-        reader.look(&world.config, &process, ms("2026-09-28T15:02:20Z").unwrap()),
+        reader
+            .look(&world.config, &process, ms("2026-09-28T15:02:20Z").unwrap())
+            .journal_line,
         None,
         "nothing stated, nothing changed"
     );
@@ -1284,7 +1454,7 @@ fn the_command_line_is_asked_only_at_a_resume() {
             record: Some((session, ms(START).unwrap())),
             args: &pinning,
         };
-        reader.look(&world.config, &process, ms(now).unwrap());
+        let _ = reader.look(&world.config, &process, ms(now).unwrap());
     };
     let mut reader = Reader::default();
     look_in(&mut reader, LEFT, "2026-09-28T15:01:10Z");

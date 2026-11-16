@@ -142,6 +142,35 @@ fn only_the_exact_true_profile_key_counts_and_other_vendor_fields_remain_opaque(
     assert!(!keys::recorded(&profile, &child));
 }
 
+/// A profile of `len` bytes that records trust for `key`, the rest of it one opaque string.
+fn padded_profile(key: &Path, len: u64) -> String {
+    let head = format!(
+        "{{\"projects\":{{{}:{{\"hasTrustDialogAccepted\":true}}}},\"pad\":\"",
+        quote(key.to_str().unwrap())
+    );
+    let tail = "\"}";
+    let fill = usize::try_from(len).unwrap() - head.len() - tail.len();
+    format!("{head}{}{tail}", "x".repeat(fill))
+}
+
+/// A LONG-USED PROFILE STILL ANSWERS: Claude Code's profile gains an entry for each project it
+/// opens, so one past a mebibyte that records the folder's trust reads as recorded, up to the
+/// bound aterm's reader had. CONTROL: one byte past that bound reads as no record.
+#[test]
+fn a_profile_past_a_mebibyte_still_answers_up_to_the_bound() {
+    let root = world();
+    let child = root.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let profile = root.join("profile");
+    std::fs::write(&profile, padded_profile(&child, 3 * 512 * 1024)).unwrap();
+    assert!(keys::recorded(&profile, &child));
+    std::fs::write(&profile, padded_profile(&child, keys::PROFILE_MAX)).unwrap();
+    assert!(keys::recorded(&profile, &child));
+    std::fs::write(&profile, padded_profile(&child, keys::PROFILE_MAX + 1)).unwrap();
+    assert!(!keys::recorded(&profile, &child));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn selected_profile_keeps_explicit_config_custom_oauth_and_legacy_precedence() {
     let root = world();

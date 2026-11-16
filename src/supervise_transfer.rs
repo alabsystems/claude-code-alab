@@ -1160,6 +1160,7 @@ mod tests {
         };
         let line = reader
             .look(&root, &process, 1_794_563_220_000)
+            .journal_line
             .map(str::to_owned);
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(

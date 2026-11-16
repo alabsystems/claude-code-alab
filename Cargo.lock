@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "alab-policy"
-version = "0.0.0"
+version = "0.8.1"
 
 [[package]]
 name = "aterm-agent-names"
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "claude-code-alab"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alab-policy",
  "aterm-phase",

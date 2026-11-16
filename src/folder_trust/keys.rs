@@ -102,8 +102,13 @@ pub(super) fn profile(home: &Path, env: &BTreeMap<OsString, OsString>) -> Option
     Some(plain)
 }
 
+/// The largest profile [`recorded`] reads: aterm's `profile::PROFILE_MAX`, the bound of the
+/// trust reader this ports. Claude Code's profile gains an entry for each project it opens, so
+/// a long-used one passes a mebibyte and still holds the trust it recorded.
+pub(super) const PROFILE_MAX: u64 = 32 * 1024 * 1024;
+
 pub(super) fn recorded(profile: &Path, key: &Path) -> bool {
-    let Some(text) = crate::store::read_bounded(profile, 1024 * 1024, true) else {
+    let Some(text) = crate::store::read_bounded(profile, PROFILE_MAX, true) else {
         return false;
     };
     let Some(value) = crate::json::parse(&text) else {

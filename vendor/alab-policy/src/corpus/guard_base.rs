@@ -90,7 +90,15 @@ fn write_base_guard() {
     use std::fmt::Write as _;
 
     use crate::words::classify_said;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an ignored writer of the guard's base record: GA_CORPUS and GA_OUT name its files; the readers read no environment"
+    )]
     let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is unset"));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an ignored writer of the guard's base record reads the corpus GA_CORPUS names; the readers read no file"
+    )]
     let corpus = std::fs::read_to_string(var("GA_CORPUS")).expect("the corpus reads");
     let mut out = HEAD.to_string();
     let mut seen = std::collections::HashSet::new();
@@ -111,5 +119,9 @@ fn write_base_guard() {
         )
         .expect("a String takes the record");
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an ignored writer of the guard's base record writes the fixture GA_OUT names; the readers write no file"
+    )]
     std::fs::write(var("GA_OUT"), out).expect("the fixture writes");
 }

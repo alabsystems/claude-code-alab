@@ -2014,7 +2014,7 @@ impl Supervisor {
             record: record.map(|r| (r.session_id.as_str(), r.started_at_ms)),
             args: &self.child.args,
         };
-        if let Some(line) = self.facts.look(&self.config, &process, now) {
+        if let Some(line) = self.facts.look(&self.config, &process, now).journal_line {
             self.journal.note(line);
         }
     }

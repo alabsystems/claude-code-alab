@@ -11,7 +11,7 @@
 //! running vendor-out again in aterm, never by editing it here.
 //!
 //! Std only, and it links none of the copies. It reads the list as aterm's
-//! `aterm_census::seal` writes it: a seal line in the first 16 lines carries
+//! `aterm_seal` (`crates/aterm-seal`) writes it: a seal line in the first 16 lines carries
 //! `@generated` and `seal ` before 16 lowercase hex digits, the FNV-1a 64 of
 //! the whole file with those digits read as `0`. Every other line that does
 //! not start with `#` is `<16 hex digits> <path from vendor/>`, in path order.

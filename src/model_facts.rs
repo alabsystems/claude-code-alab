@@ -1238,6 +1238,20 @@ impl SessionRead {
     }
 }
 
+/// One look's typed facts and independent journal change.
+#[derive(Clone, Copy, Debug)]
+#[must_use]
+pub struct Update<'a> {
+    /// The facts after the look, with their stated values and unknown states intact.
+    pub facts: &'a ModelFacts,
+    /// Whether the model, effort or key changed its value or [`Said`] state.
+    /// Changes to the reader's private inference bookkeeping do not count.
+    pub facts_changed: bool,
+    /// The new [`ModelFacts::journal_line`] only when that text changed.
+    /// Journal text can stay the same when the typed facts changed.
+    pub journal_line: Option<&'a str>,
+}
+
 /// What one child process has stated of its model, effort and key, across
 /// the conversations it was read in. An own-image move carries it in the
 /// capsule ([`Reader::put`], [`Reader::get`]): only this reader saw which
@@ -1251,7 +1265,7 @@ pub struct Reader {
     /// The conversation it was last read in.
     session: Option<SessionRead>,
     facts: ModelFacts,
-    /// [`ModelFacts::journal_line`] as [`Reader::look`] last returned it.
+    /// [`ModelFacts::journal_line`] as [`Reader::look`] last reported it.
     line: String,
     /// How many times [`pins_model`] was asked.
     #[cfg(test)]
@@ -1285,8 +1299,9 @@ impl Reader {
         self.pid
     }
 
-    /// Follow `process` one look further, at `now_ms`; the facts' journal line
-    /// when it changed. Claude Code's config directory is `config`.
+    /// Follow `process` one look further, at `now_ms`, returning the typed facts,
+    /// whether their values or unknown states changed, and any changed journal text.
+    /// Claude Code's config directory is `config`.
     ///
     /// The transcript is read again only when its length, modification time,
     /// change time or identity moved, and then only the rows appended since
@@ -1302,7 +1317,7 @@ impl Reader {
     /// Discovery consumes at most [`MAX_LOOKUP_STEPS`] directory-next attempts,
     /// including the attempt that proves a scan ended. A refused lookup marks
     /// every fact unread and keeps the existing retry interval.
-    pub fn look(&mut self, config: &Path, process: &Process<'_>, now_ms: u64) -> Option<&str> {
+    pub fn look(&mut self, config: &Path, process: &Process<'_>, now_ms: u64) -> Update<'_> {
         self.look_with_budget(config, process, now_ms, MAX_LOOKUP_STEPS)
     }
 
@@ -1312,37 +1327,58 @@ impl Reader {
         process: &Process<'_>,
         now_ms: u64,
         mut lookup_steps: usize,
-    ) -> Option<&str> {
-        let mut moved = false;
+    ) -> Update<'_> {
+        let mut before = None;
         let started = process.record.map(|(_, started)| started);
         if self.pid != Some(process.pid)
             || started.is_some_and(|s| self.floor_ms.is_some_and(|f| f != s))
         {
+            before = Some(std::mem::take(&mut self.facts));
             let line = std::mem::take(&mut self.line);
             *self = Self {
                 pid: Some(process.pid),
                 line,
                 ..Self::default()
             };
-            moved = true;
         }
         if let Some(record) = process.record {
             self.floor_ms = Some(record.1);
-            moved |= self.follow(config, record, process.args, now_ms, &mut lookup_steps);
+            let followed = self.follow(
+                config,
+                record,
+                process.args,
+                now_ms,
+                &mut lookup_steps,
+                before.is_none(),
+            );
+            before = before.or(followed);
         }
-        if !moved {
-            return None;
+        let facts_changed = before.as_ref().is_some_and(|before| {
+            before.model != self.facts.model
+                || before.effort != self.facts.effort
+                || before.key != self.facts.key
+        });
+        let journal_line = if before.is_some() {
+            let line = self.facts.journal_line();
+            if line == self.line {
+                None
+            } else {
+                self.line = line;
+                Some(self.line.as_str())
+            }
+        } else {
+            None
+        };
+        Update {
+            facts: &self.facts,
+            facts_changed,
+            journal_line,
         }
-        let line = self.facts.journal_line();
-        if line == self.line {
-            return None;
-        }
-        self.line = line;
-        Some(&self.line)
     }
 
-    /// One look at the conversation `id` the record names; whether the facts
-    /// were folded again.
+    /// One look at the conversation `id` the record names; its prior facts when
+    /// they were folded again and the caller needs a snapshot. An unchanged
+    /// source takes no snapshot.
     fn follow(
         &mut self,
         config: &Path,
@@ -1350,23 +1386,24 @@ impl Reader {
         args: &[OsString],
         now_ms: u64,
         lookup_steps: &mut usize,
-    ) -> bool {
+        snapshot_before: bool,
+    ) -> Option<ModelFacts> {
         let mut session = match self.session.take() {
             Some(same) if same.id == id => same,
             Some(left) => {
+                let before = snapshot_before.then(|| self.facts.clone());
                 self.switch(config, left, (id, started), args, now_ms, lookup_steps);
-                return true;
+                return before;
             }
             None => SessionRead::new(id, started),
         };
         let read = session.read(config, self.facts.chose, now_ms, lookup_steps);
         session.seen_ms = now_ms;
         self.session = Some(session);
-        let Some((tail, _)) = read else {
-            return false;
-        };
+        let (tail, _) = read?;
+        let before = snapshot_before.then(|| self.facts.clone());
         self.facts = tail.over(std::mem::take(&mut self.facts));
-        true
+        before
     }
 
     /// The process moved from the conversation `left` into `id`.
