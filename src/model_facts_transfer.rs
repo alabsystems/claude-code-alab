@@ -10,19 +10,21 @@
 //! another process's) for the child's current statements, and would lose what
 //! the child stated in a conversation it has left. So the reader travels: the
 //! facts, the conversation it is reading with its floor and when the child was
-//! last seen there, and where the last read stopped, with the file's stamp, so
-//! the new image goes on reading exactly where the old one stopped. The
-//! transcript's path is not carried: it is looked up again.
+//! last seen there, its immutable entry facts and the file's observed stamp.
+//! The new image skips an unchanged version and independently replays a
+//! changed one. The transcript's path is not carried: it is looked up again.
 
 use std::io;
 
-use super::{Carry, GUARD_BYTES, ModelFacts, Reader, Said, SessionRead, Stamp};
+use super::{ModelFacts, Reader, Said, SessionRead, Stamp};
 use crate::profile;
 use crate::transfer_capsule::{Decoder, Encoder};
 
 /// The most bytes of one fact's text (a model's name, a level) a capsule
 /// carries; every text the reader keeps is at most 64.
 const MAX_FACT_BYTES: usize = 256;
+/// Version 2 carries the entry baseline instead of the unverifiable suffix carry.
+const FORMAT: u8 = 2;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -40,6 +42,7 @@ impl Reader {
     /// # Errors
     /// A fact's text exceeds its bound, or the encoder refuses a value.
     pub fn put(&self, encoder: &mut Encoder) -> io::Result<()> {
+        encoder.u8(FORMAT)?;
         encoder.boolean(self.pid.is_some())?;
         if let Some(pid) = self.pid {
             encoder.u32(pid)?;
@@ -60,9 +63,12 @@ impl Reader {
     /// have written.
     ///
     /// # Errors
-    /// The bytes are truncated, or a tag, an id, a text or a carried read is
-    /// out of its bounds.
+    /// The format is unsupported, the bytes are truncated, or a tag, id,
+    /// text or entry baseline is out of its bounds.
     pub fn get(decoder: &mut Decoder<'_>) -> io::Result<Self> {
+        if decoder.u8()? != FORMAT {
+            return Err(invalid("unsupported model-reader transfer format"));
+        }
         let pid = if decoder.boolean()? {
             Some(decoder.u32()?)
         } else {
@@ -126,13 +132,16 @@ fn put_session(encoder: &mut Encoder, session: &SessionRead) -> io::Result<()> {
         put_i64(encoder, stamp.changed.0)?;
         put_i64(encoder, stamp.changed.1)?;
     }
-    encoder.boolean(session.carry.is_some())?;
-    if let Some(carry) = &session.carry {
-        encoder.u64(carry.device)?;
-        encoder.u64(carry.inode)?;
-        encoder.u64(carry.read_to)?;
-        encoder.bytes(&carry.guard[..carry.guard_len])?;
+    encoder.boolean(session.base.is_some())?;
+    if let Some(base) = &session.base {
+        put_facts(encoder, base)?;
     }
+    encoder.boolean(session.resumed)?;
+    encoder.u8(match session.pinned {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    })?;
     Ok(())
 }
 
@@ -155,31 +164,30 @@ fn get_session(decoder: &mut Decoder<'_>) -> io::Result<SessionRead> {
     } else {
         None
     };
-    let carry = if decoder.boolean()? {
-        let device = decoder.u64()?;
-        let inode = decoder.u64()?;
-        let read_to = decoder.u64()?;
-        let read = decoder.bytes(GUARD_BYTES)?;
-        if read.len() as u64 > read_to {
-            return Err(invalid("carried guard is longer than the rows read"));
-        }
-        let mut guard = [0; GUARD_BYTES];
-        guard[..read.len()].copy_from_slice(read);
-        Some(Carry {
-            device,
-            inode,
-            read_to,
-            guard,
-            guard_len: read.len(),
-        })
+    let base = if decoder.boolean()? {
+        Some(get_facts(decoder)?)
     } else {
         None
     };
+    let resumed = decoder.boolean()?;
+    let pinned = match decoder.u8()? {
+        0 => None,
+        1 => Some(false),
+        2 => Some(true),
+        _ => return Err(invalid("a carried launch pin has no such state")),
+    };
+    if (resumed && base.is_none()) || (pinned.is_some() && !resumed) {
+        return Err(invalid(
+            "a carried resume or launch pin has no entry evidence",
+        ));
+    }
     Ok(SessionRead {
         floor_ms,
         seen_ms,
         stamp,
-        carry,
+        base,
+        resumed,
+        pinned,
         ..SessionRead::new(&id, floor_ms)
     })
 }

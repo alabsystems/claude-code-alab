@@ -188,7 +188,7 @@ fn defaults_edit(
         Some(text) => settings_json::Json::parse(text)?,
         None => settings_json::Json::Object(Vec::new()),
     };
-    let own_effort = !efforts_set_by_hand(&doc).is_empty();
+    let own_effort = manual_efforts(&doc).next().is_some();
     let own_rate = survey_rate_set_by_hand(&doc).is_some();
     let top = doc
         .as_object_mut()
@@ -365,11 +365,11 @@ const CLAUDE_SURVEY_SWITCH: &str = "env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY";
 
 const SURVEY_RATE_KEY: &str = "feedbackSurveyRate";
 
-fn survey_rate_set_by_hand(doc: &settings_json::Json) -> Option<String> {
+fn survey_rate_set_by_hand(doc: &settings_json::Json) -> Option<&settings_json::Json> {
     let rate = doc.get(SURVEY_RATE_KEY)?;
     let zero =
         matches!(rate, settings_json::Json::Number(n) if n.parse::<f64>().is_ok_and(|x| x == 0.0));
-    (!zero).then(|| rate.render())
+    (!zero).then_some(rate)
 }
 
 const DEFAULT_EFFORT: &str = "xhigh";
@@ -377,27 +377,32 @@ const DEFAULT_EFFORT: &str = "xhigh";
 /// Effort defaults omitted when the person selected an effort.
 const CLAUDE_EFFORT_DEFAULTS: [&str; 2] = [CLAUDE_TOP_EFFORT_KEY, "effortLevel"];
 
-fn efforts_set_by_hand(doc: &settings_json::Json) -> Vec<(String, String)> {
+/// Manual effort values, top-level first and then models by name, without rendering them.
+fn manual_efforts(
+    doc: &settings_json::Json,
+) -> impl Iterator<Item = (Option<&str>, &settings_json::Json)> {
     use settings_json::Json;
-    let mut found = Vec::new();
-    let mut note = |path: String, effort: &Json| {
-        if effort.as_str() != Some(DEFAULT_EFFORT) {
-            found.push((path, effort.render()));
-        }
-    };
-    if let Some(effort) = doc.get("effortLevel") {
-        note("effortLevel".to_string(), effort);
-    }
-    if let Some(models) = doc.get("modelSettings").and_then(Json::as_object) {
-        let models: std::collections::BTreeMap<&str, &Json> =
-            models.iter().map(|(m, s)| (m.as_str(), s)).collect();
-        for (model, settings) in models {
-            if let Some(effort) = settings.get("effortLevel") {
-                note(format!("modelSettings.{model}.effortLevel"), effort);
-            }
-        }
-    }
-    found
+    let top = doc
+        .get("effortLevel")
+        .into_iter()
+        .map(|effort| (None, effort));
+    let models = doc
+        .get("modelSettings")
+        .and_then(Json::as_object)
+        .into_iter()
+        .flat_map(|models| {
+            models
+                .iter()
+                .map(|(model, settings)| (model.as_str(), settings))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .filter_map(|(model, settings)| {
+            settings
+                .get("effortLevel")
+                .map(|effort| (Some(model), effort))
+        });
+    top.chain(models)
+        .filter(|(_, effort)| effort.as_str() != Some(DEFAULT_EFFORT))
 }
 
 /// One default's value, as it is written when the key is unset.

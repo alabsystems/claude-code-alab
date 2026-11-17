@@ -201,7 +201,7 @@ mod tests {
             abandoned: supervise::Abandoned::default(),
             background_hold_until: 0,
             background_found: String::new(),
-            link: supervise::link::Link::Absent,
+            link: supervise::link::Link::absent(),
             ladder: crate::relaunch::Ladder::new(),
             restart_deferred: None,
             facts: crate::model_facts::Reader::default(),

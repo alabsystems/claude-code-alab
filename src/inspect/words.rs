@@ -5,6 +5,7 @@
 
 use super::{Class, Disposition, Finding, Remedy};
 use crate::prime::{DefaultState, Meaning, Setting};
+use std::borrow::Cow;
 
 fn meaning(value: Meaning) -> (&'static str, &'static str) {
     match value {
@@ -19,11 +20,15 @@ fn meaning(value: Meaning) -> (&'static str, &'static str) {
 
 /// Quote controls visibly, including C1 and Unicode line separators. The native
 /// paths are carried separately as hex, never converted into display text.
-pub(super) fn safe(text: &str) -> String {
+pub(super) fn safe(text: Cow<'_, str>) -> String {
     use std::fmt::Write as _;
+    let needs_quote = |ch: char| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}');
+    if !text.chars().any(needs_quote) {
+        return text.into_owned();
+    }
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+        if needs_quote(ch) {
             write!(out, "\\u{{{:x}}}", ch as u32).expect("writing into String");
         } else {
             out.push(ch);
@@ -38,7 +43,7 @@ pub(super) fn unavailable(key: &str, detail: &str) -> Finding {
         disposition: Disposition::Unavailable,
         class: Class::Person,
         label: "Claude Code's defaults".into(),
-        detail: safe(detail),
+        detail: safe(detail.into()),
         expected: None,
         remedy: Remedy::None,
     }
@@ -58,7 +63,7 @@ pub(super) fn setting(setting: Setting, auto_prime: bool, offer: Option<&str>) -
         class: Class::Person,
         label: format!("Claude Code: {label}"),
         detail: String::new(),
-        expected: Some(safe(&expected)),
+        expected: Some(safe(expected.as_str().into())),
         remedy: Remedy::None,
     };
     finding.detail = match state {
@@ -99,6 +104,6 @@ pub(super) fn setting(setting: Setting, auto_prime: bool, offer: Option<&str>) -
             format!("{key} is unset; automatic initialization adds {expected} at its next pass")
         }
     };
-    finding.detail = safe(&finding.detail);
+    finding.detail = safe(finding.detail.into());
     finding
 }

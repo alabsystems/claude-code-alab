@@ -64,6 +64,7 @@ fn only_the_native_hook_verb_or_exact_retired_installer_mark_is_removed() {
         "/opt/aterm/aterm-link hook run stop --report-to @s-1",
         "'/h/u/Library/Application Support/aterm/pkg/bin/aterm' link hook run stop",
         "'/tmp/it'\\''s/aterm-link' hook run stop",
+        "'/tmp/a|b/aterm' hook run stop",
         "/h/u/Library/Application Support/aterm/pkg/bin/aterm link hook run stop --state /h/u/.local/state/aterm-link",
         "/h/u/My Tools/aterm hook run stop",
         "/Applications/aterm.app/Contents/MacOS/aterm-cli link hook run stop",
@@ -80,8 +81,16 @@ fn only_the_native_hook_verb_or_exact_retired_installer_mark_is_removed() {
         "/opt/aterm/aterm ctl ls",
         "echo aterm link hook run stop",
         "'/unterminated/aterm link hook run stop",
+        "'aterm'link hook run stop",
+        "'/opt/aterm'link hook run stop",
+        "\u{a0}aterm link hook run stop",
+        "aterm \u{a0}link hook run stop",
+        "'/opt/aterm' \u{a0}link hook run stop",
+        "/h/u/My Tools/aterm \u{a0}hook run stop",
         "echo /h/u/Library/Application Support/aterm/pkg/bin/aterm link hook run stop",
         "/usr/bin/tee /x | /h/u/App Support/aterm link hook run stop",
+        "/usr/bin/printf|/opt/aterm link hook run stop",
+        "/usr/bin/true;/opt/aterm link hook run stop",
         "/usr/bin/env FOO=$(/x/aterm link hook run stop)",
         "/h/u/bin/my aterm link hook run stop",
         "Library/Application Support/aterm link hook run stop",
@@ -91,6 +100,72 @@ fn only_the_native_hook_verb_or_exact_retired_installer_mark_is_removed() {
         "# aterm-harness",
     ] {
         assert!(!is_aterm_hook_command(theirs), "{theirs}");
+    }
+}
+
+#[test]
+fn hook_filtering_preserves_foreign_and_preexisting_empty_values() {
+    for (before, expected, count) in [
+        (
+            r#"{
+                "before": 1,
+                "hooks": {
+                    "Stop": [
+                        {"matcher":"keep", "extra":true, "hooks":[
+                            {"command":"aterm hook run stop"},
+                            {"command":"foreign hook run stop", "other":[1,2]},
+                            {"type":"prompt", "prompt":"keep this"},
+                            {"command":23, "other":"unchanged"},
+                            {"command":"aterm link hook run stop"}
+                        ]},
+                        {"hooks":[], "keep":"already empty"},
+                        {"hooks":[{"command":"aterm hook run stop"}], "owner_note":"removed with group"},
+                        {"hooks":"opaque", "keep":true},
+                        {"no_hooks":"unchanged"},
+                        null
+                    ],
+                    "Notification":[{"hooks":[{"command":"aterm-cli link hook run notification"}]}],
+                    "AlreadyEmpty":[]
+                },
+                "after": 2
+            }"#,
+            r#"{
+                "before": 1,
+                "hooks": {
+                    "Stop": [
+                        {"matcher":"keep", "extra":true, "hooks":[
+                            {"command":"foreign hook run stop", "other":[1,2]},
+                            {"type":"prompt", "prompt":"keep this"},
+                            {"command":23, "other":"unchanged"}
+                        ]},
+                        {"hooks":[], "keep":"already empty"},
+                        {"hooks":"opaque", "keep":true},
+                        {"no_hooks":"unchanged"},
+                        null
+                    ],
+                    "AlreadyEmpty":[]
+                },
+                "after": 2
+            }"#,
+            4,
+        ),
+        (
+            r#"{"before":1,"hooks":{"Stop":[{"hooks":[{"command":"aterm hook run stop"}]}]},"after":2}"#,
+            r#"{"before":1,"after":2}"#,
+            1,
+        ),
+        (
+            r#"{"hooks":{},"other":[]}"#,
+            r#"{"hooks":{},"other":[]}"#,
+            0,
+        ),
+        (r#"{"other":true}"#, r#"{"other":true}"#, 0),
+    ] {
+        let mut doc = Json::parse(before).unwrap();
+        assert_eq!(strip_marked_hooks(&mut doc), Ok(count));
+        assert_eq!(doc, Json::parse(expected).unwrap());
+        assert_eq!(strip_marked_hooks(&mut doc), Ok(0));
+        assert_eq!(doc, Json::parse(expected).unwrap(), "a second pass");
     }
 }
 

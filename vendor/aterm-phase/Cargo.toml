@@ -33,5 +33,5 @@ unexpected_cfgs = { check-cfg = ["cfg(trust_verify)", "cfg(trust_seals)", "cfg(t
 unsafe_op_in_unsafe_fn = "warn"
 
 [dependencies]
-alab-policy = { path = "../alab-policy" }
+alab-policy = { path = "../alab-harness/crates/alab-policy" }
 aterm-agent-names = { path = "../aterm-agent-names" }

@@ -31,8 +31,8 @@ use std::path::{Component, Path, PathBuf};
 /// numbers, where 1 carried one optional build. 3: the two flags that said
 /// whether the session could be moved are gone, because a supervisor exists
 /// only for one that can ([`super::live_update_refusal`]). 4: the model
-/// reader travels ([`crate::model_facts::Reader::put`]), so the new image goes
-/// on reading the child's transcript where the old one stopped.
+/// reader travels ([`crate::model_facts::Reader::put`]), preserving its
+/// conversation-entry facts for bounded replay of changed transcript versions.
 pub(super) const SCHEMA: u32 = 4;
 const MAX_PATH: usize = 16 * 1024;
 const MAX_ARG: usize = 128 * 1024;
@@ -1003,7 +1003,7 @@ impl Saved {
                 background_found: self.background_found,
                 // An own-image move is admitted only outside aterm, where no
                 // link exists; nothing of a link is carried in the capsule.
-                link: super::link::Link::Absent,
+                link: super::link::Link::absent(),
                 // Nor is anything of a crash or a restart: a move is made only
                 // with neither pending, and the back-off starts over.
                 ladder: crate::relaunch::Ladder::new(),

@@ -13,22 +13,21 @@
 //! Modules, in the order a launch meets them:
 //! * [`cli`]: the harness's own options and `--version`;
 //! * [`store`]: the vendor build in the atpkg store (never `PATH`);
-//! * [`supervise`]: the child, its signals, its end, the live update;
+//! * [`supervise`]: the child, its signals, its end, the live update, and the adapter
+//!   to [`alab_wire::link::Link`] for lifecycle claims and recovery;
 //! * [`quiet`]: the safe point a live update waits for;
 //! * [`profile`]: Claude Code's facts (record, resume grammar, permission mode);
 //! * [`model_facts`]: the model, effort level and top-effort key the child
 //!   states in its transcript, which the supervisor journals;
 //! * [`procs`]: the child's background work, which a safe point waits for;
-//! * [`aterm`]: the aterm client boundary (claim text, reply parsers, the
-//!   safe-point judge), used by the supervisor's link inside an aterm tab;
-//! * [`aterm_wire`]: direct transport to aterm's control socket (the link's
-//!   request connection and event stream), connection custody, and the
+//! * [`aterm`]: local request/reply interpretation used by typed-client protocol fixtures;
+//! * [`aterm_wire`]: direct transport, typed request builders and retained
+//!   connection custody for image recovery, and the
 //!   spelling of a fenced typed write;
 //! * [`typing`]: the fenced typing client, which types only under the claim's
 //!   holder, revision and duty and the person's count (no claim takes a
 //!   typing duty yet, so nothing calls it);
-//! * [`relaunch`]: aterm's exit classification and crash back-off, which
-//!   decide a crash relaunch and a restart aterm asks for;
+//! * [`relaunch`]: exit classification and crash back-off supporting the supervisor;
 //! * [`self_image`]: the harness's own build in the atpkg store, selected and
 //!   retained for an own-image move;
 //! * [`transfer_capsule`]: the bounded frame that carries the supervisor's

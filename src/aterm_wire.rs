@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Inactive direct-local aterm transport, without claims or child supervision.
+//! Direct-local transport, typed requests and retained connection custody.
+//! Lifecycle claims and reconnects use [`alab_wire::link::Link`] through the supervisor adapter.
 //!
 //! The framing and discovery rules follow aterm's `control_socket.rs`,
 //! `control_verbs.rs` and `RelayClient`, and grok-alab's direct `aterm.rs` client.
@@ -20,7 +21,6 @@
 //! the fence aterm judges it by ([`TypedFence`]): [`send_verb`], [`key_verb`]
 //! and [`turn_verb`]. Spelling one types nothing; [`crate::typing`] sends them.
 
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -30,6 +30,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+pub(crate) use alab_wire::wire::session_id;
+pub use alab_wire::wire::{Fields, percent_decode};
 
 use crate::aterm::{Restart, Scope};
 
@@ -123,27 +126,6 @@ fn remaining_at(until: Instant, now: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "control exchange deadline elapsed"))
 }
 
-/// A minted aterm tab ID: `t` and ten lower-case Crockford base32 characters,
-/// or the `s-` and twenty lower-case hex digits retained by an older live tab.
-/// Both are single canonical words and cannot name a path or another selector.
-pub(crate) fn session_id(sid: &str) -> bool {
-    match sid.as_bytes() {
-        [b't', tail @ ..] => {
-            tail.len() == 10
-                && tail
-                    .iter()
-                    .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(byte))
-        }
-        [b's', b'-', tail @ ..] => {
-            tail.len() == 20
-                && tail
-                    .iter()
-                    .all(|byte| matches!(*byte, b'0'..=b'9' | b'a'..=b'f'))
-        }
-        _ => false,
-    }
-}
-
 /// A session's rendezvous directory and validated session ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Locator {
@@ -152,18 +134,6 @@ pub struct Locator {
 }
 
 impl Locator {
-    /// Locate the session named by `ATERM_PARENT_SESSION_ID` and the runtime/home environment.
-    ///
-    /// # Errors
-    /// A session ID or rendezvous directory is absent or malformed.
-    pub fn from_env() -> io::Result<Self> {
-        let sid = std::env::var("ATERM_PARENT_SESSION_ID")
-            .map_err(|_| invalid("ATERM_PARENT_SESSION_ID is absent or not UTF-8"))?;
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-        let home = std::env::var_os("HOME");
-        Self::from_values(&sid, runtime.as_deref(), home.as_deref())
-    }
-
     /// Resolve the documented environment values without reading the process environment.
     ///
     /// # Errors
@@ -759,17 +729,6 @@ impl Connection {
         self.finish(result, until)
     }
 
-    /// Use the caller's original deadline for one step of a bounded transaction.
-    pub(crate) fn request_line_until(
-        &mut self,
-        request: &str,
-        until: Instant,
-    ) -> io::Result<String> {
-        self.prepare(request)?;
-        let result = self.exchange_line(request, until);
-        self.finish(result, until)
-    }
-
     fn exchange_line(&mut self, request: &str, until: Instant) -> io::Result<String> {
         self.write_until(format!("{request}\n").as_bytes(), until)
             .and_then(|()| self.line_until(until))
@@ -985,104 +944,6 @@ fn canonical_u64(value: &str) -> io::Result<u64> {
     value
         .parse()
         .map_err(|_| invalid("unsigned decimal overflows"))
-}
-
-/// An `OK` reply's unique, still-percent-encoded key/value fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fields(BTreeMap<String, String>);
-
-impl Fields {
-    /// Parse only `OK` followed by unique `key=value` words; unknown keys remain available.
-    ///
-    /// # Errors
-    /// A header, key/value word or duplicate key is malformed.
-    pub fn parse(reply: &str) -> io::Result<Self> {
-        if reply.len() > MAX_LINE_BYTES {
-            return Err(invalid("field reply exceeds its bound"));
-        }
-        let mut words = reply.split_ascii_whitespace();
-        if words.next() != Some("OK") {
-            return Err(invalid("expected an OK field reply"));
-        }
-        let mut fields = BTreeMap::new();
-        for word in words {
-            let (key, value) = word
-                .split_once('=')
-                .ok_or_else(|| invalid("reply field is not key=value"))?;
-            if key.is_empty()
-                || !key.bytes().all(|byte| byte.is_ascii_graphic())
-                || fields.insert(key.to_string(), value.to_string()).is_some()
-            {
-                return Err(invalid("reply field has an empty or duplicate key"));
-            }
-        }
-        Ok(Self(fields))
-    }
-
-    /// Parse an `OK` reply whose line this client does not own word for word, such as
-    /// `status`: a later `key=value` word replaces an earlier one with the same key,
-    /// and a bare word or a word with an empty key is skipped. Values stay
-    /// percent-encoded. The strict [`Fields::parse`] remains the reader for replies
-    /// whose every word must be accounted for.
-    ///
-    /// A caller that needs a field must still refuse its absence: leniency here
-    /// never supplies a value.
-    ///
-    /// # Errors
-    /// The reply exceeds the line bound or does not start with the word `OK`.
-    pub fn parse_lenient(reply: &str) -> io::Result<Self> {
-        if reply.len() > MAX_LINE_BYTES {
-            return Err(invalid("field reply exceeds its bound"));
-        }
-        let mut words = reply.split_ascii_whitespace();
-        if words.next() != Some("OK") {
-            return Err(invalid("expected an OK field reply"));
-        }
-        let mut fields = BTreeMap::new();
-        for word in words {
-            if let Some((key, value)) = word.split_once('=')
-                && !key.is_empty()
-            {
-                fields.insert(key.to_string(), value.to_string());
-            }
-        }
-        Ok(Self(fields))
-    }
-
-    /// Read a field without decoding or inventing a value for an absent field.
-    #[must_use]
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).map(String::as_str)
-    }
-}
-
-/// Decode a percent-encoded wire value, rejecting malformed escapes and UTF-8.
-///
-/// # Errors
-/// An escape is incomplete/nonhex or decoded bytes are not UTF-8.
-pub fn percent_decode(value: &str) -> io::Result<String> {
-    if value.len() > MAX_LINE_BYTES {
-        return Err(invalid("encoded field exceeds its bound"));
-    }
-    let mut decoded = Vec::with_capacity(value.len());
-    let mut bytes = value.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte != b'%' {
-            decoded.push(byte);
-            continue;
-        }
-        let digit = |byte: u8| char::from(byte).to_digit(16).map(|n| n as u8);
-        let high = bytes
-            .next()
-            .and_then(digit)
-            .ok_or_else(|| invalid("invalid percent escape"))?;
-        let low = bytes
-            .next()
-            .and_then(digit)
-            .ok_or_else(|| invalid("invalid percent escape"))?;
-        decoded.push((high << 4) | low);
-    }
-    String::from_utf8(decoded).map_err(|_| invalid("decoded field is not UTF-8"))
 }
 
 /// What a typed write names: the claim it is made under and the person's count it
@@ -1666,10 +1527,6 @@ fn validate_custody_socket(raw: RawFd) -> io::Result<()> {
 #[cfg(test)]
 #[path = "aterm_wire_tab_ids_tests.rs"]
 mod tab_id_tests;
-
-#[cfg(test)]
-#[path = "aterm_wire_child_deadline_tests.rs"]
-mod child_deadline_tests;
 
 #[cfg(test)]
 mod tests {

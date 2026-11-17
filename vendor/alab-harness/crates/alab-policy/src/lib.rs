@@ -63,6 +63,9 @@ macro_rules! mark {
     };
 }
 
+/// The shared origin line for a harness's help and version output.
+pub const ORIGIN_LINE: &str = "by Andrew Yates · ALab · alab.systems";
+
 pub mod classify;
 pub mod claude_code;
 pub mod config;

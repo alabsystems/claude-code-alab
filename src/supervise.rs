@@ -100,8 +100,6 @@ use crate::sys::{self, ChildEvent, SignalPipe, Termios};
 pub mod image;
 #[path = "supervise_link.rs"]
 mod link;
-#[cfg(test)]
-pub(crate) use link::child_start_ask_control as child_start_ask_at;
 #[path = "supervise_transfer.rs"]
 mod transfer;
 #[path = "supervise_vendor.rs"]
@@ -705,9 +703,7 @@ pub fn run_with_image_host(setup: &Setup, factory: image::HostFactory) -> ! {
     // An older host gets the original v3 launch unchanged. A host that can
     // prove a separate vendor child receives its native identity immediately
     // after spawn, before any built-in typing duty can use that child.
-    if matches!(&sup.link, link::Link::Held(claimed) if claimed.wants_initial_child()) {
-        sup.link_reannounce();
-    }
+    sup.link_tick();
     sup.run(&mut pipe, tstp)
 }
 
@@ -977,6 +973,9 @@ impl Supervisor {
     /// asked for may be a crash to answer ([`Supervisor::crash_begins`]).
     /// Every other end is the session's, and the harness ends the same way.
     fn on_end(&mut self, event: ChildEvent) {
+        // dispatch reaches this only after consuming this current child's
+        // terminal wait event. Retire its binding before any restart or reclaim.
+        self.link.child_ended();
         let ending = std::mem::replace(&mut self.ending, Ending::None);
         let moved = self.moved.take();
         match ending {
@@ -1362,7 +1361,7 @@ impl Supervisor {
     /// * the conversation's resume argv can be written;
     /// * one fresh policy and status read shows this harness's proven claim
     ///   taking `relaunch`, and the session neither halted nor driven
-    ///   ([`Supervisor::link_relaunch_word`], [`crate::relaunch::permitted`]);
+    ///   ([`Supervisor::link_relaunch_word`], [`alab_wire::relaunch::permitted`]);
     /// * the plan can be pinned and the kernel accepts the signal.
     ///
     /// With no session record yet (the child has not written one), while the
@@ -2219,7 +2218,7 @@ mod tests {
             abandoned: Abandoned::default(),
             background_hold_until: 0,
             background_found: String::new(),
-            link: link::Link::Absent,
+            link: link::Link::absent(),
             ladder: Ladder::new(),
             restart_deferred: None,
             facts: model_facts::Reader::default(),
@@ -2542,15 +2541,10 @@ mod tests {
             crash.ask_at_ms = 2_000;
         }
         assert_eq!(sup.crash_wake_ms(), Some(2_000));
-        sup.link = link::Link::Lost {
-            locator: crate::aterm_wire::Locator::new(state.clone(), "s-0000000000000000001a")
-                .expect("a locator"),
-            retry_at_ms: 6_000,
-            noted: String::new(),
-            claimed: true,
-            held: None,
-            known: None,
-        };
+        let locator = alab_wire::wire::Locator::new(state.clone(), "s-0000000000000000001a")
+            .expect("a locator");
+        sup.link = link::Link::launch_at(&locator, None, 1_000);
+        assert!(sup.link.lost(), "a missing host is awaiting reclaim");
         // A lost link is asked nothing before it is claimed again: the loop
         // sleeps to the budget's end, the poll trying the claim meanwhile.
         assert_eq!(sup.crash_wake_ms(), Some(46_000));

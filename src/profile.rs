@@ -8,6 +8,7 @@
 //! measured Claude relaunch lane, cited per item against aterm's main branch
 //! of 2026-10-24 (`crates/aterm-agent/src/harness/upgrade.rs`).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::json::{self, Value};
@@ -266,42 +267,50 @@ fn flag(name: &str) -> Option<(Arity, Fate)> {
         .map(|(_, a, f)| (*a, *f))
 }
 
-fn maybe_option(tok: &str) -> bool {
-    tok.len() > 1 && tok.starts_with('-')
+fn maybe_option(tok: &OsStr) -> bool {
+    let bytes = tok.as_encoded_bytes();
+    bytes.len() > 1 && bytes.starts_with(b"-")
 }
 
 /// One option with its original value boundaries and argv position.
-struct ParsedFlag<'a> {
+struct ParsedFlag<'a, W> {
     name: &'a str,
     fate: Option<Fate>,
-    tokens: &'a [String],
+    tokens: &'a [W],
     at: usize,
 }
 
-fn parsed(argv: &[String]) -> Vec<ParsedFlag<'_>> {
-    parsed_with(argv, &[], |_| {})
+fn parsed(argv: &[String]) -> Vec<ParsedFlag<'_, String>> {
+    parsed_with(argv, &[], |_| {}).expect("String arguments always have UTF-8 option names")
 }
 
-fn parsed_with<'a>(
-    argv: &'a [String],
+fn parsed_with<'a, W: AsRef<OsStr>>(
+    argv: &'a [W],
     extra_flags: &[&str],
-    mut positional: impl FnMut(&'a str),
-) -> Vec<ParsedFlag<'a>> {
+    mut positional: impl FnMut(&'a W),
+) -> Option<Vec<ParsedFlag<'a, W>>> {
     let mut out = Vec::new();
     let mut i = 1;
     while i < argv.len() {
-        let tok = &argv[i];
+        let tok = argv[i].as_ref();
         if tok == "--" {
             break;
         }
         if !maybe_option(tok) {
-            positional(tok);
+            positional(&argv[i]);
             i += 1;
             continue;
         }
-        let (name, inline) = match tok.split_once('=') {
-            Some((n, _)) if n.starts_with("--") => (n, true),
-            _ => (tok.as_str(), false),
+        // Only a long option's name needs text; its inline value may be opaque.
+        let bytes = tok.as_encoded_bytes();
+        let inline_at = if bytes.starts_with(b"--") {
+            bytes.iter().position(|byte| *byte == b'=')
+        } else {
+            None
+        };
+        let (name, inline) = match inline_at {
+            Some(at) => (std::str::from_utf8(&bytes[..at]).ok()?, true),
+            None => (tok.to_str()?, false),
         };
         let known = flag(name).or_else(|| {
             (!inline && extra_flags.contains(&name)).then_some((Arity::None, Fate::Keep))
@@ -317,7 +326,7 @@ fn parsed_with<'a>(
                     }
                 }
                 Arity::Optional => {
-                    if i < argv.len() && !maybe_option(&argv[i]) {
+                    if i < argv.len() && !maybe_option(argv[i].as_ref()) {
                         i += 1;
                     }
                 }
@@ -327,7 +336,7 @@ fn parsed_with<'a>(
                     if i < argv.len() {
                         i += 1;
                     }
-                    while i < argv.len() && !maybe_option(&argv[i]) {
+                    while i < argv.len() && !maybe_option(argv[i].as_ref()) {
                         i += 1;
                     }
                 }
@@ -340,27 +349,28 @@ fn parsed_with<'a>(
             at: start,
         });
     }
-    out
+    Some(out)
 }
 
 /// Known option names/positions and the first positional word, using the same
 /// value boundaries as resume parsing. Launcher-only switches may add zero-arity
 /// names; vendor arities still have one source. Unknown arity grants no scan.
-pub(crate) struct LaunchWords<'a> {
+/// Positional words and option values remain native; only option names need UTF-8.
+pub(crate) struct LaunchWords<'a, W> {
     pub flags: Vec<(&'a str, usize)>,
-    pub first: Option<&'a str>,
+    pub first: Option<&'a W>,
 }
 
-pub(crate) fn launch_words<'a>(
-    argv: &'a [String],
+pub(crate) fn launch_words<'a, W: AsRef<OsStr>>(
+    argv: &'a [W],
     extra_flags: &[&str],
-) -> Option<LaunchWords<'a>> {
+) -> Option<LaunchWords<'a, W>> {
     let mut first = None;
     let flags = parsed_with(argv, extra_flags, |word| {
         if first.is_none() {
             first = Some(word);
         }
-    });
+    })?;
     let names = flags
         .into_iter()
         .map(|flag| flag.fate.map(|_| (flag.name, flag.at)))

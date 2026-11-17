@@ -14,7 +14,7 @@
 //!   always execs the vendor in place, leaving live duties to the host;
 //! * a lone `--version` or `-v` outside that envelope, which prints
 //!   `claude-code-alab <version> (claude <vendor version>)` from the store's
-//!   records, never by running the vendor.
+//!   records and the shared origin line, never by running the vendor.
 //!
 //! Two kinds of launch run the vendor alone, exec'd in the harness's place
 //! ([`pass_through`]: the same pid, no supervision claim):
@@ -29,6 +29,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
+
+use alab_policy::ORIGIN_LINE;
 
 use crate::journal::Journal;
 use crate::profile::{COMMAND, PACKAGE, REPO, TOOL};
@@ -316,7 +318,7 @@ pub enum Command {
         /// The vendor's arguments, unchanged.
         args: Vec<OsString>,
     },
-    /// Print the version line.
+    /// Print the version headline and shared origin line.
     Version,
     /// Print the harness's own usage.
     Help,
@@ -327,6 +329,7 @@ pub enum Command {
 pub fn usage() -> String {
     format!(
         "{TOOL} {VERSION}: runs the vendor `{COMMAND}` from the atpkg store as its child.\n\
+         {ORIGIN_LINE}\n\
          \n\
          usage: {TOOL} [--alab-<option>…] [{COMMAND} arguments…]\n\
          \x20      {TOOL} [--alab-<option>…] {ENTRY_WORD} -- [{COMMAND} arguments…]\n\
@@ -338,7 +341,7 @@ pub fn usage() -> String {
          `{ENTRY_WORD} --` and `{LAUNCH_ENTRY_WORD} --` apply managed permission, usage and update\n\
          defaults. `{LAUNCH_ENTRY_WORD} --` then execs `{COMMAND}` in place, without supervision.\n\
          --no-harness skips supervision, usage and account helpers; --yolo selects bypass.\n\
-         `{TOOL} --version` prints this harness's version and the vendor's.\n\
+         `{TOOL} --version` prints the harness and vendor versions and the origin line.\n\
          \n\
          harness options:\n\
          \x20 --alab-no-live-update   never move this session: run `{COMMAND}` alone, in this\n\
@@ -374,7 +377,12 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     let mut live_update = true;
     let mut rest = args.into_iter().peekable();
     while let Some(word) = rest.peek() {
-        let Some(text) = word.to_str() else { break };
+        if !word.as_encoded_bytes().starts_with(b"--alab-") {
+            break;
+        }
+        let text = word
+            .to_str()
+            .ok_or_else(|| "harness option is not UTF-8".to_string())?;
         let Some(option) = text.strip_prefix("--alab-") else {
             break;
         };
@@ -423,8 +431,9 @@ pub const NOT_INSTALLED: &str = "not installed";
 /// unreadable or names another version than its build directory.
 pub const UNKNOWN: &str = "unknown";
 
-/// The version line: `claude-code-alab <version> (claude <vendor version>)`,
-/// `<version>` from `[workspace.package] version`, and the vendor version the
+/// The version text: a `claude-code-alab <version> (claude <vendor version>)`
+/// headline followed by the shared origin line. `<version>` comes from
+/// `[workspace.package] version`, and the vendor version from the
 /// `.vendor` record of the build `current` names, where it names that very build
 /// ([`store::Build::version`]). Otherwise the parenthesis reads
 /// `(claude not installed)` (no `current` link) or `(claude unknown)` (every
@@ -438,7 +447,7 @@ pub fn version_line(current: Option<&Result<store::Build, store::Missing>>) -> S
         Some(Err(store::Missing::NotInstalled(_))) => NOT_INSTALLED,
         Some(Err(_)) | None => UNKNOWN,
     };
-    format!("{REPO} {VERSION} ({COMMAND} {vendor})")
+    format!("{REPO} {VERSION} ({COMMAND} {vendor})\n{ORIGIN_LINE}")
 }
 
 /// What the journal calls a launch that leaves the harness out ([`left_out`]).
@@ -751,10 +760,37 @@ mod tests {
         let args = ["--model", "opus", "--alab-no-live-update", "-p", "hi"];
         assert_eq!(parse(os(&args)), run(Options::default(), &args));
         assert_eq!(parse(Vec::new()), run(Options::default(), &[]));
+        use std::os::unix::ffi::OsStringExt as _;
+        let owned = OsString::from_vec(b"--alab-poll-ms=\xff".to_vec());
+        for words in [
+            vec![OsString::from_vec(vec![0xff])],
+            vec![OsString::from("task"), owned.clone()],
+            vec![OsString::from_vec(vec![0xff]), owned.clone()],
+            vec![OsString::from("--"), owned],
+        ] {
+            assert_eq!(
+                parse(words.clone()),
+                Ok(Command::Run {
+                    opts: Options::default(),
+                    live_update: true,
+                    args: words,
+                })
+            );
+        }
     }
 
     #[test]
     fn launch_envelope_prepares_but_never_supervises_the_vendor() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let opaque = OsString::from_vec(b"--alab-poll-ms=\xff".to_vec());
+        assert_eq!(
+            parse(vec!["launch".into(), "--".into(), opaque.clone()]),
+            Ok(Command::Run {
+                opts: Options::default(),
+                live_update: false,
+                args: vec![opaque],
+            })
+        );
         for vendor in [
             &[][..],
             &["--model", "opus", "a task"],
@@ -840,6 +876,16 @@ mod tests {
 
     #[test]
     fn the_twin_envelope_is_dropped_and_everything_after_it_is_the_vendors() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let opaque = OsString::from_vec(b"--alab-poll-ms=\xff".to_vec());
+        assert_eq!(
+            parse(vec!["run".into(), "--".into(), opaque.clone()]),
+            Ok(Command::Run {
+                opts: Options::default(),
+                live_update: true,
+                args: vec![opaque],
+            })
+        );
         // What the twin sends: `run --`, then the launch's own arguments.
         assert_eq!(
             parse(os(&["run", "--", "--model", "opus", "fix it"])),
@@ -958,6 +1004,15 @@ mod tests {
         ] {
             assert!(parse(os(bad)).is_err(), "{bad:?}");
         }
+        use std::os::unix::ffi::OsStringExt as _;
+        for bytes in [b"--alab-poll-ms=\xff".as_slice(), b"--alab-\xff".as_slice()] {
+            let bad = OsString::from_vec(bytes.to_vec());
+            assert!(parse(vec![bad.clone()]).is_err(), "{bad:?}");
+            assert!(
+                parse(vec!["--alab-quiet-ms=200".into(), bad.clone()]).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -994,8 +1049,28 @@ mod tests {
     }
 
     #[test]
+    fn version_prints_the_origin_line() {
+        let text = version_line(None);
+        assert_eq!(text.lines().nth(1), Some(alab_policy::ORIGIN_LINE));
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn usage_prints_the_origin_line() {
+        let text = usage();
+        assert_eq!(text.lines().nth(1), Some(alab_policy::ORIGIN_LINE));
+        assert_eq!(
+            text.lines()
+                .filter(|line| *line == alab_policy::ORIGIN_LINE)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn version_line_names_repo_harness_and_vendor() {
         use std::path::PathBuf;
+        let origin = alab_policy::ORIGIN_LINE;
         let build = store::Build {
             number: 1_000_002_000_001_000_310,
             dir: PathBuf::from("/s/claude/1000002000001000310"),
@@ -1005,20 +1080,20 @@ mod tests {
         };
         assert_eq!(
             version_line(Some(&Ok(build.clone()))),
-            format!("claude-code-alab {VERSION} (claude 2.1.310)")
+            format!("claude-code-alab {VERSION} (claude 2.1.310)\n{origin}")
         );
         assert_eq!(
             version_line(Some(&Ok(store::Build {
                 version: None,
                 ..build
             }))),
-            format!("claude-code-alab {VERSION} (claude unknown)")
+            format!("claude-code-alab {VERSION} (claude unknown)\n{origin}")
         );
         assert_eq!(
             version_line(Some(&Err(store::Missing::NotInstalled(PathBuf::from(
                 "/s/claude/current"
             ))))),
-            format!("claude-code-alab {VERSION} (claude not installed)")
+            format!("claude-code-alab {VERSION} (claude not installed)\n{origin}")
         );
         for missing in [
             store::Missing::Unusable(PathBuf::from("/s/claude/current"), "x".to_string()),
@@ -1027,13 +1102,13 @@ mod tests {
         ] {
             assert_eq!(
                 version_line(Some(&Err(missing.clone()))),
-                format!("claude-code-alab {VERSION} (claude unknown)"),
+                format!("claude-code-alab {VERSION} (claude unknown)\n{origin}"),
                 "{missing:?}"
             );
         }
         assert_eq!(
             version_line(None),
-            format!("claude-code-alab {VERSION} (claude unknown)"),
+            format!("claude-code-alab {VERSION} (claude unknown)\n{origin}"),
             "no home"
         );
     }

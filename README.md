@@ -13,6 +13,7 @@ $ claude-alab                      # same as `claude`, kept up to date
 $ claude-alab --model opus         # every argument goes to `claude` unchanged
 $ claude-alab --version
 claude-code-alab <version> (claude <vendor version>)
+by Andrew Yates · ALab · alab.systems
 ```
 
 Install Claude Code with `aterm pkg install claude`. Without it, `claude-alab`
@@ -93,9 +94,10 @@ them is passed to `claude`.
 | `--alab-term-grace-ms=<ms>` | How long an update waits for `claude` to end | 30000 |
 | `--alab-help` | Show the usage text | |
 
-atpkg's managed `claude` handoff uses `claude-alab launch -- <arguments>` when
-the selected binary declares `--alab-launches=claude`. That entry prepares the
-launch and execs the vendor in place. Full supervision would declare
+`--alab-launches=claude` advertises `claude-alab launch -- <arguments>` as the
+managed host entry. That entry prepares the launch and execs the vendor in
+place. Host adoption and installed routing require their own qualification.
+Full supervision would declare
 `--alab-leads=claude` and use `claude-alab run -- <arguments>`; this build keeps
 that declaration disabled until native qualification is complete.
 Inside aterm, `ATERM_NO_HARNESS=1` runs `claude` alone too.
@@ -185,30 +187,48 @@ key=off`, with `-` for a fact not stated yet or not readable. That line is
 their only output for now; aterm will be told them once the harness interface
 carries them.
 
+An unchanged transcript stamp skips the read. Every changed version replays
+at most the last 256 KiB of whole rows over the facts from when this conversation
+was entered. Facts that window may have skipped become unread, even if an
+earlier look saw them. This bounds each read and avoids retaining statements
+that were rewritten or removed. Metadata checks before and after the read
+reject observed changes; they do not make a concurrent read atomic.
+
 ## Status
 
-Working today:
+This comparison separates implementation ownership from host adoption. The cost
+column describes process and I/O bounds; no CPU, startup or latency measurements
+are claimed. The host column identifies the code that remains until its replacement
+handoff is accepted.
 
-* running, signal handling and exit status
-* live update of Claude Code with fallback to the previous build
-* self-update outside aterm
-* the aterm claim, and the update moment taken from aterm
-* under that claim, relaunching a crashed `claude` on the same conversation
-  and restarting it when aterm asks
-* managed launch defaults, bounded usage setup, renderer selection, token
-  service invocation and package update interception
-* a launch-only entry that prepares the same policy and execs the vendor in place
-* reading the model, effort level and top-effort key from the transcript,
-  across `/model`, `/effort`, `/clear` and `/resume`, into the journal
+| Feature | Independent implementation | Structural cost | Remaining aterm ownership |
+|---|---|---|---|
+| First launch | [Launch policy](src/launch.rs) owns argument/default handling, renderer selection, update interception and usage/token helper invocation. | `launch --` execs the vendor in the same process and leaves no resident supervisor or poll loop. | Managed routing still needs the owner handoff; usage and account-token services remain in aterm. |
+| Relaunch and update | The [C3 adapter](src/supervise_link.rs) uses the canonical link for claims, policy, events, child generations and reconnects. Claude keeps its crash and replacement decisions. | Claim/reconnect state lives in the shared lifecycle machine. Eligible `run --` sessions retain a supervisor. | Existing lifecycle consumers remain for paths without those claims. Typing duties, walls and task state still belong to aterm; full leadership is not advertised. |
+| Unset defaults | [Priming](src/prime.rs) owns Claude's settings schema and preserves selected effort, survey and compaction choices. | A direct operation on the explicitly selected files starts no vendor child. | The host initializer and its Claude defaults table remain until delegation is accepted. |
+| Legacy hook cleanup | [Cleanup](src/prime/legacy_hooks.rs) owns adapter matching and status-line restoration through the shared settings transaction code. | Nothing managed to remove means no lock or write; replaced bytes retain a backup. | The host's Claude settings editor and cleanup remain until the owner callback handoff is accepted. |
+| Read-only settings findings | [Inspection](src/inspect.rs) uses the same interpretation as priming and returns owner-authored findings. | Reads are bounded at 1 MiB for settings and 2 MiB for state; the response is at most 1 MiB. It creates no files. | Doctor still interprets Claude settings locally until it consumes the independent findings. |
+| Model, effort and key | The [transcript reader](src/model_facts.rs) keeps the three facts separate, including their unread states, across conversation changes. | Each changed transcript replays at most 256 KiB. An unchanged stamp skips payload reads. | These facts currently reach the journal only; host footer/display readers remain. |
+| Shared dependencies | The [canonical pin](vendor/alab-harness.pin) owns policy and wire together at v0.9.3. The [sealed projections](vendor/VENDORED) own only phase readers and agent names. | Canonical policy/link code is reused; screen readers are generated copies, with an independently chosen canonical pin. | The screen grammar is still produced by aterm. Moving that dependency out is part of the remaining extraction. |
 
-The integration suite exercises these against scripted vendor and host
-stand-ins. A separate synthetic native aterm run also covers the claim,
-crash recovery, vendor upgrade, and the host's approval, question and Cruise
-behavior with the independent harness. A separate different-image run passes
+The [standalone implementation](src/supervise.rs) also includes signal and exit
+status forwarding, vendor-update fallback to the previous build, and self-update
+outside aterm.
+
+A conversation switch can read more than one transcript; the 256 KiB bound is
+per changed file, not a whole-look I/O ceiling. Metadata and discovery work remain
+even when a payload read is skipped. Live host consumers must stay until their
+replacement is implemented and qualified.
+
+Earlier integration suites exercised the then-current launch and lifecycle
+behavior against scripted vendor and host stand-ins. A separate synthetic native
+aterm run also covered the claim, crash recovery, vendor upgrade, and the host's
+approval, question and Cruise behavior with the independent harness. A separate
+different-image run passed
 all seven local-provider cases: busy upgrade, failed exec, rollback, expired
-entry, held handoff, held roles and malformed adoption. These runs do not
-qualify real Claude Code, accounts, quota display or an own-image update inside
-aterm.
+entry, held handoff, held roles and malformed adoption. These historical runs do
+not qualify real Claude Code, accounts, quota display or an own-image update
+inside aterm.
 
 Not done yet:
 
@@ -271,13 +291,23 @@ targo fmt --check
 The tests run the real binary on a real pseudo-terminal against a scripted
 stand-in for Claude Code, and against a stand-in for aterm's control socket.
 
-`vendor/` holds copies of three aterm crates the harness builds with (the
-turn-end readers, the screen reader and the agent name table), not Claude Code.
-aterm writes them: each source file and fixture a library's build reads, byte
-for byte as in aterm, and a `Cargo.toml` of aterm's making that builds the
-library alone. Their tests, and files only a test reads, stay in aterm.
-`vendor/VENDORED` lists each file's digest, and `tests/vendored.rs` fails on
-any copy edited here.
+`vendor/alab-harness` holds one whole qualified tag of the canonical shared
+harness repository, named by `vendor/alab-harness.pin`. Both `alab-policy`
+and `alab-wire` build from that tree. Update it with the canonical repository's
+`tools/pin <this checkout> <tag>`, after that tag passes its own gate, then
+commit the whole copy and pin and run its `tools/check-pin <this checkout>`.
+Stage the copy and pin before running vendor-out. Its version can advance
+independently of aterm's pin; aterm's own repin never changes this one.
+
+aterm's `verify vendor-out` generates only `aterm-phase` and
+`aterm-agent-names`, including their standalone manifests and the sealed
+`vendor/VENDORED` digest list. Phase uses the same canonical policy dependency
+as this package. The projection checker validates the separate canonical owner
+before reserving exactly its tree and pin; every other unlisted vendor file
+remains an error. Generated files are changed through their producers.
+`tests/pin.rs` checks the committed canonical tree and working copy in a Git
+checkout. An unpacked archive has no committed tree to compare; the upstream
+tag/content comparison still requires the release check in its original checkout.
 
 ## License
 

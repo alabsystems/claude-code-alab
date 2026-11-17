@@ -144,15 +144,14 @@ impl PathObservation {
             return Err("inconsistent inspection path observation".into());
         }
         Ok(object([
-            ("selected_hex", string(&hex(&self.selected)?)),
+            ("selected_hex", Json::Str(hex(&self.selected)?)),
             (
                 "physical_hex",
                 self.physical
                     .as_deref()
                     .map(hex)
                     .transpose()?
-                    .as_deref()
-                    .map_or(Json::Null, string),
+                    .map_or(Json::Null, Json::Str),
             ),
             (
                 "status",
@@ -251,7 +250,8 @@ impl Report {
             ),
             ("findings", Json::Array(rows)),
         ]);
-        let text = format!("{}\n", doc.render());
+        let mut text = doc.render();
+        text.push('\n');
         if text.len() > MAX_RESPONSE_BYTES {
             return Err("inspection response exceeds its output budget".into());
         }

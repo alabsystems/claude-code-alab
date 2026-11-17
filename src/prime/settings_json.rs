@@ -3,9 +3,10 @@
 
 //! Order-preserving JSON parser and two-space pretty-printer for vendor settings files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fmt::Write as _;
 
+/// Maximum nested arrays and objects; the root container counts as one.
 const DEPTH_MAX: usize = 64;
 
 /// One JSON value.
@@ -104,7 +105,7 @@ impl Json {
             Self::Null => out.push_str("null"),
             Self::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Self::Number(n) => out.push_str(n),
-            Self::Str(s) => out.push_str(&string(s)),
+            Self::Str(s) => string_into(out, s),
             Self::Array(items) => {
                 if items.is_empty() {
                     out.push_str("[]");
@@ -129,7 +130,7 @@ impl Json {
                 for (i, (k, v)) in members.iter().enumerate() {
                     out.push_str(if i == 0 { "\n" } else { ",\n" });
                     indent(out, depth + 1);
-                    out.push_str(&string(k));
+                    string_into(out, k);
                     out.push_str(": ");
                     v.render_into(out, depth + 1);
                 }
@@ -151,22 +152,33 @@ fn indent(out: &mut String, depth: usize) {
 #[must_use]
 pub fn string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    string_into(&mut out, s);
     out
+}
+
+fn string_into(out: &mut String, s: &str) {
+    out.push('"');
+    let mut start = 0;
+    for (at, byte) in s.bytes().enumerate() {
+        if !matches!(byte, b'"' | b'\\' | 0..=0x1f) {
+            continue;
+        }
+        // ASCII escape boundaries cannot split a UTF-8 scalar.
+        out.push_str(&s[start..at]);
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            control => {
+                let _ = write!(out, "\\u{control:04x}");
+            }
+        }
+        start = at + 1;
+    }
+    out.push_str(&s[start..]);
+    out.push('"');
 }
 
 struct Parser<'a> {
@@ -175,7 +187,7 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
-    fn err(&self, want: &str) -> String {
+    fn err(&self, want: impl std::fmt::Display) -> String {
         format!("byte {}: expected {want}", self.at)
     }
 
@@ -195,15 +207,15 @@ impl Parser<'_> {
             self.at += 1;
             Ok(())
         } else {
-            Err(self.err(&format!("`{}`", want as char)))
+            Err(self.err(format_args!("`{}`", want as char)))
         }
     }
 
     fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > DEPTH_MAX {
-            return Err(self.err("a document nested less than 64 deep"));
-        }
         match self.peek() {
+            Some(b'{' | b'[') if depth >= DEPTH_MAX => {
+                Err(self.err(format_args!("at most {DEPTH_MAX} nested arrays or objects")))
+            }
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
             Some(b'"') => self.string().map(Json::Str),
@@ -266,6 +278,17 @@ impl Parser<'_> {
         self.eat(b'"')?;
         let mut out = String::new();
         loop {
+            let start = self.at;
+            // The input is UTF-8; an ASCII terminator cannot split a scalar.
+            while let Some(b) = self.peek() {
+                if b == b'"' || b == b'\\' || b < 0x20 {
+                    break;
+                }
+                self.at += 1;
+            }
+            out.push_str(
+                std::str::from_utf8(&self.src[start..self.at]).map_err(|_| self.err("UTF-8"))?,
+            );
             let Some(b) = self.peek() else {
                 return Err(self.err("a closing quote"));
             };
@@ -307,17 +330,7 @@ impl Parser<'_> {
                         _ => return Err(self.err("a JSON escape")),
                     }
                 }
-                b if b < 0x20 => return Err(self.err("no control byte inside a string")),
-                _ => {
-                    let start = self.at - 1;
-                    let len = utf8_len(b);
-                    let end = (start + len).min(self.src.len());
-                    out.push_str(
-                        std::str::from_utf8(&self.src[start..end])
-                            .map_err(|_| self.err("UTF-8"))?,
-                    );
-                    self.at = end;
-                }
+                _ => return Err(self.err("no control byte inside a string")),
             }
         }
     }
@@ -375,11 +388,12 @@ impl Parser<'_> {
             self.eat(b':')?;
             self.ws();
             let value = self.value(depth + 1)?;
-            match slot.get(&key) {
-                Some(&at) => members[at].1 = value,
-                None => {
-                    slot.insert(key.clone(), members.len());
-                    members.push((key, value));
+            match slot.entry(key) {
+                Entry::Occupied(entry) => members[*entry.get()].1 = value,
+                Entry::Vacant(entry) => {
+                    let at = members.len();
+                    members.push((entry.key().clone(), value));
+                    entry.insert(at);
                 }
             }
             self.ws();
@@ -392,17 +406,6 @@ impl Parser<'_> {
                 _ => return Err(self.err("`,` or `}`")),
             }
         }
-    }
-}
-
-/// The length of the UTF-8 sequence that starts with `lead`.
-#[inline]
-const fn utf8_len(lead: u8) -> usize {
-    match lead {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        _ => 4,
     }
 }
 

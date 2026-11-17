@@ -97,7 +97,19 @@ fn main() {
     let installed =
         unsafe { libc::sigaction(libc::SIGCHLD, &raw const action, std::ptr::null_mut()) };
     assert_eq!(installed, 0);
-    let filter: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
+    // The first plain word filters by substring, as before. `--skip NAME`
+    // (libtest's spelling) leaves out the scenario of exactly that name and
+    // says so; publish/config.sh names the ones its gate leaves out, and why.
+    let mut filter: Option<String> = None;
+    let mut skips: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--skip" {
+            skips.extend(args.next());
+        } else if filter.is_none() && !arg.starts_with('-') {
+            filter = Some(arg);
+        }
+    }
     let tests: &[(&str, fn())] = &[
         ("cold_native_owner_settles_trust_before_usage_and_preserves_in_place_launch",folder_trust::cold_native_owner_settles_trust_before_usage_and_preserves_in_place_launch),
         ("cold_native_trailing_partial_is_not_a_recorded_exchange",folder_trust::cold_native_trailing_partial_is_not_a_recorded_exchange),
@@ -413,10 +425,6 @@ fn main() {
             aterm_policy_off_leaves_the_session_unclaimed,
         ),
         (
-            "aterm_without_contract_3_leaves_the_session_unclaimed",
-            aterm_without_contract_3_leaves_the_session_unclaimed,
-        ),
-        (
             "aterm_without_the_roster_row_is_never_sent_a_claim",
             aterm_without_the_roster_row_is_never_sent_a_claim,
         ),
@@ -693,6 +701,10 @@ fn main() {
     let mut ran = 0;
     for (name, test) in tests {
         if filter.as_deref().is_some_and(|f| !name.contains(f)) {
+            continue;
+        }
+        if skips.iter().any(|skip| skip.as_str() == *name) {
+            println!("test {name} ... skipped (--skip)");
             continue;
         }
         ran += 1;
@@ -1158,7 +1170,10 @@ fn version_names_the_harness_and_the_vendor() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("claude-code-alab {VERSION} (claude 9.9.1)\n")
+        format!(
+            "claude-code-alab {VERSION} (claude 9.9.1)\n{}\n",
+            alab_policy::ORIGIN_LINE
+        )
     );
     assert!(
         s.starts().is_empty(),
@@ -1166,9 +1181,12 @@ fn version_names_the_harness_and_the_vendor() {
     );
 }
 
-/// `claude-code-alab <version> (claude <vendor>)`, as `--version` prints it.
+/// The version headline and shared origin line, with the command's final newline.
 fn version_line(vendor: &str) -> String {
-    format!("claude-code-alab {VERSION} (claude {vendor})\n")
+    format!(
+        "claude-code-alab {VERSION} (claude {vendor})\n{}\n",
+        alab_policy::ORIGIN_LINE
+    )
 }
 
 /// The version is the `.vendor` record's, and only where it names its build: a
@@ -3081,6 +3099,48 @@ fn journal_at(s: &Scenario, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("the journal lacks {needle:?}{}", s.report()))
 }
 
+/// Claim diagnostics by their authority fields, allowing the shared link's
+/// additional contract and revision observations without pinning their layout.
+fn claim_notes<'a>(journal: &'a str, pid: i32, vendor: &str) -> Vec<&'a str> {
+    let holder = format!("holder=claude-code-alab@{pid}");
+    let vendor = format!("vendor={vendor}");
+    journal
+        .lines()
+        .filter(|line| {
+            let Some((_, fields)) = line.split_once(" aterm claimed ") else {
+                return false;
+            };
+            let words: Vec<_> = fields.split_ascii_whitespace().collect();
+            [
+                holder.as_str(),
+                "contract=3",
+                "scope=relaunch,upgrade",
+                vendor.as_str(),
+            ]
+            .iter()
+            .all(|word| words.contains(word))
+                && words.iter().any(|word| {
+                    word.strip_prefix("revision=")
+                        .and_then(|revision| revision.parse::<u64>().ok())
+                        .is_some_and(|revision| revision > 0)
+                })
+        })
+        .collect()
+}
+
+fn await_claim(s: &Scenario, pid: i32, vendor: &str) {
+    assert!(
+        wait_until(Duration::from_secs(60), || !claim_notes(
+            &s.journal(),
+            pid,
+            vendor
+        )
+        .is_empty()),
+        "no proven C3 claim was journalled{}",
+        s.report()
+    );
+}
+
 fn got_term(s: &Scenario) -> bool {
     s.log().iter().any(|l| l == "signal TERM")
 }
@@ -3185,9 +3245,7 @@ fn aterm_claim_precedes_the_first_vendor_start() {
     );
     let journal = s.journal();
     assert!(
-        journal.contains(&format!(
-            " aterm claimed holder=claude-code-alab@{pid} scope=relaunch,upgrade vendor=9.9.1\n"
-        )) && !journal.contains("aterm unclaimed"),
+        claim_notes(&journal, pid, "9.9.1").len() == 1 && !journal.contains("aterm unclaimed"),
         "{}",
         s.report()
     );
@@ -3285,18 +3343,6 @@ fn aterm_policy_off_leaves_the_session_unclaimed() {
             );
         },
         "policy effective=off why=headless",
-        &["harness policy"],
-    );
-}
-
-fn aterm_without_contract_3_leaves_the_session_unclaimed() {
-    runs_unclaimed(
-        "aterm-contract-2",
-        |fake| {
-            fake.set_info(INFO_ROSTERED);
-            fake.set_policy(&POLICY_ON.replace("contract=2,3", "contract=2"));
-        },
-        "policy contract=2",
         &["harness policy"],
     );
 }
@@ -4925,11 +4971,7 @@ fn aterm_a_launch_aterm_did_not_answer_in_time_is_claimed_once_it_does() {
         "never claimed once aterm answered in time{}",
         s.report()
     );
-    await_journal(
-        &s,
-        Duration::from_secs(5),
-        &format!("aterm claimed holder=claude-code-alab@{pid} scope=relaunch,upgrade vendor=9.9.1"),
-    );
+    await_claim(&s, pid, "9.9.1");
     assert_eq!(
         asked(&fake, &claim_text(pid, "9.9.1")),
         1,
@@ -5028,11 +5070,7 @@ fn aterm_a_launch_whose_subscription_lanes_are_full_is_claimed_once_one_frees() 
         "never claimed once a lane freed{}",
         s.report()
     );
-    await_journal(
-        &s,
-        Duration::from_secs(5),
-        &format!("aterm claimed holder=claude-code-alab@{pid} scope=relaunch,upgrade vendor=9.9.1"),
-    );
+    await_claim(&s, pid, "9.9.1");
     let claims = asked(&fake, &claim_text(pid, "9.9.1"));
     let releases = asked(&fake, &release_text(pid));
     assert!(claims >= 2, "{:?}", fake.verbs());
@@ -5502,6 +5540,7 @@ fn aterm_a_policy_turned_off_quietly_is_released_at_a_look_and_claimed_again() {
         "never claimed again{}",
         s.report()
     );
+    await_claim(&s, pid, "9.9.2");
     let journal = s.journal();
     assert_eq!(
         journal.matches(" aterm claimed ").count(),
@@ -5512,9 +5551,7 @@ fn aterm_a_policy_turned_off_quietly_is_released_at_a_look_and_claimed_again() {
     let order = [
         " aterm released policy effective=off why=autopilot-off\n",
         " end-for-update ",
-        &format!(
-            " aterm claimed holder=claude-code-alab@{pid} scope=relaunch,upgrade vendor=9.9.2\n"
-        ),
+        claim_notes(&journal, pid, "9.9.2")[0],
     ]
     .map(|line| journal_at(&s, line));
     assert!(order.is_sorted(), "{order:?}{}", s.report());
@@ -5578,13 +5615,12 @@ fn aterm_a_claim_made_again_after_a_look_released_it_is_journalled() {
         s.report()
     );
     assert!(
-        wait_until(Duration::from_secs(5), || s
-            .journal()
-            .matches(&format!(
-                " aterm claimed holder=claude-code-alab@{pid} scope=relaunch,upgrade \
-                 vendor=9.9.1\n"
-            ))
-            .count()
+        wait_until(Duration::from_secs(60), || claim_notes(
+            &s.journal(),
+            pid,
+            "9.9.1"
+        )
+        .len()
             == 3),
         "a claim made was not journalled{}",
         s.report()
@@ -5644,6 +5680,8 @@ fn aterm_a_launch_with_autopilot_off_is_claimed_once_it_is_on() {
         "{}",
         s.report()
     );
+    // The fake holds the claim before the harness journals it.
+    await_claim(&s, pid, "9.9.1");
     let journal = s.journal();
     assert_eq!(
         journal.matches(" aterm claimed ").count(),

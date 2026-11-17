@@ -18,6 +18,14 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// The "late" case's whole start-and-ACK deadline. It also covers the fake's
+/// fork and exec, which took longer than the old 100 ms on a loaded host
+/// ("SDK source did not become the expected native image", 2026-11-17).
+#[cfg(target_os = "macos")]
+const LATE_DEADLINE: Duration = Duration::from_secs(2);
+/// How long the "late" fake waits before each ACK: well past LATE_DEADLINE.
+const LATE_ACK: Duration = Duration::from_secs(3);
+
 fn require(ok: bool, why: &str) -> io::Result<()> {
     if ok {
         Ok(())
@@ -223,7 +231,8 @@ fn fake() -> io::Result<()> {
             return Err(error);
         }
         if case == "late" {
-            std::thread::sleep(Duration::from_millis(150));
+            // Past LATE_DEADLINE, which also has to cover the fake's own start.
+            std::thread::sleep(LATE_ACK);
         }
         if case == "flood" {
             io::stdout().write_all(&vec![b'x'; MAX_OUTPUT / 2])?;
@@ -346,7 +355,7 @@ fn controls() -> io::Result<()> {
             }
             let until = Instant::now()
                 + if case == "late" {
-                    Duration::from_millis(100)
+                    LATE_DEADLINE
                 } else {
                     WITHIN
                 };

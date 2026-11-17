@@ -24,12 +24,16 @@ pub struct Journal {
 
 impl Journal {
     /// The journal under `state_home` (or `<home>/.local/state`), for harness `pid`.
+    /// Only absolute bases are used; without one, the journal writes nothing.
     #[must_use]
     pub fn new(state_home: Option<&Path>, home: Option<&Path>, pid: u32) -> Self {
         let base = state_home
             .filter(|p| p.is_absolute())
             .map(Path::to_path_buf)
-            .or_else(|| home.map(|h| h.join(".local").join("state")));
+            .or_else(|| {
+                home.filter(|h| h.is_absolute())
+                    .map(|h| h.join(".local").join("state"))
+            });
         Self {
             path: base.map(|b| b.join(crate::profile::REPO).join("journal.log")),
             pid,
@@ -77,7 +81,7 @@ impl Journal {
         let mut line = format!("{now} pid={} ", self.pid);
         for c in event.chars() {
             if c.is_control() {
-                line.push_str(&c.escape_default().to_string());
+                line.extend(c.escape_default());
             } else {
                 line.push(c);
             }
@@ -124,6 +128,15 @@ mod tests {
             Some(Path::new("/h/.local/state/claude-code-alab/journal.log"))
         );
         assert_eq!(Journal::new(None, None, 1).path(), None);
+        for home in [Path::new("relative-home"), Path::new("")] {
+            for state in [None, Some(Path::new("relative-state"))] {
+                assert_eq!(Journal::new(state, Some(home), 1).path(), None);
+            }
+            assert_eq!(
+                Journal::new(Some(Path::new("/s")), Some(home), 1).path(),
+                Some(Path::new("/s/claude-code-alab/journal.log"))
+            );
+        }
     }
 
     #[test]

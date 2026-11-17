@@ -56,7 +56,7 @@ fn scan(args: &[OsString]) -> Option<Scan> {
             .into_iter()
             .map(|(name, at)| (name.to_string(), at - 1))
             .collect(),
-        first: parsed.first.map(str::to_owned),
+        first: parsed.first.cloned(),
     })
 }
 
@@ -90,16 +90,25 @@ pub fn informational(args: &[OsString]) -> bool {
 /// The boolean says that the launch explicitly leaves supervision out.
 #[must_use]
 pub fn switches(args: Vec<OsString>) -> (Vec<OsString>, bool) {
-    let Some(scan) = scan(&args) else {
-        return (args, false);
+    let removed = {
+        let words = std::iter::once(OsStr::new(crate::profile::COMMAND))
+            .chain(
+                args.iter()
+                    .take_while(|word| *word != "--")
+                    .map(OsString::as_os_str),
+            )
+            .collect::<Vec<_>>();
+        let Some(scan) = crate::profile::launch_words(&words, LAUNCH_FLAGS) else {
+            return (args, false);
+        };
+        scan.flags
+            .into_iter()
+            .filter_map(|(name, at)| {
+                matches!(name, "--no-harness" | "--no-alab-harness").then_some(at - 1)
+            })
+            .collect::<Vec<_>>()
     };
-    let mut removed = scan
-        .flags
-        .into_iter()
-        .filter_map(|(name, at)| {
-            matches!(name.as_str(), "--no-harness" | "--no-alab-harness").then_some(at)
-        })
-        .peekable();
+    let mut removed = removed.into_iter().peekable();
     let disabled = removed.peek().is_some();
     let args = args
         .into_iter()

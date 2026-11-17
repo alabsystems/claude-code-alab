@@ -1,14 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The copies under `vendor/` are aterm's (`docs/DECISIONS.md`, 41): aterm's
+//! The phase and agent-name projections under `vendor/` are aterm's: its
 //! `targo --unverified verify vendor-out` writes them (each file a library's
 //! build reads, byte for byte, and a `Cargo.toml` of its making), with
 //! `vendor/VENDORED`, which gives each file's FNV-1a 64 digest and carries a
-//! seal of its own. This check holds every file under `vendor/` to that list
+//! seal of its own. This check holds every projection file to that list
 //! and the list to its seal, so a hand edit of a copy, or of a copy and its
 //! line in the list together, fails here without aterm. A copy is changed by
-//! running vendor-out again in aterm, never by editing it here.
+//! running vendor-out again in aterm, never by editing it here. The canonical
+//! `alab-harness/` tree and its pin are separately checked before their exact
+//! paths are reserved. Every other unlisted vendor file remains an error.
 //!
 //! Std only, and it links none of the copies. It reads the list as aterm's
 //! `aterm_seal` (`crates/aterm-seal`) writes it: a seal line in the first 16 lines carries
@@ -19,6 +21,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[path = "support/pin.rs"]
+mod pin;
+use pin::checkout;
 
 /// The list of digests, in `vendor/`.
 const LIST: &str = "VENDORED";
@@ -114,6 +120,11 @@ fn check(vendor: &Path) -> Checked {
         listed: Vec::new(),
         problems: Vec::new(),
     };
+    let root = vendor.parent().expect("vendor has a checkout parent");
+    if let Err(why) = pin::hold(root) {
+        checked.problems.push(why);
+        return checked;
+    }
     let problems = &mut checked.problems;
     let text = match fs::symlink_metadata(vendor.join(LIST)) {
         Ok(meta) if meta.is_file() => fs::read(vendor.join(LIST))
@@ -157,6 +168,10 @@ fn check(vendor: &Path) -> Checked {
                     .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
                 && inside(path)
                 && *path != LIST
+                && matches!(
+                    path.split('/').next(),
+                    Some("aterm-phase" | "aterm-agent-names")
+                )
         });
         let Some((digest, path)) = parsed else {
             problems.push(format!(
@@ -200,28 +215,28 @@ fn check(vendor: &Path) -> Checked {
             },
         }
     }
+    let canonical_prefix = format!("{}/", pin::DIR);
     for path in found.keys() {
-        if path != LIST && !digests.contains_key(path) {
+        if path != LIST
+            && path != pin::PIN
+            && !path.starts_with(&canonical_prefix)
+            && !digests.contains_key(path)
+        {
             problems.push(format!("vendor/{path}: not in vendor/{LIST}"));
         }
     }
     checked
 }
 
-/// This checkout, read when the test runs: a test built in another checkout
-/// and reused from a shared build cache would otherwise check that one's copy.
-fn checkout() -> PathBuf {
-    std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs")
-}
-
 /// A fresh scratch folder of this test's own.
 fn scratch(name: &str) -> PathBuf {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        ".ubd/vendored.noindex/{name}-{}",
-        std::process::id()
-    ));
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            ".ubd/vendored.noindex/{name}-{}",
+            std::process::id()
+        ));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("scratch folder");
     root
@@ -248,11 +263,12 @@ fn every_copy_matches_the_sealed_list() {
     let checked = check(&checkout().join("vendor"));
     assert!(
         checked.problems.is_empty(),
-        "vendor/ is not as aterm's vendor-out wrote it. Run `targo --unverified verify \
-         vendor-out --into <this checkout>` in aterm; never edit a copy here:\n{}",
+        "vendor ownership differs: canonical copies change through alab-harness's tools/pin; \
+         phase/name projections through aterm's `targo --unverified verify vendor-out \
+         --into <this checkout>`. Never edit either copy here:\n{}",
         checked.problems.join("\n")
     );
-    for package in ["alab-policy", "aterm-phase", "aterm-agent-names"] {
+    for package in ["aterm-phase", "aterm-agent-names"] {
         let manifest = format!("{package}/Cargo.toml");
         assert!(
             checked.listed.contains(&manifest),
@@ -320,4 +336,127 @@ fn a_changed_byte_is_named() {
     );
 
     fs::remove_dir_all(&root).expect("remove the scratch folder");
+}
+
+#[test]
+fn canonical_drift_fails_before_projection_paths_are_reserved() {
+    let root = scratch("canonical-drift");
+    let vendor = root.join("vendor");
+    copy_tree(&checkout().join("vendor"), &vendor);
+    fs::write(root.join(".gitignore"), b"vendor/alab-harness/ignored\n")
+        .expect("fixture ignore rule");
+    pin::git(&root, &["init", "--quiet", "--object-format=sha1"]).expect("fixture repository");
+    // This fixture owns no detached Git housekeeping when its directory is removed.
+    pin::git(&root, &["config", "gc.auto", "0"]).expect("disable fixture auto gc");
+    pin::git(&root, &["config", "maintenance.auto", "false"])
+        .expect("disable fixture auto maintenance");
+    pin::git(
+        &root,
+        &[
+            "-c",
+            "core.autocrlf=false",
+            "add",
+            "-f",
+            "vendor",
+            ".gitignore",
+        ],
+    )
+    .expect("fixture index");
+    let commit = [
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    ];
+    pin::git(&root, &commit).expect("fixture commit");
+    assert!(check(&vendor).problems.is_empty());
+    let file = vendor.join(pin::DIR).join("README.md");
+    let original = fs::read(&file).expect("canonical input");
+    let mut bytes = original.clone();
+    bytes.extend_from_slice(b"\n");
+    fs::write(&file, &bytes).expect("change canonical data");
+    fs::write(vendor.join("aterm-phase/stray.rs"), b"// stray\n").expect("projection stray");
+    let changed = || {
+        let problems = check(&vendor).problems;
+        assert_eq!(
+            problems.len(),
+            1,
+            "pin failure precedes projection checks: {problems:?}"
+        );
+        assert!(problems[0].starts_with("canonical copy or pin changed:"));
+    };
+    changed();
+    pin::git(&root, &["add", "vendor/alab-harness/README.md"]).expect("stage canonical drift");
+    changed();
+    fs::write(&file, &original).expect("restore canonical data");
+    pin::git(&root, &["add", "vendor/alab-harness/README.md"]).expect("restore fixture index");
+    fs::remove_file(vendor.join("aterm-phase/stray.rs")).expect("remove projection stray");
+    assert!(check(&vendor).problems.is_empty());
+
+    let ignored = vendor.join(pin::DIR).join("ignored");
+    fs::write(&ignored, b"not part of the pin\n").expect("ignored canonical stray");
+    changed();
+    fs::remove_file(ignored).expect("remove ignored stray");
+    assert!(check(&vendor).problems.is_empty());
+
+    fs::write(&file, bytes).expect("change canonical data again");
+    pin::git(&root, &["add", "vendor/alab-harness/README.md"]).expect("stage committed drift");
+    pin::git(&root, &commit).expect("commit canonical drift");
+    let problems = check(&vendor).problems;
+    assert_eq!(problems.len(), 1, "committed drift: {problems:?}");
+    assert!(problems[0].starts_with("vendor/alab-harness: committed entry"));
+    fs::remove_dir_all(root).expect("fixture cleanup");
+}
+
+#[test]
+fn malformed_pins_and_projection_overlap_do_not_create_a_vendor_exception() {
+    let root = scratch("owner-boundaries");
+    let vendor = root.join("vendor");
+    copy_tree(&checkout().join("vendor"), &vendor);
+    let pin_file = vendor.join(pin::PIN);
+    let original_pin = fs::read(&pin_file).expect("pin input");
+    fs::write(&pin_file, "tag=v0.9.1\ntree=invalid\n").expect("invalid pin");
+    let problems = check(&vendor).problems;
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].starts_with("vendor/alab-harness.pin:"));
+    fs::write(&pin_file, original_pin).expect("restore pin");
+
+    let list_file = vendor.join(LIST);
+    let original_list = fs::read_to_string(&list_file).expect("projection list");
+    let at = original_list
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    for canonical_path in ["alab-harness/Cargo.toml", pin::PIN] {
+        let digest = fnv1a_64(&fs::read(vendor.join(canonical_path)).unwrap(), 0..0);
+        let mut overlap = original_list.clone();
+        overlap.insert_str(at, &format!("{digest:016x} {canonical_path}\n"));
+        let digits = seal_digits(&overlap).unwrap();
+        let seal = format!("{:016x}", fnv1a_64(overlap.as_bytes(), digits.clone()));
+        overlap.replace_range(digits, &seal);
+        fs::write(&list_file, overlap).expect("sealed overlapping owner");
+        let checked = check(&vendor);
+        assert_eq!(
+            checked.problems.len(),
+            1,
+            "a valid seal cannot claim {canonical_path}: {:?}",
+            checked.problems
+        );
+        assert!(!checked.listed.iter().any(|listed| listed == canonical_path));
+    }
+
+    fs::write(&list_file, original_list).expect("restore list");
+    fs::write(vendor.join("alab-harness-extra"), b"stray\n").expect("similar name");
+    assert_eq!(
+        check(&vendor).problems,
+        ["vendor/alab-harness-extra: not in vendor/VENDORED"]
+    );
+    fs::remove_dir_all(root).expect("fixture cleanup");
 }

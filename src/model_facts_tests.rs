@@ -109,6 +109,26 @@ fn model_ids_read_as_the_vendor_spells_them() {
     assert_eq!(model_display("claude-haiku-4-5-20251001"), "Haiku 4.5");
     assert_eq!(model_display("claude-opus-5-5[1m]"), "Opus 5.5");
     assert_eq!(model_display("gpt-5-codex"), "gpt-5-codex");
+    for id in [
+        "claude-",
+        "claude--5",
+        "claude-opus-",
+        "claude-opus--5",
+        "claude-opus-5-",
+        "claude-opus-5--5",
+        "claude-opus-[1m]",
+        "claude-[1m]",
+    ] {
+        assert_eq!(model_display(id), id);
+        assert_eq!(model_name(id).as_deref(), Some(id));
+        for row in [
+            result_at("2026-11-10T00:11:47Z", &format!("Set model to `{id}`")),
+            answer_at(id, "2026-11-10T00:11:47Z", None),
+            request(MAIN_THREAD_QUERY, id, "high"),
+        ] {
+            assert_eq!(tail_facts(&body(&[&row]), None).model, is(id));
+        }
+    }
 }
 
 #[test]
@@ -121,12 +141,16 @@ fn a_result_row_names_its_kind_its_model_and_its_effort() {
         Some(ModelResult {
             kind: ModelResultKind::Set,
             display: Some("Sonnet 5".into()),
-            effort: Some("high".into()),
+            effort: Some("high"),
         })
     );
     assert_eq!(
         strip_sgr(FAST_ON_COLOURED),
         "\u{21AF} Fast mode ON \u{00B7} model set to `Opus 5.5` \u{00B7} $30/$150 per Mtok"
+    );
+    assert_eq!(
+        strip_sgr("a\u{1b}?b \u{1b}[12x c\u{1b}[m reset \u{1b}[1mbold\u{1b}[22m \u{1b}["),
+        "a\u{1b}?b \u{1b}[12x c reset bold \u{1b}["
     );
     assert_eq!(
         model_result_of(&row(FAST_ON_COLOURED)),
@@ -140,19 +164,46 @@ fn a_result_row_names_its_kind_its_model_and_its_effort() {
         model_result_of("why did it say Set model to `claude-fable-5-1`?"),
         None
     );
+    for level in [
+        "unknown-effort-that-is-longer-than-sixteen".to_owned(),
+        "漢字".repeat(12),
+    ] {
+        let text = format!("Set model to `Opus 5.5` with `{level}` effort");
+        let content = row(&text);
+        let parsed = model_result_of(&content).expect("a model result");
+        assert_eq!(parsed.effort, Some(level.as_str()));
+        let transcript_row = result_at("2026-11-10T00:11:47Z", &text);
+        let facts = tail_facts(&body(&[&transcript_row]), None);
+        assert_eq!(facts.model, is("Opus 5.5"));
+        assert_eq!(facts.effort, Said::Unread);
+        assert_eq!(facts.key, Said::Unsaid);
+    }
 }
 
 #[test]
 fn stamps_read_to_the_millisecond() {
     assert_eq!(ms("1970-01-01T00:00:00Z"), Some(0));
     assert_eq!(ms("1970-01-01T00:00:01.5Z"), Some(1_500));
+    assert_eq!(ms("1970-01-01T00:00:59.999Z"), Some(59_999));
+    assert_eq!(ms("1970-01-01T00:01:00Z"), Some(60_000));
     // `date -j -u -f %Y-%m-%dT%H:%M:%S 2026-11-13T04:18:02 +%s` is 1794543482.
     assert_eq!(ms("2026-11-13T04:18:02.796Z"), Some(1_794_543_482_796));
     assert_eq!(
         ms("2026-11-13T04:18:02.796123456Z"),
         Some(1_794_543_482_796)
     );
+    assert_eq!(ms("2000-02-29T00:00:00Z"), Some(951_782_400_000));
     assert_eq!(ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+    for (last, next) in [
+        ("2000-02-29T00:00:00Z", "2000-03-01T00:00:00Z"),
+        ("2100-02-28T00:00:00Z", "2100-03-01T00:00:00Z"),
+        ("2400-02-29T00:00:00Z", "2400-03-01T00:00:00Z"),
+        ("2026-04-30T00:00:00Z", "2026-05-01T00:00:00Z"),
+        ("2026-01-31T00:00:00Z", "2026-02-01T00:00:00Z"),
+    ] {
+        let at = ms(last).expect("valid Gregorian month end");
+        assert_eq!(ms(next), Some(at + 86_400_000), "{last} to {next}");
+    }
     for bad in [
         "",
         "2026-11-13T04:18:02",
@@ -160,13 +211,48 @@ fn stamps_read_to_the_millisecond() {
         "2026-11-13T04:18:02.1234567890Z",
         "2026-11-13 04:18:02Z",
         "2026-13-13T04:18:02Z",
+        "2026-00-13T04:18:02Z",
+        "2026-01-00T04:18:02Z",
+        "2026-01-32T04:18:02Z",
+        "2026-02-29T00:00:00Z",
+        "2024-02-30T00:00:00Z",
+        "2000-02-30T00:00:00Z",
+        "2100-02-29T00:00:00Z",
+        "2026-04-31T00:00:00Z",
+        "2026-06-31T00:00:00Z",
+        "2026-09-31T00:00:00Z",
+        "2026-11-31T00:00:00Z",
         "2026-11-13T24:18:02Z",
+        "2026-11-13T04:60:02Z",
+        "1970-01-01T00:00:60Z",
+        "1970-01-01T00:00:60.500Z",
+        "1970-01-01T00:00:61Z",
+        // Leap-second labels, including RFC 3339's example, are unsupported.
+        "1990-12-31T23:59:60Z",
         "2026-11-13T04:18:02+00:00",
         "1969-12-31T23:59:59Z",
         "2026-11-1xT04:18:02Z",
     ] {
         assert_eq!(ms(bad), None, "{bad:?}");
     }
+}
+
+#[test]
+fn an_unsupported_second_does_not_roll_forward_across_the_floor() {
+    let read = |stamp| {
+        let row = answer_at("claude-opus-5-5", stamp, Some("high"));
+        tail_facts(&body(&[&row]), Some(60_000))
+    };
+    for stamp in [
+        "1970-01-01T00:00:59.999Z",
+        "1970-01-01T00:00:60Z",
+        "1970-01-01T00:00:60.001Z",
+    ] {
+        assert_eq!(read(stamp), ModelFacts::default(), "{stamp}");
+    }
+    let at_floor = read("1970-01-01T00:01:00Z");
+    assert_eq!(at_floor.model, is("Opus 5.5"));
+    assert_eq!(at_floor.effort, is("high"));
 }
 
 #[test]
@@ -230,6 +316,118 @@ fn a_main_thread_request_shows_a_switch_before_its_reply() {
         r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to low</local-command-stdout>"}}"#
     );
     assert_eq!(tail_facts(&set, None).effort, is("low"));
+}
+
+#[test]
+fn request_spacing_never_restores_an_older_model_after_a_newer_effort_result() {
+    let older = answer_at("claude-fable-5-2", "2026-11-10T00:11:47Z", Some("medium"));
+    let sent = request("repl_main_thread", "claude-opus-5-5", "high");
+    let result = result_at("2026-11-10T00:11:48Z", "Set effort level to low");
+    let check = |row: &str, expected: &str| {
+        let rows = body(&[&older, row, &result]);
+        for floor in [None, ms("2026-11-10T00:11:46Z")] {
+            let facts = tail_facts(&rows, floor);
+            assert_eq!(facts.model, is(expected), "row={row}, floor={floor:?}");
+            assert_eq!(facts.effort, is("low"), "row={row}, floor={floor:?}");
+        }
+    };
+    for field in [
+        r#""type":"api-request""#,
+        r#""type": "api-request""#,
+        "\"type\" \t:\t \"api-request\"",
+    ] {
+        let row = sent.replacen(r#""type":"api-request""#, field, 1);
+        check(&row, "Opus 5.5");
+    }
+
+    for row in [
+        request("compact", "claude-opus-5-5", "high"),
+        sent.replacen('{', r#"{"isSidechain":true,"#, 1),
+        sent.replacen(
+            r#""type":"api-request""#,
+            r#""type":"unknown","note":"api-request""#,
+            1,
+        ),
+        sent.strip_suffix('}').unwrap().to_string(),
+        sent.replacen('{', r#"{"type":"api-request","#, 1),
+    ] {
+        check(&row, "Fable 5.2");
+    }
+}
+
+#[test]
+fn json_escapes_do_not_change_which_rows_state_facts() {
+    let at = "2026-11-10T00:11:47Z";
+    let older = answer_at("claude-fable-5-2", "2026-11-10T00:11:45Z", Some("low"));
+    for (row, plain, escaped) in [
+        (
+            answer_at("claude-opus-5-5", at, None),
+            "assistant",
+            r"assistan\u0074",
+        ),
+        (
+            request(MAIN_THREAD_QUERY, "claude-opus-5-5", "high"),
+            "api-request",
+            r"api-reques\u0074",
+        ),
+        (
+            format!(r#"{{"type":"user","timestamp":"{at}","effort":"max"}}"#),
+            "effort",
+            r"eff\u006frt",
+        ),
+        (
+            key_row("enter", at),
+            "ultra_effort_enter",
+            r"\u0075ltra_effort_enter",
+        ),
+        (
+            command_at("model", at),
+            "<command-name>",
+            r"\u003ccommand-name>",
+        ),
+        (command_at("effort", at), "/effort", r"\/effort"),
+        (
+            result_at(at, "Set model to `Opus 5.5` with `high` effort"),
+            "<local-command-stdout>",
+            r"\u003clocal-command-stdout>",
+        ),
+        (
+            result_at(at, "Set effort level to high"),
+            "<local-command-stdout>",
+            r"\u003clocal-command-stdout>",
+        ),
+        (
+            request("compact", "claude-opus-5-5", "high"),
+            "api-request",
+            r"api-reques\u0074",
+        ),
+        (
+            key_row("enter", at).replacen(r#""isSidechain":false"#, r#""isSidechain":true"#, 1),
+            "ultra_effort_enter",
+            r"\u0075ltra_effort_enter",
+        ),
+        (
+            result_at(at, "Set effort level to high").replacen(
+                r#""type":"user""#,
+                r#""type":"unknown""#,
+                1,
+            ),
+            "<local-command-stdout>",
+            r"\u003clocal-command-stdout>",
+        ),
+    ] {
+        let encoded = row.replacen(plain, escaped, 1);
+        assert_ne!(encoded, row);
+        assert!(json::parse(&row).is_some(), "row={row}");
+        assert_eq!(json::parse(&encoded), json::parse(&row));
+        for floor in [None, ms("2026-11-10T00:11:46Z")] {
+            assert_eq!(
+                tail_facts(&body(&[&older, &encoded]), floor),
+                tail_facts(&body(&[&older, &row]), floor),
+                "row={encoded}, floor={floor:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -324,6 +522,17 @@ fn the_tail_takes_the_newest_main_thread_model_and_effort() {
         r#"{"type":"assistant","effort":"max","message":{"model":"claude-opus-5-5"}}"#
     );
     assert_eq!(tail_facts(&answered, None).effort, is("max"));
+    for level in ["Future_Level_9", "HIGH"] {
+        for row in [
+            answer_at("claude-opus-5-5", "2026-11-10T00:11:47Z", Some(level)),
+            request(MAIN_THREAD_QUERY, "claude-opus-5-5", level),
+        ] {
+            let facts = tail_facts(&format!("{answered}{row}\n"), None);
+            assert_eq!(facts.model, is("Opus 5.5"));
+            assert_eq!(facts.effort, is(level));
+            assert_eq!(facts.key, Said::Unsaid);
+        }
+    }
     assert_eq!(
         tail_facts("", None),
         ModelFacts::default(),
@@ -450,6 +659,164 @@ fn a_model_result_display_is_the_vendors_name() {
 }
 
 #[test]
+fn newer_effort_keeps_older_key_facts_independent() {
+    let floor = stamp_ms("2026-11-10T00:11:30Z").unwrap();
+    let before = answer_at("claude-opus-5-5", "2026-11-10T00:11:40Z", Some("medium"));
+    let later = answer_at("claude-opus-5-5", "2026-11-10T00:12:00Z", Some("high"));
+    let effort_command = command_at("effort", "2026-11-10T00:12:00Z");
+    let plain_level = result_at("2026-11-10T00:12:00Z", "Set effort level to high");
+    let key_off = format!(
+        r#"{{"type":"attachment","timestamp":"2026-11-10T00:12:05Z","attachment":{{"type":"{KEY_EXIT}"}}}}"#
+    );
+    let raw_level = |kind: &str, at: &str| {
+        format!(r#"{{"type":"{kind}","timestamp":"{at}","effort":"{TOP_EFFORT_KEY}"}}"#)
+    };
+    let read = |rows: &[String], expected_key: Said<bool>| {
+        let text = rows.join("\n") + "\n";
+        for floor in [None, Some(floor)] {
+            let facts = tail_facts(&text, floor);
+            assert_eq!(facts.model, is("Opus 5.5"), "floor={floor:?}");
+            assert_eq!(facts.effort, is("high"), "floor={floor:?}");
+            assert_eq!(facts.key, expected_key, "floor={floor:?}");
+        }
+    };
+    let older_statements = [
+        vec![
+            command_at("model", "2026-11-10T00:11:47Z"),
+            result_at(
+                "2026-11-10T00:11:47Z",
+                &format!(
+                    "Set model to `Opus 5.5` for this session only with `{TOP_EFFORT_KEY}` effort"
+                ),
+            ),
+        ],
+        vec![answer_at(
+            "claude-opus-5-5",
+            "2026-11-10T00:11:47Z",
+            Some(TOP_EFFORT_KEY),
+        )],
+        vec![raw_level("user", "2026-11-10T00:11:47Z")],
+        vec![raw_level("system", "2026-11-10T00:11:47Z")],
+        vec![request(
+            MAIN_THREAD_QUERY,
+            "claude-opus-5-5",
+            TOP_EFFORT_KEY,
+        )],
+    ];
+    for older in older_statements {
+        for newer in [
+            vec![effort_command.clone(), plain_level.clone()],
+            vec![later.clone()],
+        ] {
+            let mut rows = vec![before.clone()];
+            rows.extend_from_slice(&older);
+            rows.extend(newer);
+            read(&rows, Said::Is(true));
+            rows.push(key_off.clone());
+            read(&rows, Said::Is(false));
+        }
+        let mut rows = vec![before.clone()];
+        rows.extend(older);
+        rows.extend([effort_command.clone(), later.clone()]);
+        read(&rows, Said::Unread);
+    }
+    let raw_answer = answer_at(
+        "claude-opus-5-5",
+        "2026-11-10T00:11:47Z",
+        Some(TOP_EFFORT_KEY),
+    );
+    for ignored in [
+        raw_level("progress", "2026-11-10T00:11:47Z"),
+        raw_level("queue-operation", "2026-11-10T00:11:47Z"),
+        request("compact", "claude-opus-5-5", TOP_EFFORT_KEY),
+        raw_answer.replacen('{', r#"{"isSidechain":true,"#, 1),
+        raw_answer.strip_suffix('}').unwrap().to_owned(),
+    ] {
+        read(&[before.clone(), ignored, later.clone()], Said::Unsaid);
+    }
+    let pre_floor = raw_level("user", "2026-11-10T00:11:00Z");
+    let text = [pre_floor, before, later].join("\n") + "\n";
+    let facts = tail_facts(&text, Some(floor));
+    assert_eq!(facts.model, is("Opus 5.5"));
+    assert_eq!(facts.effort, is("high"));
+    assert_eq!(facts.key, Said::Unsaid);
+}
+
+#[test]
+fn quoted_model_names_are_validated_in_full() {
+    let read = |quoted: &str, suffix: &str| {
+        let row = result_at(
+            "2026-11-10T00:11:47Z",
+            &format!("Set model to {quoted}{suffix}"),
+        );
+        tail_facts(&body(&[&row]), None)
+    };
+    for invalid in ['!', '\u{7}'] {
+        let display = format!("Opus 5.5{}{invalid}", " ".repeat(72));
+        assert_eq!(model_name(&display), None);
+        for quoted in [
+            format!("`{display}`"),
+            format!("\u{1b}[1m{display}\u{1b}[22m"),
+        ] {
+            let facts = read(&quoted, "");
+            assert_eq!(facts.model, Said::Unread);
+            assert_eq!(facts.effort, Said::Unread);
+            let facts = read(&quoted, " with `high` effort");
+            assert_eq!(facts.model, Said::Unread);
+            assert_eq!(facts.effort, is("high"));
+        }
+    }
+    for display in [
+        format!("Opus 5.5{}", " ".repeat(100)),
+        format!("Opus 5.5{}", " (default)".repeat(10)),
+    ] {
+        for quoted in [
+            format!("`{display}`"),
+            format!("\u{1b}[1m{display}\u{1b}[22m"),
+        ] {
+            assert_eq!(read(&quoted, "").model, is("Opus 5.5"));
+        }
+    }
+}
+
+#[test]
+fn fast_model_results_keep_their_quotes() {
+    for text in [
+        "\u{21AF} Fast mode ON \u{b7} model set to \u{1b}[1mOpus 5.5\u{1b}[22m \u{b7} $30/$150 per Mtok",
+        "\u{1b}[38;2;255;106;0m\u{1F600}\u{1b}[39m Fast \u{1b}[1mmode\u{1b}[22m ON \u{b7} model set to \u{1b}[38;5;1m\u{1b}[1mOpus 5.5\u{1b}[22m\u{1b}[39m",
+        "\u{21AF} Fast mode ON \u{b7} model set to \u{1b}[1m`Opus 5.5`\u{1b}[22m",
+        FAST_ON_COLOURED,
+    ] {
+        let row = result_at("2026-11-10T00:11:47Z", text);
+        assert_eq!(
+            tail_facts(&body(&[&row]), None).model,
+            is("Opus 5.5"),
+            "{text:?}"
+        );
+    }
+    for text in [
+        "\u{21AF} Fast mode ON \u{b7} model set to Opus 5.5",
+        "\u{21AF} Fast mode ON \u{b7} model set to \u{1b}[1mOpus 5.5",
+    ] {
+        let row = result_at("2026-11-10T00:11:47Z", text);
+        assert_eq!(
+            tail_facts(&body(&[&row]), None).model,
+            Said::Unread,
+            "{text:?}"
+        );
+    }
+    let invalid = format!("Opus 5.5{}!", " ".repeat(72));
+    for quoted in [
+        format!("`{invalid}`"),
+        format!("\u{1b}[1m{invalid}\u{1b}[22m"),
+    ] {
+        let text = format!("\u{21AF} Fast mode ON \u{b7} model set to {quoted}");
+        let row = result_at("2026-11-10T00:11:47Z", &text);
+        assert_eq!(tail_facts(&body(&[&row]), None).model, Said::Unread);
+    }
+}
+
+#[test]
 fn a_kept_model_leaves_the_facts_as_they_were() {
     const ANSWER: &str = r#"{"parentUuid":"00000000-0000-4000-8000-000000000030","isSidechain":false,"type":"assistant","effort":"xhigh","message":{"model":"claude-fable-5-1","role":"assistant","content":[{"type":"text","text":"Done."}]},"uuid":"00000000-0000-4000-8000-000000000031","timestamp":"2026-09-22T17:05:50.000Z","userType":"external","entrypoint":"cli","cwd":"/h/u/ty","sessionId":"00000000-0000-4000-8000-000000000004","version":"2.1.278"}"#;
     const KEPT_COMMAND: &str = r#"{"parentUuid":"00000000-0000-4000-8000-000000000031","isSidechain":false,"type":"system","subtype":"local_command","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>","level":"info","timestamp":"2026-09-22T17:06:02.248Z","uuid":"00000000-0000-4000-8000-000000000032","isMeta":false,"userType":"external","entrypoint":"cli","cwd":"/h/u/ty","sessionId":"00000000-0000-4000-8000-000000000004","version":"2.1.278"}"#;
@@ -540,6 +907,36 @@ fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
 }
 
 #[test]
+fn an_effort_clause_requires_the_complete_keyword() {
+    let at = "2026-11-10T00:11:47Z";
+    let older = answer_at("claude-opus-5-5", "2026-11-10T00:11:45Z", Some("low"));
+    let key = key_row("exit", "2026-11-10T00:11:46Z");
+    for keyword in [
+        "effortless",
+        "effort_future",
+        "effort-new",
+        "effort.extra",
+        "efforté",
+        "effort<future>",
+    ] {
+        for (model, expected_effort) in [("Opus 5.5", is("low")), ("Haiku 4.5", Said::Unread)] {
+            for level in ["high", TOP_EFFORT_KEY] {
+                for lead in ["Set model to", "Kept model as"] {
+                    let result =
+                        result_at(at, &format!("{lead} `{model}` with `{level}` {keyword}"));
+                    for floor in [None, ms("2026-11-10T00:11:44Z")] {
+                        let facts = tail_facts(&body(&[&older, &key, &result]), floor);
+                        assert_eq!(facts.model, is(model), "{result}, floor={floor:?}");
+                        assert_eq!(facts.effort, expected_effort, "{result}, floor={floor:?}");
+                        assert_eq!(facts.key, Said::Is(false), "{result}, floor={floor:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_command_pairs_only_with_the_result_directly_under_it() {
     let start = ms("2026-09-28T15:00:00Z");
     let opus = answer_at("claude-opus-5-5", "2026-09-28T15:01:00.000Z", Some("xhigh"));
@@ -577,6 +974,29 @@ fn a_command_pairs_only_with_the_result_directly_under_it() {
         facts(&[&fable, &fast_cmd, &off]),
         (is("Fable 5.1"), is("high"))
     );
+
+    let kept = result_at("2026-09-28T15:02:00.000Z", "Kept model as `Opus 5.5`");
+    for floor in [None, start] {
+        let adjacent = tail_facts(&body(&[&opus, &model_cmd, &kept]), floor);
+        assert_eq!(adjacent.model, is("Opus 5.5"));
+        assert_eq!(adjacent.effort, is("xhigh"));
+        for gap in [
+            r#"{"type":"system","subtype":"turn_duration","timestamp":"2026-09-28T15:02:00.000Z","durationMs":5}"#,
+            r#"{"type":"progress","timestamp":"2026-09-28T15:02:00.000Z","effort":"low"}"#,
+            r#"{"type":"user","isSidechain":true,"timestamp":"2026-09-28T15:02:00.000Z","message":{"content":"ignored"}}"#,
+            "{}",
+            r#"{"type":"assistant""#,
+            "",
+        ] {
+            let separated = tail_facts(&body(&[&opus, &model_cmd, gap, &kept]), floor);
+            assert_eq!(
+                separated.model,
+                is("Opus 5.5"),
+                "gap={gap}, floor={floor:?}"
+            );
+            assert_eq!(separated.effort, Said::Unread, "gap={gap}, floor={floor:?}");
+        }
+    }
 }
 
 /// aterm's floor is a second; this one is the record's `startedAt` to the
@@ -588,7 +1008,7 @@ fn the_floor_is_the_processs_start_and_the_first_row_before_it_ends_the_scan() {
     let same_second = answer_at("claude-fable-5-1", "2026-09-28T15:00:00.100Z", None);
     let above = answer_at("claude-sonnet-5", "2026-09-28T15:10:00.000Z", Some("low"));
     let read = |rows: &[&str]| {
-        let (facts, floored) = scan(body(rows).as_bytes(), floor, false, true);
+        let (facts, floored) = scan(body(rows).as_bytes(), floor, false);
         (facts.model, facts.effort, floored)
     };
     assert_eq!(read(&[&after]), (is("Opus 5.5"), is("high"), false));
@@ -596,6 +1016,15 @@ fn the_floor_is_the_processs_start_and_the_first_row_before_it_ends_the_scan() {
         read(&[&above, &same_second]),
         (Said::Unsaid, Said::Unsaid, true)
     );
+    let neutral = r#"{"type":"queue-operation","timest\u0061mp":"2026-09-28T14:00:00Z"}"#;
+    let chosen = result_at(
+        "2026-09-28T15:02:00Z",
+        "Set model to `Opus 5.5` with `high` effort",
+    );
+    let key = key_row("enter", "2026-09-28T15:03:00Z");
+    let (facts, floored) = scan(body(&[neutral, &chosen, &key]).as_bytes(), floor, false);
+    assert!(facts.settled());
+    assert!(floored, "an escaped timestamp still establishes the floor");
 }
 
 #[test]
@@ -659,6 +1088,96 @@ fn effort_after_answer(text: Option<&str>) -> ModelFacts {
 }
 
 #[test]
+fn unknown_effort_result_words_never_become_a_known_prefix() {
+    let key = capital_key();
+    for word in [
+        "high_future".to_owned(),
+        "high-new".to_owned(),
+        "max.future".to_owned(),
+        "highé".to_owned(),
+        "high<future>".to_owned(),
+        format!("{TOP_EFFORT_KEY}_future"),
+        format!("{TOP_EFFORT_KEY}é"),
+    ] {
+        for (result, expected_key) in [
+            (
+                format!("Set effort level to {word}: Unknown level · {key} off"),
+                Said::Is(false),
+            ),
+            (
+                format!("Current effort level: {word} (Unknown level)"),
+                Said::Unsaid,
+            ),
+            (
+                format!("{key} on (this session only): Dynamic workflows. Effort stays {word}."),
+                Said::Is(true),
+            ),
+            (format!("{key} off. Effort stays {word}."), Said::Is(false)),
+        ] {
+            let facts = effort_after_answer(Some(&result));
+            assert_eq!(facts.model, is("Opus 5.5"), "{result}");
+            assert_eq!(facts.effort, Said::Unread, "{result}");
+            assert_eq!(facts.key, expected_key, "{result}");
+        }
+    }
+}
+
+#[test]
+fn fixed_effort_results_require_complete_words() {
+    let key = capital_key();
+    for suffix in ["_future", "-new", ".future", "é", "<future>", ".."] {
+        for result in [
+            format!("Effort level set to auto{suffix}"),
+            format!("{key} needs dynamic workflows enabled{suffix}"),
+        ] {
+            let facts = effort_after_answer(Some(&result));
+            assert_eq!(facts.model, is("Opus 5.5"), "{result}");
+            assert_eq!(
+                (facts.effort, facts.key),
+                (Said::Unread, Said::Unread),
+                "unknown result: {result}"
+            );
+        }
+    }
+    for suffix in ["", ".", ": Details", " (details)", "\tmore details"] {
+        let auto = format!("Effort level set to auto{suffix}");
+        let facts = effort_after_answer(Some(&auto));
+        assert_eq!(
+            (facts.effort, facts.key),
+            (Said::Unread, Said::Unsaid),
+            "known auto result: {auto}"
+        );
+        let refusal = format!("{key} needs dynamic workflows enabled{suffix}");
+        let facts = effort_after_answer(Some(&refusal));
+        assert_eq!(
+            (facts.effort, facts.key),
+            (is("high"), Said::Unsaid),
+            "known refusal: {refusal}"
+        );
+    }
+
+    // Unknown answers cannot preserve the key from before this command.
+    let answer = answer_at("claude-opus-5-5", "2026-10-19T10:00:10.000Z", Some("high"));
+    let on = key_row("enter", "2026-10-19T10:00:15.000Z");
+    let command = command_at("effort", "2026-10-19T10:00:20.000Z");
+    for text in [
+        "Effort level set to auto_future".to_owned(),
+        format!("{key} needs dynamic workflows enabledness"),
+    ] {
+        let result = result_at("2026-10-19T10:00:20.000Z", &text);
+        let facts = tail_facts(
+            &body(&[&answer, &on, &command, &result]),
+            ms("2026-10-19T10:00:00Z"),
+        );
+        assert_eq!(
+            (facts.effort, facts.key),
+            (Said::Unread, Said::Unread),
+            "unknown result after an older key: {text}"
+        );
+    }
+}
+
+#[test]
 fn a_top_effort_off_result_keeps_the_effort_and_names_the_key() {
     let key = capital_key();
     let facts = effort_after_answer(Some(&format!("{key} off. Effort stays xhigh.")));
@@ -711,6 +1230,10 @@ fn a_level_result_suffix_names_the_key() {
         "Fast mode off".to_owned(),
         format!("{key} online"),
         format!("{key}s off"),
+        format!("{key} on_future"),
+        format!("{key} off-new"),
+        format!("{key} off.future"),
+        format!("{key} oné"),
     ] {
         let said = effort_after_answer(Some(&format!(
             "Set effort level to low (this session only): Quick \u{b7} {tail}"
@@ -881,7 +1404,7 @@ fn an_unknown_or_truncated_row_changes_nothing() {
     }
     let mut not_utf8 = body(&[&answer]).into_bytes();
     not_utf8.extend_from_slice(b"{\"type\":\"assistant\",\"effort\":\"low\",\"x\":\"\xff\"}\n");
-    assert_eq!(scan(&not_utf8, start, false, true).0, before, "not UTF-8");
+    assert_eq!(scan(&not_utf8, start, false).0, before, "not UTF-8");
     // CONTROL: the whole rows do.
     assert_eq!(
         tail_facts(&body(&[&answer, &choice]), start).model,
@@ -1114,12 +1637,12 @@ fn typed_model_names_remain_distinct_when_their_journal_words_match() {
     let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:14Z");
     assert!(!update.facts_changed, "a new row can state the same facts");
     assert_eq!(update.journal_line, None);
-    assert_eq!(session(&reader).appends, 2);
+    assert_eq!(session(&reader).reads, 3);
 
     let update = look_update(&mut reader, &world, &process, "2026-09-28T15:01:15Z");
     assert!(!update.facts_changed, "an unchanged source changes nothing");
     assert_eq!(update.journal_line, None);
-    assert_eq!(session(&reader).appends, 2);
+    assert_eq!(session(&reader).reads, 3);
 }
 
 #[test]
@@ -1165,7 +1688,7 @@ fn private_model_choice_bookkeeping_is_not_a_typed_fact_change() {
 }
 
 /// THE TRANSCRIPT IS READ AGAIN ONLY WHEN IT MOVED: an unchanged file is not
-/// read; growth is read as an append; a rewrite of the same size and
+/// read; growth, a rewrite of the same size and
 /// modification time, a replacement and a shrink are read afresh; a file that
 /// is gone is looked up again and read anew. Each change of what the facts
 /// show is one journal line, and only that.
@@ -1191,7 +1714,7 @@ fn the_transcript_is_read_again_only_when_it_moved() {
         look(&mut reader, &world, S, false, "2026-09-28T15:01:12Z").as_deref(),
         Some("facts model=Opus_6 effort=high key=-")
     );
-    assert_eq!((session(&reader).reads, session(&reader).appends), (2, 1));
+    assert_eq!(session(&reader).reads, 2);
 
     // The same size and modification time, other rows: the change time differs.
     let path = world.path(S);
@@ -1210,8 +1733,8 @@ fn the_transcript_is_read_again_only_when_it_moved() {
         Some("facts model=Opus_7 effort=high key=-")
     );
     assert_eq!(
-        (session(&reader).reads, session(&reader).appends),
-        (3, 1),
+        session(&reader).reads,
+        3,
         "a rewrite in place of the same length is read afresh"
     );
 
@@ -1233,7 +1756,7 @@ fn the_transcript_is_read_again_only_when_it_moved() {
         look(&mut reader, &world, S, false, "2026-09-28T15:01:14Z").as_deref(),
         Some("facts model=Opus_8 effort=high key=-")
     );
-    assert_eq!((session(&reader).reads, session(&reader).appends), (4, 1));
+    assert_eq!(session(&reader).reads, 4);
 
     // Gone, then back with less in it: looked up again and read afresh.
     std::fs::remove_file(&path).unwrap();
@@ -1251,7 +1774,7 @@ fn the_transcript_is_read_again_only_when_it_moved() {
         look(&mut reader, &world, S, false, "2026-09-28T15:01:16Z").as_deref(),
         Some("facts model=Opus_9 effort=high key=-")
     );
-    assert_eq!((session(&reader).reads, session(&reader).appends), (5, 1));
+    assert_eq!(session(&reader).reads, 5);
 }
 
 /// A transcript not found is looked up at most once per [`LOOKUP_RETRY_MS`]:
@@ -1330,15 +1853,17 @@ fn a_row_still_being_written_counts_once_it_is_whole() {
         Some("facts model=Fable_5.1 effort=- key=-"),
         "CONTROL: the whole row is read, and its model names no level"
     );
-    assert_eq!(session(&reader).appends, 2, "both were appends");
+    assert_eq!(
+        session(&reader).reads,
+        3,
+        "each changed version is replayed"
+    );
 }
 
-/// A statement that more than a tail of newer rows has pushed back is
-/// carried, and every appended row is read: the answer below a 300 KiB row
-/// still names the model, and a choice made right before another such row
-/// counts. CONTROL: the file's tail alone, read afresh, names no model.
+/// A statement outside the current window is unread, even if an earlier
+/// version named it. CONTROL: a whole statement inside the window names it.
 #[test]
-fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
+fn a_fact_outside_the_current_tail_is_unread_even_if_an_earlier_look_saw_it() {
     const S: &str = "00000000-0000-4000-8000-000000000104";
     let world = World::new("carry");
     let image = format!(
@@ -1357,14 +1882,14 @@ fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
     assert!(look(&mut reader, &world, S, false, "2026-09-28T15:05:01Z").is_some());
     world.append(S, &image);
     assert_eq!(
-        look(&mut reader, &world, S, false, "2026-09-28T15:18:14Z"),
-        None
+        look(&mut reader, &world, S, false, "2026-09-28T15:18:14Z").as_deref(),
+        Some("facts model=- effort=- key=-")
     );
-    assert_eq!(words(&reader).0, is("Opus 5.5"), "carried past the window");
+    assert_eq!(words(&reader), (Said::Unread, Said::Unread, Said::Unread));
     let file = std::fs::read(world.path(S)).unwrap();
     let tail = &file[file.len() - usize::try_from(profile::TRANSCRIPT_TAIL_BYTES).unwrap()..];
     assert_eq!(
-        scan(tail, ms(START), false, true).0.model,
+        scan(tail, ms(START), false).0.model,
         Said::Unsaid,
         "CONTROL: the tail alone names no model"
     );
@@ -1377,11 +1902,24 @@ fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
     );
     world.append(S, &image);
     assert_eq!(
-        look(&mut reader, &world, S, false, "2026-09-28T15:19:01Z").as_deref(),
-        Some("facts model=Fable_5.1 effort=- key=-"),
-        "every appended byte is read"
+        look(&mut reader, &world, S, false, "2026-09-28T15:19:01Z"),
+        None,
+        "the choice is also outside the window"
     );
-    assert_eq!(session(&reader).appends, 2);
+    assert!(!reader.facts.chose, "a skipped choice is not inferred");
+    world.append(
+        S,
+        &rows(&[&answer_at(
+            "claude-opus-7",
+            "2026-09-28T15:20:00Z",
+            Some("low"),
+        )]),
+    );
+    assert_eq!(
+        look(&mut reader, &world, S, false, "2026-09-28T15:20:01Z").as_deref(),
+        Some("facts model=Opus_7 effort=low key=-"),
+        "CONTROL: the current window states these facts"
+    );
 }
 
 /// Another process (another pid, or the same pid with another `startedAt`)
@@ -1822,7 +2360,8 @@ fn a_command_is_read_with_the_result_under_it() {
         look(&mut fresh, &world, S, false, now)
     };
     let split = |reader: &mut Reader, command: &str, at: &str, result: &str, now: [&str; 2]| {
-        world.append(S, &rows(&[&command_at(command, at)]));
+        let command = command_at(command, at).replacen("<command-name>", r"\u003ccommand-name>", 1);
+        world.append(S, &rows(&[&command]));
         let between = look(reader, &world, S, false, now[0]);
         let held = words(reader);
         world.append(S, &rows(&[&result_at(at, result)]));
@@ -1894,16 +2433,14 @@ fn a_command_is_read_with_the_result_under_it() {
     );
 }
 
-/// A GROWTH PAST THE APPEND BOUND LEAVES WHAT IT SKIPPED UNREAD: more than
-/// [`MAX_APPEND_BYTES`] between two looks is read as a fresh tail, and a fact
-/// that tail does not state is unread (`-`), never the value a skipped row
-/// overrode. CONTROLS: the same rows under the bound are read as an append and
-/// every statement counts; a fact the tail does state is shown.
+/// A window that may have skipped a statement leaves that fact unread,
+/// never the value the skipped row overrode. CONTROLS: the same statements
+/// inside the window count; a fact the current window states is shown.
 #[test]
-fn a_growth_past_the_append_bound_leaves_what_it_skipped_unread() {
+fn a_window_that_skips_statements_keeps_only_the_facts_it_reads() {
     const S: &str = "00000000-0000-4000-8000-0000000000d2";
     let key = capital_key();
-    let over_kib = usize::try_from(MAX_APPEND_BYTES / 1024).unwrap() + 200;
+    let over_kib = usize::try_from(profile::TRANSCRIPT_TAIL_BYTES / 1024).unwrap() + 200;
     let started = |world: &World| {
         world.write(
             S,
@@ -1931,9 +2468,10 @@ fn a_growth_past_the_append_bound_leaves_what_it_skipped_unread() {
             "Set model to `Sonnet 5.5` for this session only",
         ),
     ]);
-    for (kib, line, appends) in [
-        (over_kib, Some("facts model=- effort=- key=-"), 0),
-        (300, Some("facts model=Sonnet_5.5 effort=- key=off"), 1),
+    for (kib, line) in [
+        (over_kib, Some("facts model=- effort=- key=-")),
+        (300, Some("facts model=- effort=- key=-")),
+        (64, Some("facts model=Sonnet_5.5 effort=- key=off")),
     ] {
         let world = World::new("bound");
         let mut reader = started(&world);
@@ -1945,9 +2483,9 @@ fn a_growth_past_the_append_bound_leaves_what_it_skipped_unread() {
             "{kib} KiB"
         );
         assert_eq!(
-            (session(&reader).reads, session(&reader).appends),
-            (2, appends),
-            "{kib} KiB: an append only under the bound"
+            session(&reader).reads,
+            2,
+            "{kib} KiB: one replay for the changed version"
         );
     }
     // The key's exit, a growth past the bound and an answer: the tail names
@@ -1971,48 +2509,250 @@ fn a_growth_past_the_append_bound_leaves_what_it_skipped_unread() {
     assert_eq!(words(&reader).2, Said::Unread);
 }
 
-/// A CHANGED BYTE BEFORE THE END OF THE LAST READ MEANS A FRESH READ: the
-/// guard catches a transcript rewritten in place (the same inode, grown), so
-/// its new rows are read, not only what follows the old end. CONTROL: an
-/// append over unchanged bytes is read as an append.
+/// An earlier statement can change while the file grows and the old suffix
+/// stays identical. The whole current window is replayed, including after a
+/// pure reader transfer. CONTROL: an unchanged version is skipped.
 #[test]
-fn a_changed_byte_before_the_read_end_is_read_afresh() {
+fn an_earlier_prefix_rewrite_is_read_even_when_the_unchanged_suffix_grows() {
     const S: &str = "00000000-0000-4000-8000-0000000000d3";
-    let world = World::new("guard");
     let row = |model: &str| answer_at(model, "2026-09-28T15:01:00.000Z", Some("high"));
-    let filler = r#"{"type":"user","timestamp":"2026-09-28T15:01:05.000Z","message":{"content":"plain words"}}"#;
-    let mut reader = Reader::default();
-    world.write(S, &[&row("claude-opus-5")]);
+    let filler = format!(
+        r#"{{"type":"user","timestamp":"2026-09-28T15:01:05.000Z","message":{{"content":"{}"}}}}"#,
+        "plain words ".repeat(100)
+    );
     let inode = |world: &World| {
         use std::os::unix::fs::MetadataExt as _;
         std::fs::metadata(world.path(S)).unwrap().ino()
     };
-    let before = inode(&world);
-    assert_eq!(
-        look(&mut reader, &world, S, false, "2026-09-28T15:01:10Z").as_deref(),
-        Some("facts model=Opus_5 effort=high key=-")
+    for transfer in [false, true] {
+        let world = World::new("prefix");
+        let mut reader = Reader::default();
+        world.write(S, &[&row("claude-opus-5"), &filler]);
+        let before = inode(&world);
+        assert_eq!(
+            look(&mut reader, &world, S, false, "2026-09-28T15:01:10Z").as_deref(),
+            Some("facts model=Opus_5 effort=high key=-")
+        );
+        if transfer {
+            reader = moved(&reader);
+        }
+        let old = std::fs::read(world.path(S)).unwrap();
+        world.write(S, &[&row("claude-opus-7"), &filler, &filler]);
+        let new = std::fs::read(world.path(S)).unwrap();
+        assert_eq!(inode(&world), before, "rewritten in place");
+        assert_eq!(row("claude-opus-5").len(), row("claude-opus-7").len());
+        assert_eq!(
+            &old[row("claude-opus-5").len()..],
+            &new[row("claude-opus-7").len()..old.len()],
+            "only the earlier statement changed within the old extent"
+        );
+        assert_eq!(
+            look(&mut reader, &world, S, false, "2026-09-28T15:01:11Z").as_deref(),
+            Some("facts model=Opus_7 effort=high key=-"),
+            "transfer={transfer}"
+        );
+        let reads = session(&reader).reads;
+        assert_eq!(
+            look(&mut reader, &world, S, false, "2026-09-28T15:01:12Z"),
+            None
+        );
+        assert_eq!(session(&reader).reads, reads, "unchanged version skipped");
+    }
+}
+
+/// Removed statements cannot survive in the reader's prior file-version
+/// facts. A conversation entered by clear replays over its entry facts;
+/// the process's first conversation has no such baseline. The pure transfer
+/// must preserve this distinction and must not retain a removed model choice.
+#[test]
+fn removing_statements_replays_only_the_immutable_entry_baseline() {
+    const LEFT: &str = "00000000-0000-4000-8000-0000000000d6";
+    const CURRENT: &str = "00000000-0000-4000-8000-0000000000d7";
+    const TAKEN: &str = "00000000-0000-4000-8000-0000000000d8";
+    for has_base in [false, true] {
+        for transfer in [false, true] {
+            let world = World::new("removed-statements");
+            let mut reader = Reader::default();
+            if has_base {
+                world.write(
+                    LEFT,
+                    &[
+                        &answer_at("claude-opus-5", "2026-09-28T15:00:10Z", Some("high")),
+                        &key_row("enter", "2026-09-28T15:00:11Z"),
+                    ],
+                );
+                look(&mut reader, &world, LEFT, false, "2026-09-28T15:00:20Z");
+            }
+            world.write(
+                CURRENT,
+                &[
+                    &command_at("model", "2026-09-28T15:01:00Z"),
+                    &result_at(
+                        "2026-09-28T15:01:01Z",
+                        "Set model to `Opus 7` with `low` effort",
+                    ),
+                    &key_row("exit", "2026-09-28T15:01:02Z"),
+                ],
+            );
+            look(&mut reader, &world, CURRENT, false, "2026-09-28T15:01:10Z");
+            assert_eq!(words(&reader), (is("Opus 7"), is("low"), Said::Is(false)));
+            assert!(reader.facts.chose);
+            if transfer {
+                reader = moved(&reader);
+            }
+            // Removing the statements, then growing the same file with only
+            // irrelevant rows, both replay the same immutable baseline.
+            for rows in [Vec::new(), vec![image_at("2026-09-28T15:01:20Z", 4)]] {
+                world.write(
+                    CURRENT,
+                    &rows.iter().map(String::as_str).collect::<Vec<_>>(),
+                );
+                look(&mut reader, &world, CURRENT, false, "2026-09-28T15:01:30Z");
+                assert_eq!(
+                    words(&reader),
+                    if has_base {
+                        (is("Opus 5"), is("high"), Said::Is(true))
+                    } else {
+                        (Said::Unsaid, Said::Unsaid, Said::Unsaid)
+                    },
+                    "base={has_base}, transfer={transfer}, rows={}",
+                    rows.len()
+                );
+                assert!(
+                    !reader.facts.chose,
+                    "removed choice cannot pin a later resume"
+                );
+            }
+            world.write(
+                TAKEN,
+                &[&answer_at(
+                    "claude-sonnet-5",
+                    "2026-09-28T14:00:00Z",
+                    Some("low"),
+                )],
+            );
+            look(&mut reader, &world, TAKEN, false, "2026-09-28T15:02:00Z");
+            assert_eq!(
+                words(&reader).0,
+                Said::Unread,
+                "no removed choice pins the model"
+            );
+            assert_eq!(
+                words(&reader).1,
+                Said::Unread,
+                "a resume never keeps effort"
+            );
+        }
+    }
+}
+
+/// A pre-entry row establishes that this entry was a resume. Rewriting it
+/// away cannot turn the entry into a clear or restore the left conversation's
+/// effort. A launch pin still keeps the entry model, and an incomplete window
+/// still leaves omitted facts unread. Both laws survive pure serialization.
+#[test]
+fn removing_old_rows_cannot_turn_an_established_resume_into_a_clear() {
+    const LEFT: &str = "00000000-0000-4000-8000-0000000000da";
+    const TAKEN: &str = "00000000-0000-4000-8000-0000000000db";
+    for pinned in [false, true] {
+        for transfer in [false, true] {
+            let world = World::new("resume-history");
+            let mut reader = Reader::default();
+            world.write(
+                LEFT,
+                &[
+                    &answer_at("claude-opus-5", "2026-09-28T15:00:10Z", Some("high")),
+                    &key_row("enter", "2026-09-28T15:00:11Z"),
+                ],
+            );
+            look(&mut reader, &world, LEFT, pinned, "2026-09-28T15:00:20Z");
+            world.write(
+                TAKEN,
+                &[&answer_at(
+                    "claude-sonnet-5",
+                    "2026-09-28T14:00:00Z",
+                    Some("low"),
+                )],
+            );
+            look(&mut reader, &world, TAKEN, pinned, "2026-09-28T15:01:00Z");
+            let expected = (
+                if pinned { is("Opus 5") } else { Said::Unread },
+                Said::Unread,
+                Said::Is(true),
+            );
+            assert_eq!(words(&reader), expected);
+            if transfer {
+                reader = moved(&reader);
+            }
+            world.write(TAKEN, &[&image_at("2026-09-28T15:01:10Z", 4)]);
+            look(&mut reader, &world, TAKEN, pinned, "2026-09-28T15:01:20Z");
+            assert_eq!(
+                words(&reader),
+                expected,
+                "pin={pinned}, transfer={transfer}"
+            );
+            world.write(TAKEN, &[&image_at("2026-09-28T15:01:30Z", 300)]);
+            look(&mut reader, &world, TAKEN, pinned, "2026-09-28T15:01:40Z");
+            assert_eq!(
+                words(&reader),
+                (Said::Unread, Said::Unread, Said::Unread),
+                "established resume does not fill potentially skipped facts"
+            );
+        }
+    }
+}
+
+/// A growing incomplete row never requires an unbounded reread or becomes
+/// a statement. Once it pushes earlier statements outside the window those
+/// facts are unread; a later whole, in-window statement recovers them.
+#[test]
+fn an_oversized_partial_row_does_not_retain_facts_outside_the_window() {
+    const S: &str = "00000000-0000-4000-8000-0000000000d9";
+    let world = World::new("partial-window");
+    let mut reader = Reader::default();
+    world.write(
+        S,
+        &[&answer_at(
+            "claude-opus-5",
+            "2026-09-28T15:00:10Z",
+            Some("high"),
+        )],
     );
-    world.write(S, &[&row("claude-opus-7"), filler]);
-    assert_eq!(inode(&world), before, "rewritten in place");
-    assert_eq!(
-        look(&mut reader, &world, S, false, "2026-09-28T15:01:11Z").as_deref(),
-        Some("facts model=Opus_7 effort=high key=-")
+    look(&mut reader, &world, S, false, "2026-09-28T15:00:20Z");
+    let partial = format!(
+        r#"{{"type":"assistant","timestamp":"2026-09-28T15:01:00Z","message":{{"model":"claude-opus-7","content":"{}"#,
+        "a".repeat(300 * 1024)
     );
+    world.append(S, &partial);
+    look(&mut reader, &world, S, false, "2026-09-28T15:01:10Z");
+    assert_eq!(words(&reader), (Said::Unread, Said::Unread, Said::Unread));
+    let reads = session(&reader).reads;
+    look(&mut reader, &world, S, false, "2026-09-28T15:01:11Z");
     assert_eq!(
-        (session(&reader).reads, session(&reader).appends),
-        (2, 0),
-        "the changed bytes are read afresh"
+        session(&reader).reads,
+        reads,
+        "unchanged partial row is skipped"
     );
-    world.append(S, &rows(&[filler]));
+    world.append(S, &"b".repeat(300 * 1024));
+    look(&mut reader, &world, S, false, "2026-09-28T15:01:12Z");
+    assert_eq!(words(&reader).0, Said::Unread);
+    world.append(S, "\"}}\n");
+    look(&mut reader, &world, S, false, "2026-09-28T15:01:13Z");
     assert_eq!(
-        look(&mut reader, &world, S, false, "2026-09-28T15:01:12Z"),
-        None
+        words(&reader).0,
+        Said::Unread,
+        "a cut row is excluded even when whole"
     );
-    assert_eq!(
-        (session(&reader).reads, session(&reader).appends),
-        (3, 1),
-        "CONTROL: unchanged bytes, an append"
+    world.append(
+        S,
+        &rows(&[&answer_at(
+            "claude-opus-8",
+            "2026-09-28T15:01:20Z",
+            Some("low"),
+        )]),
     );
+    look(&mut reader, &world, S, false, "2026-09-28T15:01:21Z");
+    assert_eq!(words(&reader), (is("Opus 8"), is("low"), Said::Unread));
 }
 
 /// A `/resume` IS TOLD FROM A `/clear` BY ANY ROW FROM BEFORE THE SWITCH, not
@@ -2144,7 +2884,7 @@ fn moved(reader: &Reader) -> Reader {
 /// AN OWN-IMAGE MOVE CARRIES THE READER: the child starts in X (Sonnet 5.5,
 /// high, the key entered), `/clear`s into Y (the key off, `/model` Opus 5.5,
 /// `/effort low`) and `/resume`s X. The new image says what the old one says,
-/// reads nothing again, and goes on with an append where the old one stopped.
+/// reads nothing again, and replays a changed version over its entry facts.
 /// CONTROL: a reader started afresh in the new image takes X's rows from
 /// before the `/resume` for the child's, and names all three wrongly, the key
 /// for good.
@@ -2233,11 +2973,7 @@ fn an_own_image_move_carries_the_reader() {
         look(&mut new, &world, X, false, next).as_deref(),
         Some("facts model=Opus_5.5 effort=low key=off")
     );
-    assert_eq!(
-        (session(&new).reads, session(&new).appends),
-        (1, 1),
-        "an append from where the old image stopped"
-    );
+    assert_eq!(session(&new).reads, 1, "one replay of the changed version");
     assert_eq!(
         look(&mut old, &world, X, false, next).as_deref(),
         Some("facts model=Opus_5.5 effort=low key=off")
@@ -2251,8 +2987,9 @@ fn an_own_image_move_carries_the_reader() {
 
 /// A carried reader restores only what [`Reader::put`] could have written: a
 /// truncated reader, a state no fact has, a conversation id no transcript has
-/// and a guard longer than the rows read are refused. CONTROL: the smallest
-/// reader restores.
+/// and a pin without an entry baseline are refused. An old suffix-carry
+/// format cannot reconstruct the baseline and is explicitly unsupported.
+/// CONTROLS: the smallest and maximum-text readers restore within the bound.
 #[test]
 fn a_carried_reader_restores_only_what_put_writes() {
     use crate::transfer_capsule::{Decoder, Encoder};
@@ -2267,8 +3004,8 @@ fn a_carried_reader_restores_only_what_put_writes() {
         }
         encoder.finish()
     };
-    // No pid, no floor, no conversation.
-    let none = [0_u8, 0, 0];
+    // Format 2, no pid, no floor, no conversation.
+    let none = [2_u8, 0, 0, 0];
     let with = |head: &[u8], tail: &[u8]| [head, tail].concat();
     let smallest = read(&with(&none, &facts(0, 0))).expect("CONTROL: the smallest reader");
     assert_eq!(smallest.facts(), &ModelFacts::default());
@@ -2286,8 +3023,17 @@ fn a_carried_reader_restores_only_what_put_writes() {
         read(&with(&none, &facts(0, 4))).is_err(),
         "no fifth key state"
     );
-    let session = |id: &str, read_to: u64, guard: &[u8]| -> Vec<u8> {
+    assert!(
+        read(&with(&[0, 0, 0], &facts(0, 0))).is_err(),
+        "old format is unsupported"
+    );
+    assert!(
+        read(&with(&[3, 0, 0, 0], &facts(0, 0))).is_err(),
+        "unknown format is unsupported"
+    );
+    let session = |id: &str, base: bool, resumed: bool, pinned: u8| -> Vec<u8> {
         let mut encoder = Encoder::new();
+        encoder.u8(2).unwrap();
         for flag in [false, false, true] {
             encoder.boolean(flag).unwrap();
         }
@@ -2295,16 +3041,85 @@ fn a_carried_reader_restores_only_what_put_writes() {
         encoder.u64(1).unwrap();
         encoder.u64(2).unwrap();
         encoder.boolean(false).unwrap();
-        encoder.boolean(true).unwrap();
-        for value in [3, 4, read_to] {
-            encoder.u64(value).unwrap();
+        encoder.boolean(base).unwrap();
+        let mut bytes = encoder.finish();
+        if base {
+            bytes.extend(facts(0, 0));
         }
-        encoder.bytes(guard).unwrap();
-        [encoder.finish(), facts(0, 0)].concat()
+        bytes.push(u8::from(resumed));
+        bytes.push(pinned);
+        bytes.extend(facts(0, 0));
+        bytes
     };
     const ID: &str = "00000000-0000-4000-8000-0000000000e3";
-    assert!(read(&session(ID, 8, b"row end\n")).is_ok(), "CONTROL");
-    assert!(read(&session("../escape", 8, b"row end\n")).is_err());
-    assert!(read(&session(ID, 4, b"row end\n")).is_err());
-    assert!(read(&session(ID, 900, &[b'x'; GUARD_BYTES + 1])).is_err());
+    assert!(
+        read(&session(ID, false, false, 0)).is_ok(),
+        "CONTROL: first conversation"
+    );
+    assert!(
+        read(&session(ID, true, true, 2)).is_ok(),
+        "CONTROL: entry baseline with a pin"
+    );
+    assert!(read(&session("../escape", false, false, 0)).is_err());
+    assert!(
+        read(&session(ID, false, true, 1)).is_err(),
+        "pin needs a baseline"
+    );
+    assert!(
+        read(&session(ID, false, true, 0)).is_err(),
+        "resume needs a baseline"
+    );
+    assert!(
+        read(&session(ID, true, false, 1)).is_err(),
+        "pin is only asked at a resume"
+    );
+    assert!(
+        read(&session(ID, true, true, 3)).is_err(),
+        "no fourth pin state"
+    );
+
+    let maximum = ModelFacts {
+        model: is(&"m".repeat(256)),
+        effort: is(&"e".repeat(256)),
+        effort_for: Some("f".repeat(256)),
+        key: Said::Is(true),
+        chose: true,
+    };
+    let reader = Reader {
+        pid: Some(u32::MAX),
+        floor_ms: Some(u64::MAX),
+        session: Some(SessionRead {
+            base: Some(maximum.clone()),
+            resumed: true,
+            pinned: Some(true),
+            stamp: Some(Stamp {
+                device: u64::MAX,
+                inode: u64::MAX,
+                len: u64::MAX,
+                modified: (i64::MAX, i64::MAX),
+                changed: (i64::MAX, i64::MAX),
+            }),
+            ..SessionRead::new(ID, u64::MAX)
+        }),
+        facts: maximum,
+        ..Reader::default()
+    };
+    let mut encoder = Encoder::new();
+    reader.put(&mut encoder).unwrap();
+    let bytes = encoder.finish();
+    assert!(bytes.len() <= Reader::TRANSFER_BOUND);
+    assert_eq!(moved(&reader).facts(), reader.facts());
+    let mut too_long = reader;
+    too_long
+        .session
+        .as_mut()
+        .unwrap()
+        .base
+        .as_mut()
+        .unwrap()
+        .effort_for = Some("f".repeat(257));
+    assert!(
+        too_long.put(&mut Encoder::new()).is_err(),
+        "the baseline uses the same text bound"
+    );
 }

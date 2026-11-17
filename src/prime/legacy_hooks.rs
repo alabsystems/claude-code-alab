@@ -3,6 +3,7 @@
 
 //! Retired aterm hook removal through the same transaction as Claude's defaults.
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{self, Read as _};
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -126,14 +127,14 @@ fn read_text(path: &Path) -> io::Result<Option<String>> {
 }
 
 fn is_aterm_hook_command(command: &str) -> bool {
-    let command = command.trim();
+    let command = command.trim_matches(' ');
     if is_harness_statusline_command(command) || bare_path_hook(command) {
         return true;
     }
     let Some((exe, rest)) = split_first_word(command) else {
         return false;
     };
-    let name = exe.rsplit('/').next().unwrap_or(&exe);
+    let name = exe.rsplit('/').next().unwrap_or(exe.as_ref());
     ATERM_EXE_NAMES.contains(&name) && is_link_hook_form(rest)
 }
 
@@ -157,7 +158,7 @@ fn bare_path_hook(command: &str) -> bool {
             after
                 .strip_prefix(name)
                 .and_then(|rest| rest.strip_prefix(' '))
-                .is_some_and(|rest| is_link_hook_form(rest.trim_start()))
+                .is_some_and(|rest| is_link_hook_form(rest.trim_start_matches(' ')))
         }) {
             return true;
         }
@@ -165,7 +166,7 @@ fn bare_path_hook(command: &str) -> bool {
     false
 }
 
-fn split_first_word(command: &str) -> Option<(String, &str)> {
+fn split_first_word(command: &str) -> Option<(Cow<'_, str>, &str)> {
     if let Some(rest) = command.strip_prefix('\'') {
         let mut word = String::new();
         let mut it = rest.char_indices();
@@ -176,16 +177,21 @@ fn split_first_word(command: &str) -> Option<(String, &str)> {
                     it.nth(2);
                     continue;
                 }
-                return Some((word, rest[i + 1..].trim_start()));
+                let tail = &rest[i + 1..];
+                if !tail.is_empty() && !tail.starts_with(' ') {
+                    return None;
+                }
+                return Some((Cow::Owned(word), tail.trim_start_matches(' ')));
             }
             word.push(c);
         }
         None
     } else {
-        match command.split_once(' ') {
-            Some((word, rest)) => Some((word.to_string(), rest.trim_start())),
-            None => Some((command.to_string(), "")),
+        let (word, rest) = command.split_once(' ').unwrap_or((command, ""));
+        if word.contains(SH_META) {
+            return None;
         }
+        Some((Cow::Borrowed(word), rest.trim_start_matches(' ')))
     }
 }
 
@@ -204,28 +210,20 @@ fn strip_marked_hooks(doc: &mut Json) -> Result<usize, String> {
             .as_array_mut()
             .ok_or_else(|| format!("`hooks.{event}` is not a JSON array"))?;
         let had_groups = !groups.is_empty();
-        let mut group_emptied = Vec::with_capacity(groups.len());
-        for group in groups.iter_mut() {
-            let mut emptied = false;
-            if let Some(entries) = group.get_mut("hooks").and_then(Json::as_array_mut) {
-                let before = entries.len();
-                entries.retain(|entry| {
-                    !entry
-                        .get("command")
-                        .and_then(Json::as_str)
-                        .is_some_and(is_aterm_hook_command)
-                });
-                let taken = before - entries.len();
-                removed += taken;
-                emptied = taken > 0 && entries.is_empty();
-            }
-            group_emptied.push(emptied);
-        }
-        let mut index = 0;
-        groups.retain(|_| {
-            let drop = group_emptied[index];
-            index += 1;
-            !drop
+        groups.retain_mut(|group| {
+            let Some(entries) = group.get_mut("hooks").and_then(Json::as_array_mut) else {
+                return true;
+            };
+            let before = entries.len();
+            entries.retain(|entry| {
+                !entry
+                    .get("command")
+                    .and_then(Json::as_str)
+                    .is_some_and(is_aterm_hook_command)
+            });
+            let taken = before - entries.len();
+            removed += taken;
+            taken == 0 || !entries.is_empty()
         });
         event_emptied.push(had_groups && groups.is_empty());
     }

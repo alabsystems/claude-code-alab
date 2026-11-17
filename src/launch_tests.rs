@@ -78,6 +78,106 @@ fn bypass_switches_are_removed_only_before_the_literal_boundary() {
 }
 
 #[test]
+fn opaque_vendor_words_preserve_launcher_switch_boundaries() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let opaque = OsString::from_vec(vec![0xff]);
+    let opaque_option = OsString::from_vec(b"--unknown-\xff".to_vec());
+    let opaque_inline = OsString::from_vec(b"--model=\xff=tail".to_vec());
+    let opaque_value = OsString::from_vec(b"--no-harness\xff".to_vec());
+    let no = OsString::from("--no-harness");
+    let alias = OsString::from("--no-alab-harness");
+    let cases = [
+        (vec![no.clone(), opaque.clone()], vec![opaque.clone()], true),
+        (vec![opaque.clone(), no.clone()], vec![opaque.clone()], true),
+        (
+            vec!["--system-prompt".into(), opaque.clone(), no.clone()],
+            vec!["--system-prompt".into(), opaque.clone()],
+            true,
+        ),
+        (
+            vec![
+                "--system-prompt".into(),
+                no.clone(),
+                opaque.clone(),
+                alias.clone(),
+            ],
+            vec!["--system-prompt".into(), no.clone(), opaque.clone()],
+            true,
+        ),
+        (
+            vec!["--system-prompt".into(), opaque_value.clone(), no.clone()],
+            vec!["--system-prompt".into(), opaque_value.clone()],
+            true,
+        ),
+        (
+            vec![
+                "--add-dir".into(),
+                opaque.clone(),
+                "another".into(),
+                alias.clone(),
+            ],
+            vec!["--add-dir".into(), opaque.clone(), "another".into()],
+            true,
+        ),
+        (
+            vec![
+                "--add-dir".into(),
+                no.clone(),
+                opaque.clone(),
+                alias.clone(),
+            ],
+            vec!["--add-dir".into(), no.clone(), opaque.clone()],
+            true,
+        ),
+        (
+            vec!["--prompt-suggestions".into(), opaque.clone(), alias.clone()],
+            vec!["--prompt-suggestions".into(), opaque.clone()],
+            true,
+        ),
+        (
+            vec![opaque_inline.clone(), alias.clone()],
+            vec![opaque_inline],
+            true,
+        ),
+        (
+            vec![
+                no.clone(),
+                "--".into(),
+                opaque.clone(),
+                opaque_option.clone(),
+                alias.clone(),
+            ],
+            vec![
+                "--".into(),
+                opaque.clone(),
+                opaque_option.clone(),
+                alias.clone(),
+            ],
+            true,
+        ),
+    ];
+    for (args, expected, disabled) in cases {
+        assert_eq!(switches(args.clone()), (expected, disabled), "{args:?}");
+    }
+
+    // Unknown names retain the entire input, even after a recognized launcher flag.
+    for unknown in [
+        OsString::from("--future"),
+        opaque_option,
+        OsString::from_vec(b"-\xff".to_vec()),
+        OsString::from_vec(b"--future=\xff".to_vec()),
+        OsString::from_vec(b"--no-harness=\xff".to_vec()),
+    ] {
+        let args = vec![no.clone(), unknown, opaque.clone()];
+        assert_eq!(switches(args.clone()), (args.clone(), false), "{args:?}");
+    }
+    // A required value does not move the launcher's unconditional literal cut.
+    let args = vec!["--system-prompt".into(), "--".into(), no, opaque];
+    assert_eq!(switches(args.clone()), (args, false));
+}
+
+#[test]
 fn managed_permissions_preserve_explicit_posture_and_unknown_arity() {
     for args in [
         vec!["--permission-mode", "plan"],

@@ -20,8 +20,8 @@
 //! 4. **A `/clear` keeps the model, the level and the key.**
 //!
 //! Each fact is one of three things ([`Said`]): never stated since the process
-//! started, stated but unread (the newest statement is one this build cannot
-//! read, or a `/resume` left the fact out), or a stated value. Nothing fills an
+//! started, unread (a statement cannot be read, the bounded window may have
+//! skipped it, or a `/resume` left the fact out), or a stated value. Nothing fills an
 //! unstated or unread fact: no launch flag, no row from before the process
 //! started, no default.
 //!
@@ -30,17 +30,18 @@
 //! main-thread `assistant`, `user` or `system` row's `effort`, a request's
 //! `params.output_config.effort`, an `/effort` result and a model result's
 //! `with … effort`. The key is the newest `ultra_effort_enter` or
-//! `ultra_effort_exit` attachment, or an `/effort` result that states it.
+//! `ultra_effort_exit` attachment, or a key statement in an effort field or
+//! command result.
 //!
-//! A read is the same whatever looks it is split across: a later read takes
-//! only the whole rows appended since, and a `/model` or `/effort` command row
-//! waits to be read with the result Claude Code writes under it
-//! ([`read_end`]). A fresh read (the first, or one after a rewrite or a growth
-//! past [`MAX_APPEND_BYTES`]) takes the transcript's last
-//! [`crate::profile::TRANSCRIPT_TAIL_BYTES`]; where that window neither starts
-//! at the file's start nor holds a row from before the floor, it may have
-//! missed a statement, so each fact it does not state is unread
-//! ([`ModelFacts::leave_unread`]), never filled from before what it skipped.
+//! An unchanged file stamp skips the read. Every changed version is replayed
+//! from its last [`crate::profile::TRANSCRIPT_TAIL_BYTES`] over the facts held
+//! when the process entered this conversation, never over earlier reads of
+//! this mutable file. No suffix sample proves that a growing file's earlier
+//! bytes stayed unchanged. A `/model` or `/effort` command row waits for the
+//! result Claude Code writes under it ([`read_end`]). Where the window neither
+//! starts at the file's start nor holds a row from before the floor, it may
+//! have missed a statement: each fact it does not state is unread
+//! ([`ModelFacts::leave_unread`]), including a value seen in an earlier window.
 //! Discovery also has a per-look budget ([`MAX_LOOKUP_STEPS`]), shared across
 //! conversations. An incomplete, unreadable or ambiguous lookup leaves the three
 //! facts unread; a complete lookup that finds no file states nothing new. A known
@@ -60,6 +61,7 @@
 //! a kind this reader does not know states no level (aterm read a top-level
 //! `effort` on any row); and any `--model` pins, alias or id.
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -88,9 +90,10 @@ pub enum Said<T> {
     /// Nothing since the process started states it.
     #[default]
     Unsaid,
-    /// The newest statement is one this build cannot read, or a `/resume`
-    /// left the fact out (the model of a process nothing pinned, the level of
-    /// any): nothing older stands for it.
+    /// The newest statement is one this build cannot read, a bounded window
+    /// may have skipped a statement, or a `/resume` left the fact out (the
+    /// model of a process nothing pinned, the level of any): nothing older
+    /// stands for it.
     Unread,
     /// The newest statement names it.
     Is(T),
@@ -114,6 +117,17 @@ impl<T> Said<T> {
     }
 }
 
+impl Said<&str> {
+    /// Own the stated text while preserving both unknown states.
+    fn into_owned(self) -> Said<String> {
+        match self {
+            Self::Unsaid => Said::Unsaid,
+            Self::Unread => Said::Unread,
+            Self::Is(text) => Said::Is(text.to_owned()),
+        }
+    }
+}
+
 /// The child's model, effort level and top-effort key, each as the transcript
 /// since the process started states it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -128,9 +142,10 @@ pub struct ModelFacts {
     /// model switched to: the older effort stands only if it was that model's.
     effort_for: Option<String>,
     /// The process chose its model: a `/model` result that set it (readable or
-    /// not) or a `/fast on` result that moved it. Either pins it, so a
-    /// `/resume` restores no conversation's model over it. Any such row says
-    /// so, not only the newest.
+    /// not) or a `/fast on` result that moved it in the current window, or a
+    /// choice in the immutable entry baseline. Either pins it, so a `/resume`
+    /// restores no conversation's model over it. Any such row in the window
+    /// says so, not only the newest; an earlier read of this file cannot.
     chose: bool,
 }
 
@@ -141,17 +156,23 @@ impl ModelFacts {
     /// field stays one word.
     #[must_use]
     pub fn journal_line(&self) -> String {
-        let model = self
-            .model
-            .shown()
-            .map_or_else(|| "-".to_string(), |m| m.replace(' ', "_"));
+        let model = self.model.shown().map_or("-", String::as_str);
         let effort = self.effort.shown().map_or("-", String::as_str);
         let key = match self.key {
             Said::Is(true) => "on",
             Said::Is(false) => "off",
             Said::Unsaid | Said::Unread => "-",
         };
-        format!("facts model={model} effort={effort} key={key}")
+        let mut line = String::with_capacity(
+            "facts model= effort= key=".len() + model.len() + effort.len() + key.len(),
+        );
+        line.push_str("facts model=");
+        line.extend(model.chars().map(|c| if c == ' ' { '_' } else { c }));
+        line.push_str(" effort=");
+        line.push_str(effort);
+        line.push_str(" key=");
+        line.push_str(key);
+        line
     }
 
     /// These facts (newer) over `older`: each fact the newer rows decided
@@ -258,10 +279,13 @@ impl ModelFacts {
     }
 
     /// A word in a level's place ([`level_said`]): the level, and the key
-    /// where the word is the key itself.
+    /// where the word is the key itself. Each fact fills only what newer
+    /// statements have left open.
     fn state_level(&mut self, word: &str, raw: bool) {
         let (level, key) = level_said(word, raw);
-        self.decide_effort(level);
+        if !self.effort.decided() {
+            self.decide_effort(level.into_owned());
+        }
         self.state_key(key);
     }
 
@@ -285,7 +309,8 @@ const COMMAND_STDOUT: &str = "<local-command-stdout>";
 /// The `subtype` of the `system` row a command typed mid-turn is recorded in (2.1.322).
 const LOCAL_COMMAND: &str = "local_command";
 /// The `type` of the row Claude Code writes as it sends a request (2.1.321).
-const API_REQUEST: &str = "\"type\":\"api-request\"";
+/// Also a candidate marker; whitespace around a JSON field decides no fact.
+const API_REQUEST: &str = "api-request";
 /// The `querySource` of a request on the conversation's own thread (2.1.321).
 const MAIN_THREAD_QUERY: &str = "repl_main_thread";
 /// What every `attachment.type` of the key's own rows starts with (2.1.322):
@@ -304,16 +329,13 @@ const FAST_ON_LEAD: usize = 4;
 /// `/effort`'s results (2.1.283).
 const EFFORT_SET: &str = "Set effort level to ";
 const EFFORT_CURRENT: &str = "Current effort level: ";
-const EFFORT_AUTO: &str = "Effort level set to auto";
+const EFFORT_AUTO_LEAD: &str = "Effort level set to ";
 /// The key's own results, after the key word (2.1.304).
 const KEY_ON_RESULT: &str = " on (this session only): ";
 const KEY_OFF_RESULT: &str = " off. Effort stays ";
 const EFFORT_STAYS: &str = ". Effort stays ";
-const KEY_NEEDS: &str = " needs dynamic workflows enabled";
+const KEY_NEEDS_LEAD: &str = " needs dynamic workflows ";
 const KEY_UNAVAILABLE: &str = " isn't available on ";
-/// A level result's closing ` · <Key> on|off` (2.1.304).
-const KEY_SUFFIX_ON: &str = " on";
-const KEY_SUFFIX_OFF: &str = " off";
 
 /// The effort levels `/effort` takes. The key is none of them: Claude Code
 /// runs it at whatever level the session has.
@@ -334,23 +356,31 @@ fn effort_level(word: &str) -> Option<&'static str> {
 /// level unread, never a level of its own. `raw` keeps a word that is no level
 /// this build names (a row's own `effort`); without it such a word is unread
 /// (a result's wording this build cannot read).
-fn level_said(word: &str, raw: bool) -> (Said<String>, Option<bool>) {
+fn level_said(word: &str, raw: bool) -> (Said<&str>, Option<bool>) {
     if word.eq_ignore_ascii_case(TOP_EFFORT_KEY) {
         return (Said::Unread, Some(true));
     }
     match effort_level(word) {
-        Some(level) => (Said::Is(level.to_owned()), None),
-        None if raw => (Said::Is(word.to_owned()), None),
+        Some(level) => (Said::Is(level), None),
+        None if raw => (Said::Is(word), None),
         None => (Said::Unread, None),
     }
 }
 
+/// The complete first result word, without its closing tag or sentence period.
+fn result_word(text: &str) -> &str {
+    let end = text
+        .find(|c: char| c.is_whitespace() || c == ':')
+        .unwrap_or(text.len());
+    let word = &text[..end];
+    let word = word.strip_suffix("</local-command-stdout>").unwrap_or(word);
+    word.strip_suffix('.').unwrap_or(word)
+}
+
 /// [`level_said`] of the word `text` begins with.
 fn level_word(text: &str) -> (Said<String>, Option<bool>) {
-    let end = text
-        .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(text.len());
-    level_said(&text[..end], false)
+    let (level, key) = level_said(result_word(text), false);
+    (level.into_owned(), key)
 }
 
 /// A model as a result spells it, as Claude Code shows it: an id as its
@@ -382,7 +412,8 @@ fn model_name(display: &str) -> Option<String> {
 }
 
 /// A model id's display name (`claude-opus-5-5` is `Opus 5.5`); anything
-/// that is no Claude id is itself.
+/// that is no Claude id is itself. An empty family or component keeps the
+/// original text.
 #[must_use]
 fn model_display(id: &str) -> String {
     let base = id.split('[').next().unwrap_or(id);
@@ -392,10 +423,13 @@ fn model_display(id: &str) -> String {
     let mut parts = rest.split('-');
     let Some(family) = parts
         .next()
-        .filter(|f| f.chars().all(|c| c.is_ascii_alphabetic()))
+        .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphabetic()))
     else {
         return id.to_owned();
     };
+    if parts.clone().any(str::is_empty) {
+        return id.to_owned();
+    }
     let mut name = String::new();
     let mut chars = family.chars();
     if let Some(first) = chars.next() {
@@ -420,7 +454,7 @@ fn is_word(s: &str) -> bool {
 
 /// `text` without ANSI SGR sequences (`\x1b[1m`, `\x1b[38;2;255;106;0m`), as
 /// Claude Code's own result classifier strips them.
-fn strip_sgr(text: &str) -> std::borrow::Cow<'_, str> {
+fn strip_sgr(text: &str) -> Cow<'_, str> {
     if !text.contains('\u{1b}') {
         return text.into();
     }
@@ -428,18 +462,43 @@ fn strip_sgr(text: &str) -> std::borrow::Cow<'_, str> {
     let mut rest = text;
     while let Some(at) = rest.find("\u{1b}[") {
         out.push_str(&rest[..at]);
-        let seq = &rest[at + 2..];
-        match seq.find(|c: char| !(c.is_ascii_digit() || c == ';')) {
-            Some(end) if seq[end..].starts_with('m') => rest = &seq[end + 1..],
+        let seq = &rest[at..];
+        match sgr_len(seq) {
+            Some(end) => rest = &seq[end..],
             _ => {
                 out.push('\u{1b}');
-                rest = &rest[at + 1..];
+                rest = &seq[1..];
             }
         }
     }
     out.push_str(rest);
     out.into()
 }
+
+/// Bytes of an SGR sequence at the start of `text`.
+fn sgr_len(text: &str) -> Option<usize> {
+    let parameters = text.strip_prefix("\u{1b}[")?;
+    let end = parameters.find(|c: char| !(c.is_ascii_digit() || c == ';'))?;
+    parameters[end..].starts_with('m').then_some(end + 3)
+}
+
+/// The original text after a prefix matched with SGR sequences ignored.
+fn after_sgr_prefix<'a>(mut text: &'a str, prefix: &str) -> Option<&'a str> {
+    for wanted in prefix.chars() {
+        while let Some(end) = sgr_len(text) {
+            text = &text[end..];
+        }
+        let got = text.chars().next()?;
+        if got != wanted {
+            return None;
+        }
+        text = &text[got.len_utf8()..];
+    }
+    Some(text)
+}
+
+const BOLD_START: &str = "\u{1b}[1m";
+const BOLD_END: &str = "\u{1b}[22m";
 
 /// What a `/model` or `/fast` result row says of the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -454,36 +513,37 @@ enum ModelResultKind {
 
 /// A model result row, read ([`model_result_of`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ModelResult {
+struct ModelResult<'a> {
     kind: ModelResultKind,
     /// The model as the row spells it, quotes off (`Opus 5.5 (default)`).
-    display: Option<String>,
+    /// Keep the complete text until [`model_name`] validates it.
+    display: Option<Cow<'a, str>>,
     /// The level a `` with `<level>` effort `` clause after it names, as written.
-    effort: Option<String>,
+    effort: Option<&'a str>,
 }
 
 /// The model a result quotes (in backticks, or bold), and what follows it.
-fn quoted_display(rest: &str) -> Option<(String, &str)> {
+fn quoted_display(rest: &str) -> Option<(&str, &str)> {
     let (display, after) = if let Some(quoted) = rest.strip_prefix('`') {
         let end = quoted.find('`')?;
         (&quoted[..end], &quoted[end + 1..])
     } else {
-        let bold = rest.strip_prefix("\u{1b}[1m")?;
-        let end = bold.find("\u{1b}[22m")?;
-        (&bold[..end], &bold[end + "\u{1b}[22m".len()..])
+        let bold = rest.strip_prefix(BOLD_START)?;
+        let end = bold.find(BOLD_END)?;
+        (&bold[..end], &bold[end + BOLD_END.len()..])
     };
-    Some((display.chars().take(80).collect(), after))
+    Some((display, after))
 }
 
-fn effort_clause(after: &str) -> Option<String> {
+fn effort_clause(after: &str) -> Option<&str> {
     let (_, rest) = after.split_once(" with `")?;
     let (level, tail) = rest.split_once('`')?;
-    tail.starts_with(" effort")
-        .then(|| level.chars().take(16).collect())
+    let keyword = tail.strip_prefix(' ')?;
+    (result_word(keyword) == "effort").then_some(level)
 }
 
 /// What a command result's `content` says of the model, when it is a model result.
-fn model_result_of(content: &str) -> Option<ModelResult> {
+fn model_result_of(content: &str) -> Option<ModelResult<'_>> {
     let body = content
         .trim_start()
         .strip_prefix(COMMAND_STDOUT)?
@@ -496,8 +556,8 @@ fn model_result_of(content: &str) -> Option<ModelResult> {
             let quoted = quoted_display(rest);
             return Some(ModelResult {
                 kind,
-                effort: quoted.as_ref().and_then(|(_, after)| effort_clause(after)),
-                display: quoted.map(|(display, _)| display),
+                effort: quoted.and_then(|(_, after)| effort_clause(after)),
+                display: quoted.map(|(display, _)| Cow::Borrowed(display)),
             });
         }
     }
@@ -506,9 +566,19 @@ fn model_result_of(content: &str) -> Option<ModelResult> {
     if lead.encode_utf16().count() > FAST_ON_LEAD {
         return None;
     }
+    let display = quoted_display(model)
+        .map(|(display, _)| Cow::Owned(display.to_owned()))
+        .or_else(|| {
+            let mut original = after_sgr_prefix(after_sgr_prefix(body, lead)?, FAST_ON_MODEL_SET)?;
+            while !original.starts_with(BOLD_START) {
+                let end = sgr_len(original)?;
+                original = &original[end..];
+            }
+            quoted_display(original).map(|(display, _)| strip_sgr(display))
+        });
     Some(ModelResult {
         kind: ModelResultKind::FastOn,
-        display: quoted_display(model).map(|(d, _)| d),
+        display,
         effort: None,
     })
 }
@@ -557,20 +627,14 @@ fn past_key(text: &str) -> Option<&str> {
         .map(|_| &text[TOP_EFFORT_KEY.len()..])
 }
 
-/// The key's state a level result's last ` · <Key> on|off` states.
+/// The key's state a level result's last ` · <Key> on|off` states (2.1.304).
 fn key_suffix(body: &str) -> Option<bool> {
     let (_, last) = body.rsplit_once(" \u{b7} ")?;
-    let rest = past_key(last)?;
-    let word = |w: &str| {
-        rest.strip_prefix(w)
-            .is_some_and(|after| !after.starts_with(|c: char| c.is_ascii_alphanumeric()))
-    };
-    if word(KEY_SUFFIX_ON) {
-        Some(true)
-    } else if word(KEY_SUFFIX_OFF) {
-        Some(false)
-    } else {
-        None
+    let rest = past_key(last)?.strip_prefix(' ')?;
+    match result_word(rest) {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -594,12 +658,19 @@ fn effort_result(content: &str) -> Option<EffortSaid> {
                 stays: level_word(after).0,
             });
         }
-        if rest.starts_with(KEY_NEEDS) || rest.starts_with(KEY_UNAVAILABLE) {
+        if rest
+            .strip_prefix(KEY_NEEDS_LEAD)
+            .is_some_and(|word| result_word(word) == "enabled")
+            || rest.starts_with(KEY_UNAVAILABLE)
+        {
             return Some(EffortSaid::Refused);
         }
     }
     let top = key_suffix(&body);
-    if body.starts_with(EFFORT_AUTO) {
+    if body
+        .strip_prefix(EFFORT_AUTO_LEAD)
+        .is_some_and(|word| result_word(word) == "auto")
+    {
         return Some(EffortSaid::Level {
             said: Said::Unread,
             top,
@@ -638,12 +709,17 @@ fn fold_result(content: &str, facts: &mut ModelFacts) -> Answered {
             .and_then(model_name)
             .map_or(Said::Unread, Said::Is);
         let readable = matches!(model, Said::Is(_));
-        facts.meet_model(model.clone());
-        if !facts.effort.decided() {
-            match (result.effort.as_deref(), model) {
-                (Some(word), _) => facts.state_level(word, false),
-                (None, Said::Is(to)) => facts.effort_for = Some(to),
-                (None, _) => facts.decide_effort(Said::Unread),
+        let effort_for = model
+            .shown()
+            .filter(|_| result.effort.is_none() && !facts.effort.decided())
+            .cloned();
+        facts.meet_model(model);
+        if let Some(word) = result.effort {
+            facts.state_level(word, false);
+        } else if !facts.effort.decided() {
+            match effort_for {
+                Some(to) => facts.effort_for = Some(to),
+                None => facts.decide_effort(Said::Unread),
             }
         }
         return Answered {
@@ -682,52 +758,56 @@ fn command_text<'a>(kind: Option<&str>, row: &'a Value) -> Option<&'a str> {
 
 /// What the rows of a transcript tail say about the model, the effort and the
 /// key, counting only rows stamped at `since_ms` or later (every row when
-/// `None`): newest first, stopping once nothing older can change them.
+/// `None`): newest first, down to the floor when one is given.
 #[must_use]
 pub fn tail_facts(tail: &str, since_ms: Option<u64>) -> ModelFacts {
-    scan(tail.as_bytes(), since_ms, false, true).0
+    scan(tail.as_bytes(), since_ms, false).0
 }
 
 /// [`tail_facts`] of the rows in `rows`, and whether the scan stopped at a row
 /// from before `since_ms` (the conversation was there before: one the process
-/// took up). `chose` is a choice of the model already known, which a scan
-/// then does not read back to the floor for. `fresh` is a read of a tail, not
-/// of rows just appended: there every stamped row counts for the floor, not
-/// only one whose words can matter, so a conversation taken up whose newest
-/// rows say nothing of the model (a run of queue rows) is still told from a
-/// new one. An appended row is new, so there only the rows that are parsed
-/// anyway are asked. A row that is not UTF-8 is skipped.
-fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool, fresh: bool) -> (ModelFacts, bool) {
+/// took up). `chose` comes only from the conversation-entry facts. Every
+/// stamped row counts for the floor, even after the visible facts are
+/// settled: their entry baseline still depends on whether this is a resume.
+/// A row that is not UTF-8 is skipped.
+fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool) -> (ModelFacts, bool) {
     let mut facts = ModelFacts {
         chose,
         ..ModelFacts::default()
     };
     let mut under = Answered::default();
     for raw in rows.rsplit(|&b| b == b'\n') {
-        if facts.settled() {
+        if facts.settled() && since_ms.is_none() {
             break;
         }
+        // A result belongs only to the row immediately above it. An
+        // intervening row consumes that adjacency even when it states no facts.
+        let answered = std::mem::take(&mut under);
         let Some(line) = std::str::from_utf8(raw).ok().filter(|l| !l.is_empty()) else {
             continue;
         };
-        let command = line.contains(COMMAND_STDOUT) || line.contains(COMMAND_NAME);
+        // Unicode escapes can hide these markers or keys; basic escapes
+        // cannot. Keep such rows until their decoded fields decide what they state.
+        let escaped = line.contains(r"\u");
+        let command = escaped || line.contains(COMMAND_STDOUT) || line.contains(COMMAND_NAME);
         let model_open = !facts.model.decided() || facts.effort_for.is_some();
         let answer = line.contains("\"assistant\"");
+        let has_effort = line.contains("\"effort\"");
         let wants_model = model_open && (command || answer || line.contains(API_REQUEST));
-        let wants_effort = !facts.effort.decided() && (command || line.contains("\"effort\""));
-        // The key's own rows and an `/effort` result state the key. A session
-        // that never used the key states nothing, so an answer is read for its
-        // stamp alone: the first one from before the floor ends the scan. A
-        // choice of the model is looked for the same way.
-        let wants_key = !facts.key.decided() && (command || answer || line.contains(KEY_ROW));
+        let wants_effort = !facts.effort.decided() && (command || has_effort);
+        // Attachments, command results and effort fields may state the key
+        // independently of the level. Every stamped row also counts for the
+        // floor, and a model choice may still be found in an older row.
+        let wants_key =
+            !facts.key.decided() && (command || answer || has_effort || line.contains(KEY_ROW));
         let wants_choice = !facts.chose && (command || answer);
         let wanted = wants_model || wants_effort || wants_key || wants_choice;
-        let floor_only = fresh && since_ms.is_some() && line.contains("\"timestamp\"");
+        let floor_only = since_ms.is_some() && (escaped || line.contains("\"timestamp\""));
         if !(wanted || floor_only) {
             continue;
         }
         // A row cut short (the tail's first, or one still being written) does
-        // not parse, and changes nothing.
+        // not parse and states no facts.
         let Some(row) = json::parse(line) else {
             continue;
         };
@@ -756,7 +836,6 @@ fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool, fresh: bool) -> (ModelF
                 continue;
             }
             if content.starts_with(COMMAND_NAME) {
-                let answered = std::mem::take(&mut under);
                 if content.starts_with(MODEL_COMMAND) && !answered.model {
                     facts.meet_model(Said::Unread);
                     if !facts.effort.decided() {
@@ -790,7 +869,7 @@ fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool, fresh: bool) -> (ModelF
         // with, the moment it is sent, so the newest one stands until a newer
         // row says otherwise. A side query (a title, a compaction) may run on
         // another model, so only the main thread counts.
-        if kind == Some("api-request") {
+        if kind == Some(API_REQUEST) {
             if row.get("querySource").and_then(Value::as_str) != Some(MAIN_THREAD_QUERY) {
                 continue;
             }
@@ -803,7 +882,7 @@ fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool, fresh: bool) -> (ModelF
             {
                 facts.meet_model(Said::Is(model_display(model)));
             }
-            if !facts.effort.decided()
+            if (!facts.effort.decided() || !facts.key.decided())
                 && let Some(effort) = params
                     .and_then(|p| p.get("output_config"))
                     .and_then(|c| c.get("effort"))
@@ -824,10 +903,8 @@ fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool, fresh: bool) -> (ModelF
         {
             facts.meet_model(Said::Is(model_display(model)));
         }
-        // Only the conversation's own rows state the level: a row of a kind
-        // this reader does not know (a `progress` row of a subagent, say)
-        // changes nothing.
-        if !facts.effort.decided()
+        // A top-level effort field counts only on assistant, user and system rows.
+        if (!facts.effort.decided() || !facts.key.decided())
             && matches!(kind, Some("assistant" | "user" | "system"))
             && let Some(effort) = row
                 .get("effort")
@@ -840,10 +917,11 @@ fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool, fresh: bool) -> (ModelF
     (facts, false)
 }
 
-/// Epoch milliseconds of an RFC 3339 UTC stamp as Claude Code writes a row's
-/// `timestamp` (`2026-11-13T04:18:02.796Z`): `Z` only, with an optional
-/// fraction of 1 to 9 digits, cut to the millisecond. `None` for any other
-/// text and for a time before 1970.
+/// Epoch milliseconds of a supported RFC 3339 UTC row stamp
+/// (`2026-11-13T04:18:02.796Z`): `Z` only, seconds `00` through `59`, and an
+/// optional fraction of 1 to 9 digits, cut to the millisecond. Leap-second
+/// labels are unsupported rather than normalized. `None` for any other text
+/// or for a time before 1970.
 #[must_use]
 fn stamp_ms(text: &str) -> Option<u64> {
     let (&last, head) = text.as_bytes().split_last()?;
@@ -859,12 +937,7 @@ fn stamp_ms(text: &str) -> Option<u64> {
     let field = |from: usize, to: usize| stamp.get(from..to)?.iter().try_fold(0, push_digit);
     let (year, month, day) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
     let (hour, minute, second) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let millis = match fraction {
@@ -898,13 +971,21 @@ fn push_digit(value: u16, &digit: &u8) -> Option<u16> {
 }
 
 /// Days from 1970-01-01 to a civil date (Howard Hinnant's `days_from_civil`);
-/// `None` before 1970 and for a day 0.
+/// `None` before 1970 or for an invalid Gregorian month or day.
 fn days_from_civil(year: u16, month: u16, day: u16) -> Option<u64> {
-    let (year, month, day) = (u64::from(year), u64::from(month), u64::from(day));
-    // Year 0 is before 1970 in any month, and day 0 is no day.
-    if year == 0 || day == 0 {
+    let last_day = match month {
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    if year == 0 || !(1..=last_day).contains(&day) {
         return None;
     }
+    let (year, month, day) = (u64::from(year), u64::from(month), u64::from(day));
     let year = if month <= 2 { year - 1 } else { year };
     let era = year / 400;
     let year_of_era = year % 400;
@@ -935,15 +1016,6 @@ fn pins_model(args: &[OsString]) -> bool {
     crate::supervise::launch_argv(args).is_some_and(|argv| profile::pins_model(&argv))
 }
 
-/// The most bytes one look reads as an append to the rows read before; a
-/// larger growth is read as a fresh tail, and each fact that tail does not
-/// state is unread, since what it skips may have stated it.
-pub const MAX_APPEND_BYTES: u64 = 4 * 1024 * 1024;
-
-/// How many bytes before the end of the last read must be unchanged for an
-/// append to be read on top of it.
-const GUARD_BYTES: usize = 64;
-
 /// One transcript's file as a read found it: re-read only when one of these
 /// changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -973,36 +1045,6 @@ impl From<&std::fs::Metadata> for Stamp {
             len: meta.len(),
             modified: (meta.mtime(), meta.mtime_nsec()),
             changed: (meta.ctime(), meta.ctime_nsec()),
-        }
-    }
-}
-
-/// Where the last read of a transcript ended, so the next reads only what was
-/// appended since.
-#[derive(Clone, Copy, Debug)]
-struct Carry {
-    device: u64,
-    inode: u64,
-    /// Just past the last whole row read.
-    read_to: u64,
-    /// The [`GUARD_BYTES`] (fewer at the file's start) before `read_to`.
-    guard: [u8; GUARD_BYTES],
-    guard_len: usize,
-}
-
-impl Carry {
-    /// The carry of a read of `meta`'s file whose bytes `read` end at `read_to`.
-    fn at(meta: &std::fs::Metadata, read_to: u64, read: &[u8]) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-        let guard_len = read.len().min(GUARD_BYTES);
-        let mut guard = [0; GUARD_BYTES];
-        guard[..guard_len].copy_from_slice(&read[read.len() - guard_len..]);
-        Self {
-            device: meta.dev(),
-            inode: meta.ino(),
-            read_to,
-            guard,
-            guard_len,
         }
     }
 }
@@ -1049,7 +1091,7 @@ fn read_end(rows: &[u8]) -> usize {
 fn awaits_result(line: &[u8]) -> bool {
     let Some(line) = std::str::from_utf8(line)
         .ok()
-        .filter(|l| l.contains(COMMAND_NAME))
+        .filter(|l| l.contains(COMMAND_NAME) || l.contains(r"\u"))
     else {
         return false;
     };
@@ -1078,14 +1120,40 @@ struct SessionRead {
     lookup_after_ms: u64,
     /// The file as the last read found it.
     stamp: Option<Stamp>,
-    /// Where the last read ended.
-    carry: Option<Carry>,
+    /// Immutable facts from the conversation left; none for the first conversation.
+    base: Option<ModelFacts>,
+    /// Once a pre-entry row establishes a resume, removing it cannot undo
+    /// that entry evidence. New observations may still establish a resume.
+    resumed: bool,
+    /// The launch's model pin, asked only when this conversation reads as a resume.
+    pinned: Option<bool>,
     #[cfg(test)]
     lookups: usize,
     #[cfg(test)]
     reads: usize,
-    #[cfg(test)]
-    appends: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum History {
+    New,
+    Resumed,
+    Unread,
+}
+
+struct Snapshot {
+    facts: ModelFacts,
+    history: History,
+}
+
+impl Snapshot {
+    fn unread() -> Self {
+        let mut facts = ModelFacts::default();
+        facts.leave_unread();
+        Self {
+            facts,
+            history: History::Unread,
+        }
+    }
 }
 
 impl SessionRead {
@@ -1097,17 +1165,9 @@ impl SessionRead {
         }
     }
 
-    /// What the rows since this conversation's floor that this read is the
-    /// first to see say (the rows appended since the last read, or a fresh
-    /// tail), and whether they met a row from before the floor; `None` when
-    /// the transcript is not found or has not changed since the last read.
-    fn read(
-        &mut self,
-        config: &Path,
-        chose: bool,
-        now_ms: u64,
-        lookup_steps: &mut usize,
-    ) -> Option<(ModelFacts, bool)> {
+    /// One bounded replay of the current file version, or none when the file
+    /// is absent or unchanged. Unstable or unreadable observations are not cached.
+    fn read(&mut self, config: &Path, now_ms: u64, lookup_steps: &mut usize) -> Option<Snapshot> {
         if self.path.is_none() {
             if now_ms < self.lookup_after_ms {
                 return None;
@@ -1120,15 +1180,7 @@ impl SessionRead {
                 Ok(path) => self.path = path,
                 Err(_) => {
                     self.lookup_after_ms = now_ms.saturating_add(LOOKUP_RETRY_MS);
-                    return Some((
-                        ModelFacts {
-                            model: Said::Unread,
-                            effort: Said::Unread,
-                            key: Said::Unread,
-                            ..ModelFacts::default()
-                        },
-                        false,
-                    ));
+                    return Some(Snapshot::unread());
                 }
             }
             if self.path.is_none() {
@@ -1141,67 +1193,32 @@ impl SessionRead {
             // Gone, or no longer a regular file: looked up again.
             self.path = None;
             self.stamp = None;
-            self.carry = None;
             return None;
         };
         if self.stamp == Some(stamp) {
             return None;
         }
-        let (mut file, meta) = profile::open_transcript(path)?;
-        let read = match self.read_append(&mut file, &meta, chose) {
-            Some(read) => read,
-            None => self.read_fresh(&mut file, &meta, chose)?,
+        let Some((mut file, meta)) = profile::open_transcript(path) else {
+            self.stamp = None;
+            return Some(Snapshot::unread());
         };
-        self.stamp = Some(Stamp::from(&meta));
+        let before = Stamp::from(&meta);
+        let read = self.read_fresh(&mut file, &meta);
+        // These are observed bookends, not an atomic snapshot or proof that
+        // arbitrary concurrent writes were absent. Do not cache a known change.
+        if read.is_none()
+            || file.metadata().ok().as_ref().map(Stamp::from) != Some(before)
+            || Stamp::of(path) != Some(before)
+        {
+            self.stamp = None;
+            return Some(Snapshot::unread());
+        }
+        self.stamp = Some(before);
         #[cfg(test)]
         {
             self.reads += 1;
         }
-        Some(read)
-    }
-
-    /// The whole rows appended since the carried read (up to [`read_end`]),
-    /// or `None` where this is not that file grown by at most
-    /// [`MAX_APPEND_BYTES`] with the bytes before the carried end unchanged
-    /// (it is then read afresh).
-    fn read_append(
-        &mut self,
-        file: &mut std::fs::File,
-        meta: &std::fs::Metadata,
-        chose: bool,
-    ) -> Option<(ModelFacts, bool)> {
-        use std::os::unix::fs::MetadataExt as _;
-        let carry = self.carry?;
-        let len = meta.len();
-        if carry.device != meta.dev()
-            || carry.inode != meta.ino()
-            || len <= carry.read_to
-            || len - carry.read_to > MAX_APPEND_BYTES
-        {
-            return None;
-        }
-        let guard = carry.guard_len as u64;
-        let bytes = read_range(file, carry.read_to.checked_sub(guard)?, len)?;
-        if bytes.get(..carry.guard_len)? != &carry.guard[..carry.guard_len] {
-            return None;
-        }
-        let rows = &bytes[carry.guard_len..];
-        let end = carry.guard_len + read_end(&rows[..whole_rows(rows)]);
-        self.carry = Some(Carry::at(
-            meta,
-            carry.read_to + (end - carry.guard_len) as u64,
-            &bytes[..end],
-        ));
-        #[cfg(test)]
-        {
-            self.appends += 1;
-        }
-        Some(scan(
-            &bytes[carry.guard_len..end],
-            Some(self.floor_ms),
-            chose,
-            false,
-        ))
+        read
     }
 
     /// The whole rows of the file's last
@@ -1209,15 +1226,13 @@ impl SessionRead {
     /// row the window cuts is dropped. A window that starts past the file's
     /// start and meets no row from before the floor may have cut off a
     /// statement since the floor: each fact it does not state is unread.
-    fn read_fresh(
-        &mut self,
-        file: &mut std::fs::File,
-        meta: &std::fs::Metadata,
-        chose: bool,
-    ) -> Option<(ModelFacts, bool)> {
+    fn read_fresh(&self, file: &mut std::fs::File, meta: &std::fs::Metadata) -> Option<Snapshot> {
         let len = meta.len();
         let start = len.saturating_sub(profile::TRANSCRIPT_TAIL_BYTES);
         let bytes = read_range(file, start, len)?;
+        if bytes.len() as u64 != len - start {
+            return None;
+        }
         let end = read_end(&bytes[..whole_rows(&bytes)]);
         let from = if start == 0 {
             0
@@ -1227,14 +1242,46 @@ impl SessionRead {
                 .position(|&b| b == b'\n')
                 .map_or(end, |nl| nl.saturating_add(1))
         };
-        // A window with no row end in it starts mid-row: the next read is fresh too.
-        let read_to = start.saturating_add(end as u64);
-        self.carry = (start == 0 || end > 0).then(|| Carry::at(meta, read_to, &bytes[..end]));
-        let (mut facts, floored) = scan(&bytes[from..end], Some(self.floor_ms), chose, true);
+        let chose = self.base.as_ref().is_some_and(|base| base.chose);
+        let (mut facts, floored) = scan(&bytes[from..end], Some(self.floor_ms), chose);
         if start > 0 && !floored {
             facts.leave_unread();
         }
-        Some((facts, floored))
+        Some(Snapshot {
+            facts,
+            history: if floored {
+                History::Resumed
+            } else if start == 0 {
+                History::New
+            } else {
+                History::Unread
+            },
+        })
+    }
+
+    /// Replay only over facts from before this conversation; never over a
+    /// prior version of its own rows. Return whether the launch pin was asked.
+    fn replay(&mut self, snapshot: Snapshot, args: &[OsString]) -> (ModelFacts, bool) {
+        let Some(base) = &self.base else {
+            return (snapshot.facts, false);
+        };
+        if matches!(snapshot.history, History::Resumed) {
+            self.resumed = true;
+        }
+        let mut asked = false;
+        let older = match snapshot.history {
+            History::Unread => Snapshot::unread().facts,
+            History::New | History::Resumed if self.resumed => {
+                let pinned = base.chose
+                    || *self.pinned.get_or_insert_with(|| {
+                        asked = true;
+                        pins_model(args)
+                    });
+                base.clone().taken_up(pinned)
+            }
+            History::New | History::Resumed => base.clone(),
+        };
+        (snapshot.facts.over(older), asked)
     }
 }
 
@@ -1304,8 +1351,8 @@ impl Reader {
     /// Claude Code's config directory is `config`.
     ///
     /// The transcript is read again only when its length, modification time,
-    /// change time or identity moved, and then only the rows appended since
-    /// the last read where it grew. Another process (a pid, or a record
+    /// change time or identity moved. Every changed version replays one
+    /// bounded tail over its conversation-entry facts. Another process (a pid, or a record
     /// `startedAt`, other than the last) starts from nothing. A record that
     /// names another conversation is a `/clear` (a new conversation: every
     /// fact is kept) or a `/resume` (one with rows from before the switch:
@@ -1358,7 +1405,7 @@ impl Reader {
                 || before.effort != self.facts.effort
                 || before.key != self.facts.key
         });
-        let journal_line = if before.is_some() {
+        let journal_line = if facts_changed {
             let line = self.facts.journal_line();
             if line == self.line {
                 None
@@ -1397,13 +1444,27 @@ impl Reader {
             }
             None => SessionRead::new(id, started),
         };
-        let read = session.read(config, self.facts.chose, now_ms, lookup_steps);
+        let read = session.read(config, now_ms, lookup_steps);
+        let facts = read.map(|snapshot| self.replay(&mut session, snapshot, args));
         session.seen_ms = now_ms;
         self.session = Some(session);
-        let (tail, _) = read?;
-        let before = snapshot_before.then(|| self.facts.clone());
-        self.facts = tail.over(std::mem::take(&mut self.facts));
-        before
+        let facts = facts?;
+        let before = std::mem::replace(&mut self.facts, facts);
+        snapshot_before.then_some(before)
+    }
+
+    fn replay(
+        &mut self,
+        session: &mut SessionRead,
+        snapshot: Snapshot,
+        args: &[OsString],
+    ) -> ModelFacts {
+        let (facts, _asked) = session.replay(snapshot, args);
+        #[cfg(test)]
+        if _asked {
+            self.pin_asks += 1;
+        }
+        facts
     }
 
     /// The process moved from the conversation `left` into `id`.
@@ -1417,26 +1478,16 @@ impl Reader {
         lookup_steps: &mut usize,
     ) {
         let before = std::mem::take(&mut self.facts);
-        let carried = match left.read(config, before.chose, now_ms, lookup_steps) {
-            Some((said, _)) => said.over(before),
+        let carried = match left.read(config, now_ms, lookup_steps) {
+            Some(snapshot) => self.replay(&mut left, snapshot, args),
             None => before,
         };
         let mut entered = SessionRead::new(id, left.seen_ms.max(started));
-        let (tail, resumed) = entered
-            .read(config, carried.chose, now_ms, lookup_steps)
-            .unwrap_or_default();
-        self.facts = tail.over(if resumed {
-            let pinned = carried.chose || {
-                #[cfg(test)]
-                {
-                    self.pin_asks += 1;
-                }
-                pins_model(args)
-            };
-            carried.taken_up(pinned)
-        } else {
-            carried
-        });
+        entered.base = Some(carried.clone());
+        self.facts = match entered.read(config, now_ms, lookup_steps) {
+            Some(snapshot) => self.replay(&mut entered, snapshot, args),
+            None => carried,
+        };
         entered.seen_ms = now_ms;
         self.session = Some(entered);
     }

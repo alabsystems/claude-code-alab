@@ -59,6 +59,31 @@ fn strings_escape_and_unescape() {
     assert_eq!(string("héllo"), "\"héllo\"");
     let round = Json::parse(&Json::Str("tab\there \u{1F600}".into()).render()).unwrap();
     assert_eq!(round, Json::Str("tab\there \u{1F600}".into()));
+    let keyed = Json::Object(vec![("a\"b\n".into(), Json::Str("\\\u{1b}é".into()))]);
+    assert_eq!(keyed.render(), "{\n  \"a\\\"b\\n\": \"\\\\\\u001bé\"\n}");
+    assert_eq!(Json::parse(&keyed.render()), Ok(keyed));
+    let text = r#""prefix héllo 😀\nnext café 漢字\"tail\\end""#;
+    assert_eq!(
+        Json::parse(text),
+        Ok(Json::Str(
+            "prefix héllo 😀\nnext café 漢字\"tail\\end".into()
+        ))
+    );
+    for (end, _) in text.char_indices() {
+        assert!(Json::parse(&text[..end]).is_err(), "prefix ending at {end}");
+    }
+    for (bad, expected_offset) in [
+        ("\"é\\q\"", 5),
+        ("\"é\u{1}\"", 4),
+        ("\"é\\", 4),
+        ("\"é\\u12", 5),
+    ] {
+        let error = Json::parse(bad).expect_err("a malformed string");
+        let offset = error
+            .split_ascii_whitespace()
+            .find_map(|word| word.trim_end_matches(':').parse::<usize>().ok());
+        assert_eq!(offset, Some(expected_offset), "{bad:?}");
+    }
 }
 
 #[test]
@@ -85,10 +110,25 @@ fn malformed_documents_are_refused() {
     ] {
         assert!(Json::parse(bad).is_err(), "{bad:?} must be refused");
     }
-    let deep = format!("{}1{}", "[".repeat(100), "]".repeat(100));
-    assert!(Json::parse(&deep).is_err(), "nesting is bounded");
-    let fine = format!("{}1{}", "[".repeat(20), "]".repeat(20));
-    assert!(Json::parse(&fine).is_ok());
+}
+
+#[test]
+fn nesting_counts_containers_with_empty_and_scalar_leaves() {
+    for (open, close) in [("[", "]"), ("{\"child\":", "}")] {
+        let nested = |levels, leaf: &str| open.repeat(levels) + leaf + &close.repeat(levels);
+        for (leaf, levels) in [
+            ("null", DEPTH_MAX),
+            ("[]", DEPTH_MAX - 1),
+            ("{}", DEPTH_MAX - 1),
+        ] {
+            let accepted = Json::parse(&nested(levels, leaf)).expect("at the container bound");
+            assert_eq!(Json::parse(&accepted.render()), Ok(accepted));
+            assert!(
+                Json::parse(&nested(levels + 1, leaf)).is_err(),
+                "{open} ending in {leaf} past the container bound"
+            );
+        }
+    }
 }
 
 #[test]

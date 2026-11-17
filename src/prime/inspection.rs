@@ -33,11 +33,14 @@ pub(crate) enum Meaning {
 }
 
 fn env_true(value: &Json) -> bool {
-    let text = value.as_str().map_or_else(|| value.render(), str::to_owned);
-    matches!(
-        text.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    let text = match value {
+        Json::Str(text) | Json::Number(text) => text.trim(),
+        Json::Bool(value) => return *value,
+        Json::Null | Json::Array(_) | Json::Object(_) => return false,
+    };
+    ["1", "true", "yes", "on"]
+        .iter()
+        .any(|word| text.eq_ignore_ascii_case(word))
 }
 
 fn value<'a>(doc: &'a Json, key: &str) -> Option<&'a Json> {
@@ -54,20 +57,30 @@ pub(crate) fn settings_state(doc: &Json, hold_window: bool) -> Result<Vec<Settin
     if doc.get("env").is_some_and(|env| env.as_object().is_none()) {
         return Err("its env is not a JSON object".into());
     }
-    let efforts = efforts_set_by_hand(doc);
-    let effort = efforts
-        .iter()
-        .map(|(key, v)| format!("{} = {v}", settings_json::string(key)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rate = survey_rate_set_by_hand(doc);
+    let mut effort = String::new();
+    let mut has_efforts = false;
+    for (model, value) in manual_efforts(doc) {
+        if has_efforts {
+            effort.push_str(", ");
+        }
+        let key = model.map_or_else(
+            || "effortLevel".to_string(),
+            |model| format!("modelSettings.{model}.effortLevel"),
+        );
+        effort.push_str(&settings_json::string(&key));
+        effort.push_str(" = ");
+        effort.push_str(&value.render());
+        has_efforts = true;
+    }
+    let rate = survey_rate_set_by_hand(doc).map(Json::render);
     let survey_off = matches!(doc.get(SURVEY_RATE_KEY), Some(Json::Number(n)) if n.parse::<f64>().is_ok_and(|n| n == 0.0))
         || value(doc, CLAUDE_SURVEY_SWITCH).is_some_and(env_true);
     Ok(CLAUDE_DEFAULTS.iter().map(|&(key, want, meaning)| {
         let have = value(doc, key);
+        let expected = want.json();
         let state = match have {
             None if key == SURVEY_RATE_KEY && survey_off => DefaultState::Default,
-            None if held_default(key, !efforts.is_empty(), rate.is_some(), hold_window) => {
+            None if held_default(key, has_efforts, rate.is_some(), hold_window) => {
                 if CLAUDE_EFFORT_DEFAULTS.contains(&key) {
                     DefaultState::HeldForEffort(effort.clone())
                 } else if key == CLAUDE_SURVEY_SWITCH {
@@ -78,25 +91,24 @@ pub(crate) fn settings_state(doc: &Json, hold_window: bool) -> Result<Vec<Settin
             }
             None => DefaultState::Unset,
             Some(have) => {
-                let text = have.render();
-                if key == CLAUDE_TOP_EFFORT_KEY && have == &Json::Bool(true) && !efforts.is_empty() {
+                if key == CLAUDE_TOP_EFFORT_KEY && have == &Json::Bool(true) && has_efforts {
                     DefaultState::OverridesEffort(effort.clone())
                 } else if (key == CLAUDE_SURVEY_SWITCH && env_true(have))
-                    || have == &want.json()
+                    || have == &expected
                     || (key == SURVEY_RATE_KEY && matches!(have, Json::Number(n) if n.parse::<f64>().is_ok_and(|n| n == 0.0)))
                 {
                     DefaultState::Default
                 } else {
-                    DefaultState::Manual(text)
+                    DefaultState::Manual(have.render())
                 }
             }
         };
-        Setting { key, expected: want.json().render(), state, meaning }
+        Setting { key, expected: expected.render(), state, meaning }
     }).collect())
 }
 
 pub(crate) fn would_add(doc: &Json, hold_window: bool) -> bool {
-    let effort = !efforts_set_by_hand(doc).is_empty();
+    let effort = manual_efforts(doc).next().is_some();
     let rate = survey_rate_set_by_hand(doc).is_some();
     CLAUDE_DEFAULTS.iter().any(|(key, _, _)| {
         value(doc, key).is_none() && !held_default(key, effort, rate, hold_window)

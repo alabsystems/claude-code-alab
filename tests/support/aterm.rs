@@ -1556,8 +1556,6 @@ pub fn the_fake_aterms_info_reply_reads_through_the_roster_guard() {
     let current = ask(&mut connection, aterm::info_verb(&fake.sid));
     assert_eq!(current, INFO_CURRENT);
     assert!(aterm::rostered(&current));
-    assert!(aterm::child_proof_supported(&current));
-    assert!(aterm::child_start_supported(&current));
     fake.set_info("ERR usage: native-act");
     assert!(!aterm::rostered(&ask(
         &mut connection,

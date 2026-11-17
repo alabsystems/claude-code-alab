@@ -1,21 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The aterm client boundary: what a contract-3 claim says and what its replies
-//! mean.
+//! Pure aterm request/reply policy for local typed clients and protocol fixtures.
 //!
-//! This module holds the pure half of the contract-3 client
-//! (`docs/PLAN-stage-1-contract-3-client-2026-11-12.md`, sections 1 and 2): the
-//! request texts, the reply parsers and the safe-point judge. It performs no
-//! I/O; [`crate::aterm_wire`] carries the lines, and the supervisor's link
-//! (`src/supervise_link.rs`) is the one caller: inside an aterm tab it claims
-//! the `relaunch` and `upgrade` duties before the first vendor start and judges
-//! the safe point by aterm's `status` while that claim stands proven
-//! (docs/REFERENCE.md, "aterm supervision"). A [`Restart`] is handed to the
-//! supervisor, which makes it only under that claim and a fresh permission read
-//! ([`crate::relaunch::permitted`]). The "paired" own-image provider that
-//! preceded this client was removed on 2026-11-12 without ever having been
-//! activated.
+//! The supervisor's adapter (`src/supervise_link.rs`) delegates lifecycle claims,
+//! recovery and native child generations to [`alab_wire::link::Link`]. This module
+//! retains request texts, reply parsers and safe-point interpretation for the
+//! typed-client protocol fixtures. It performs no I/O; [`crate::aterm_wire`]
+//! supplies their bounded transport. Runtime lifecycle judgement uses the shared core.
 //!
 //! The rule a client of this boundary keeps:
 //!
@@ -45,6 +37,9 @@
 use std::fmt;
 use std::time::Duration;
 
+pub(crate) use alab_wire::claim::journal_word;
+pub use alab_wire::claim::{info_verb, policy_verb, status_verb};
+
 use crate::aterm_wire::{Fields, percent_decode, session_id};
 
 /// The aterm control contract this harness requires before it claims anything.
@@ -73,14 +68,6 @@ pub fn advertised_contract(policy_reply: &str) -> Option<u32> {
         .then_some(REQUIRED_CONTRACT)
 }
 
-/// Whether the host advertised this client's supported contract. An unknown newer
-/// contract alone does not imply support for this one. This is a capability check,
-/// not activation of the client.
-#[must_use]
-pub fn may_claim(advertised: Option<u32>) -> bool {
-    advertised == Some(REQUIRED_CONTRACT)
-}
-
 /// This harness's row on aterm's roster: the holder id, the atpkg package and
 /// the repository are one word (`aterm/crates/aterm-agent/src/harness/contract.rs`,
 /// `Row::id`).
@@ -95,7 +82,7 @@ const JOURNAL_WORD_MAX: usize = 64;
 
 /// One duty a contract-3 claim takes from aterm's built-in engine, every one
 /// aterm names, in its canonical order (`contract.rs`, `Scope`). A claim names
-/// only the duties a build performs (`SCOPES` in `src/supervise_link.rs`); the
+/// only the duties a build performs (`config()` in `src/supervise_link.rs`); the
 /// four typing duties are named here so that a typed write can say which one it
 /// performs ([`crate::typing`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -264,211 +251,6 @@ pub fn claim_verb(
     addressed(sid, &verb)
 }
 
-/// A direct vendor child's kernel lifetime, in the host's native birth units.
-/// This is identity evidence only: aterm still proves the child's image before
-/// allowing any built-in typing duty to use it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChildProof {
-    /// The direct child's process id, checked once when constructed.
-    pid: std::num::NonZeroU32,
-    /// Epoch microseconds on macOS; boot clock ticks on Linux.
-    birth: std::num::NonZeroU64,
-}
-
-impl ChildProof {
-    /// A native child target in the host's admitted pid and birth ranges.
-    #[must_use]
-    pub fn new(pid: u32, birth: u64) -> Option<Self> {
-        if pid <= 1 || pid > i32::MAX as u32 {
-            return None;
-        }
-        Some(Self {
-            pid: std::num::NonZeroU32::new(pid)?,
-            birth: std::num::NonZeroU64::new(birth)?,
-        })
-    }
-
-    /// The claim target for a fresh kernel observation, refusing invalid or
-    /// overflowing identities instead of substituting a wall-clock start time.
-    #[must_use]
-    pub fn from_identity(identity: &crate::procs::ChildIdentity) -> Option<Self> {
-        let birth = match identity.birth {
-            crate::procs::Birth::MacOs {
-                seconds,
-                microseconds,
-            } => {
-                if microseconds >= 1_000_000 {
-                    return None;
-                }
-                seconds
-                    .checked_mul(1_000_000)?
-                    .checked_add(u64::from(microseconds))?
-            }
-            crate::procs::Birth::Linux(ticks) => ticks,
-        };
-        Self::new(identity.pid, birth)
-    }
-}
-
-/// A contract-3 claim naming its current child, sent only when
-/// [`child_proof_supported`] negotiated the optional field. With no child the
-/// request remains byte-for-byte the original contract-3 claim.
-#[must_use]
-pub fn claim_child_verb(
-    sid: &str,
-    pid: u32,
-    scopes: &[Scope],
-    version: &str,
-    vendor: Option<&str>,
-    child: Option<&ChildProof>,
-) -> Option<String> {
-    let mut verb = claim_verb(sid, pid, scopes, version, vendor)?;
-    if let Some(child) = child {
-        verb.push_str(&format!(" child={}:{}", child.pid, child.birth));
-    }
-    Some(verb)
-}
-
-/// Whether one unambiguous host capability advertises the optional native
-/// child proof. An older, malformed or duplicated capability enables nothing.
-#[must_use]
-pub fn child_proof_supported(info_reply: &str) -> bool {
-    capability(info_reply, "child-proof=")
-}
-
-fn capability(info_reply: &str, key: &str) -> bool {
-    let mut words = info_reply.split_ascii_whitespace();
-    if words.next() != Some("OK") {
-        return false;
-    }
-    let mut advertised = None;
-    for word in words {
-        if let Some(value) = word.strip_prefix(key)
-            && advertised.replace(value).is_some()
-        {
-            return false;
-        }
-    }
-    advertised == Some("1")
-}
-
-/// Whether the host supports a pre-spawn output barrier as well as native child proof.
-#[must_use]
-pub fn child_start_supported(info_reply: &str) -> bool {
-    child_proof_supported(info_reply) && capability(info_reply, "child-start=")
-}
-
-/// Begin a new child lifetime before spawning it. This intentionally names no
-/// child: only a later native child tuple can finish the pending barrier.
-#[must_use]
-pub fn claim_child_start_verb(
-    sid: &str,
-    pid: u32,
-    scopes: &[Scope],
-    version: &str,
-    vendor: Option<&str>,
-    generation: u64,
-) -> Option<String> {
-    if generation == 0 {
-        return None;
-    }
-    let mut verb = claim_verb(sid, pid, scopes, version, vendor)?;
-    verb.push_str(&format!(" child-start={generation}"));
-    Some(verb)
-}
-
-/// Acknowledged pending authority, read back before a claimed fork. Duplicate
-/// authority fields, a scope set other than the claimed relaunch and upgrade
-/// duties, a named child or a missing proof never establish the barrier.
-#[must_use]
-pub fn child_start_pending(reply: &str, holder: &str, generation: u64) -> bool {
-    if generation == 0 {
-        return false;
-    }
-    let Ok(status) = Status::parse(reply) else {
-        return false;
-    };
-    let unique = |key: &str| {
-        let mut values = reply
-            .split_ascii_whitespace()
-            .filter_map(|word| word.strip_prefix(key));
-        let value = values.next()?;
-        values.next().is_none().then_some(value)
-    };
-    for key in [
-        "schema=",
-        "supervisor=",
-        "supervisor_proven=",
-        "supervisor_scope=",
-        "supervisor_revision=",
-        "supervisor_child_start=",
-        "supervisor_child=",
-    ] {
-        if unique(key).is_none() {
-            return false;
-        }
-    }
-    let Some(named) = unique("supervisor_scope=").and_then(|scopes| {
-        scopes
-            .split(',')
-            .map(Scope::from_word)
-            .collect::<Option<Vec<_>>>()
-    }) else {
-        return false;
-    };
-    status.held_by(holder)
-        && named.len() == 2
-        && named.contains(&Scope::Relaunch)
-        && named.contains(&Scope::Upgrade)
-        && status.takes(Scope::Relaunch)
-        && status.takes(Scope::Upgrade)
-        && status
-            .supervisor_revision
-            .is_some_and(|revision| revision > 0)
-        && unique("supervisor_child_start=") == Some(generation.to_string().as_str())
-        && unique("supervisor_child=") == Some("-")
-}
-
-/// The host's unique canonical child generation, including a completed bound
-/// child. Zero or an absent/malformed field carries no generation evidence.
-#[must_use]
-pub fn child_generation(reply: &str) -> Option<u64> {
-    let mut values = reply
-        .split_ascii_whitespace()
-        .filter_map(|word| word.strip_prefix("supervisor_child_start="));
-    let value = values.next()?;
-    if values.next().is_some() {
-        return None;
-    }
-    canonical_u64(value).filter(|value| *value > 0)
-}
-
-/// Finish or renew a particular child generation; old hosts receive the
-/// original child claim unchanged, and no guessed generation is added.
-#[must_use]
-pub fn claim_child_generation_verb(
-    sid: &str,
-    pid: u32,
-    scopes: &[Scope],
-    version: &str,
-    vendor: Option<&str>,
-    child: Option<&ChildProof>,
-    generation: Option<u64>,
-) -> Option<String> {
-    let mut verb = claim_child_verb(sid, pid, scopes, version, vendor, child)?;
-    if let Some(generation) = generation {
-        if generation == 0 {
-            return None;
-        }
-        verb.push_str(&format!(" child-start={generation}"));
-    }
-    Some(verb)
-}
-
-#[cfg(test)]
-#[path = "aterm_start_tests.rs"]
-mod start_tests;
-
 /// The release of process `pid`'s claim on session `sid`:
 /// `@<sid> meta unset supervisor holder=claude-code-alab@<pid>`. Naming the
 /// holder makes it a no-op against anyone else's claim
@@ -483,27 +265,6 @@ pub fn release_verb(sid: &str, pid: u32) -> Option<String> {
         sid,
         &format!("meta unset supervisor holder={}", holder(pid)),
     )
-}
-
-/// The read of session `sid`'s policy, `@<sid> harness policy`, answered by a
-/// [`Policy`]. `None` when `sid` is not a session ID.
-#[must_use]
-pub fn policy_verb(sid: &str) -> Option<String> {
-    addressed(sid, "harness policy")
-}
-
-/// The read of session `sid`'s status, `@<sid> status`, answered by a
-/// [`Status`]. `None` when `sid` is not a session ID.
-#[must_use]
-pub fn status_verb(sid: &str) -> Option<String> {
-    addressed(sid, "status")
-}
-
-/// The read-only roster question, `@<sid> native-act info`, whose reply
-/// [`rostered`] judges. `None` when `sid` is not a session ID.
-#[must_use]
-pub fn info_verb(sid: &str) -> Option<String> {
-    addressed(sid, "native-act info")
 }
 
 /// The roster guard: whether a `native-act info` reply names this harness's row
@@ -539,28 +300,6 @@ pub fn rostered(info_reply: &str) -> bool {
         rows.split(',')
             .any(|row| row.split_once(':') == Some(wanted))
     })
-}
-
-/// `value` as one journal word: ASCII graphic bytes kept, any other byte
-/// percent-encoded, cut at 64 bytes. An empty value reads `(empty)`, which no
-/// wire value spells.
-pub(crate) fn journal_word(value: &str) -> String {
-    if value.is_empty() {
-        return "(empty)".to_string();
-    }
-    let mut word = String::new();
-    for byte in value.bytes() {
-        let piece = if byte.is_ascii_graphic() && byte != b'%' {
-            char::from(byte).to_string()
-        } else {
-            format!("%{byte:02X}")
-        };
-        if word.len() + piece.len() > JOURNAL_WORD_MAX {
-            break;
-        }
-        word.push_str(&piece);
-    }
-    word
 }
 
 /// Why a reply could not be read as what was asked for. Its text is one journal
@@ -791,20 +530,6 @@ impl Policy {
             && matches!(
                 self.why.as_deref(),
                 Some("unhosted" | "disabled" | "headless" | "agent-off" | "autopilot-off")
-            )
-    }
-
-    /// Whether the policy is off by a setting a person can switch on again
-    /// while the session runs: `[harness] enabled` (`disabled`), the agent's
-    /// own switch (`agent-off`), or the session's Autopilot (`autopilot-off`).
-    /// Each is [`Policy::off_by_configuration`]; `unhosted` and `headless`
-    /// are facts of the window and stand.
-    #[must_use]
-    pub fn switched_off(&self) -> bool {
-        !self.effective
-            && matches!(
-                self.why.as_deref(),
-                Some("disabled" | "agent-off" | "autopilot-off")
             )
     }
 
@@ -1127,89 +852,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_child_proof_is_negotiated_once_and_invalid_capabilities_enable_nothing() {
-        assert!(child_proof_supported(
-            "OK native-act child-proof=1 own-image=claude-code-alab:upgrade"
-        ));
-        for reply in [
-            "OK own-image=claude-code-alab:upgrade",
-            "ERR child-proof=1",
-            "OKAY child-proof=1",
-            "OK child-proof=0",
-            "OK child-proof=01",
-            "OK child-proof=2",
-            "OK child-proof=1 child-proof=1",
-            "OK child-proof=1 child-proof=0",
-        ] {
-            assert!(!child_proof_supported(reply), "{reply}");
-        }
-        let child = ChildProof::new(123, 42_000_005).unwrap();
-        let old = claim_verb(SID, 4242, &[Scope::Upgrade], "0.2.0", Some("2.1.325")).unwrap();
-        assert_eq!(
-            claim_child_verb(SID, 4242, &[Scope::Upgrade], "0.2.0", Some("2.1.325"), None),
-            Some(old.clone())
-        );
-        assert_eq!(
-            claim_child_verb(
-                SID,
-                4242,
-                &[Scope::Upgrade],
-                "0.2.0",
-                Some("2.1.325"),
-                Some(&child)
-            ),
-            Some(format!("{old} child=123:42000005"))
-        );
-        for (pid, birth) in [(1, 1), (u32::MAX, 1), (123, 0)] {
-            assert!(ChildProof::new(pid, birth).is_none());
-        }
-    }
-
-    #[test]
-    fn child_claim_birth_keeps_native_units_and_refuses_overflow() {
-        let identity = |birth| crate::procs::ChildIdentity {
-            pid: 123,
-            parent: 42,
-            pgid: 42,
-            session: 42,
-            birth,
-            executable: crate::procs::Executable {
-                path: "/vendor/claude".into(),
-                device: 1,
-                inode: 2,
-            },
-        };
-        assert_eq!(
-            ChildProof::from_identity(&identity(crate::procs::Birth::MacOs {
-                seconds: 42,
-                microseconds: 5
-            })),
-            Some(ChildProof::new(123, 42_000_005).unwrap())
-        );
-        assert_eq!(
-            ChildProof::from_identity(&identity(crate::procs::Birth::Linux(42))),
-            Some(ChildProof::new(123, 42).unwrap())
-        );
-        for birth in [
-            crate::procs::Birth::MacOs {
-                seconds: u64::MAX,
-                microseconds: 0,
-            },
-            crate::procs::Birth::MacOs {
-                seconds: 42,
-                microseconds: 1_000_000,
-            },
-            crate::procs::Birth::Linux(0),
-        ] {
-            assert_eq!(ChildProof::from_identity(&identity(birth)), None);
-        }
-    }
-
-    #[test]
     fn an_older_policy_without_contracts_admits_no_claim() {
         let older = "OK gen=12 effective=on why=config continue=on land=off questions=on";
         assert_eq!(advertised_contract(older), None);
-        assert!(!may_claim(advertised_contract(older)));
     }
 
     #[test]
@@ -1222,9 +867,6 @@ mod tests {
         ] {
             assert_eq!(advertised_contract(reply), Some(3), "{reply}");
         }
-        assert!(may_claim(Some(3)));
-        assert!(!may_claim(Some(4)));
-        assert!(!may_claim(Some(2)));
         for reply in [
             "",
             "ERR contract=3",
@@ -1249,7 +891,7 @@ mod tests {
 
     #[test]
     fn recognizing_a_host_contract_alone_admits_no_claim() {
-        assert!(may_claim(advertised_contract("OK contract=2,3")));
+        assert_eq!(advertised_contract("OK contract=2,3"), Some(3));
         // The contract set is one of seven facts a policy must state, and the
         // policy one of three gates (with the roster and the proof read-back).
         assert_eq!(
