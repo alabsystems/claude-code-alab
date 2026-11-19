@@ -67,7 +67,8 @@ pub use claim::{
 };
 pub use config::{Config, ConfigError, EnvNames, HostedMark};
 pub use link::{
-    ChildStart, Drained, Facts, Failure, Link, NativeObservation, Reading, Relaunch, Verdict,
+    ChildStart, Drained, Facts, Failure, Link, ModelAck, NativeObservation, Reading, Relaunch,
+    Verdict,
 };
 pub use record::{Body, Decoded, Kind, LineError, Needs, Record, StreamReply};
 pub use run::{Run, RunError};

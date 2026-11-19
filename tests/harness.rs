@@ -43,7 +43,8 @@
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -77,6 +78,9 @@ const BUILD_3: u64 = 1_000_009_000_009_000_003;
 static SCENARIO_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
+    if let Some(socket) = std::env::var_os("FAKE_FOREGROUND_PEER") {
+        fake::run_foreground_peer(Path::new(&socket));
+    }
     folder_trust::entry();
     launch_host::signal_parent_entry();
     launch_query_entry::entry();
@@ -99,7 +103,7 @@ fn main() {
     assert_eq!(installed, 0);
     // The first plain word filters by substring, as before. `--skip NAME`
     // (libtest's spelling) leaves out the scenario of exactly that name and
-    // says so; publish/config.sh names the ones its gate leaves out, and why.
+    // reports it.
     let mut filter: Option<String> = None;
     let mut skips: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -182,6 +186,10 @@ fn main() {
         (
             "managed_option_values_stay_exact_and_keep_host_services",
             launch_host::managed_option_values_stay_exact_and_keep_host_services,
+        ),
+        (
+            "managed_model_relaunch_preserves_resume_and_host_services",
+            launch_host::managed_model_relaunch_preserves_resume_and_host_services,
         ),
         (
             "managed_host_services_share_the_exact_no_harness_boundary",
@@ -349,6 +357,10 @@ fn main() {
             the_journal_names_the_childs_model_effort_and_key,
         ),
         (
+            "the_c4_stream_reports_the_owned_childs_model_and_resends_it_on_reconnect",
+            the_c4_stream_reports_the_owned_childs_model_and_resends_it_on_reconnect,
+        ),
+        (
             "a_broken_stderr_does_not_lose_the_session",
             a_broken_stderr_does_not_lose_the_session,
         ),
@@ -441,6 +453,34 @@ fn main() {
             aterm_moves_on_aterms_word_over_what_the_tracker_calls_a_draft,
         ),
         (
+            "aterm_an_update_rechecks_the_conversation_after_the_safe_point",
+            aterm_an_update_rechecks_the_conversation_after_the_safe_point,
+        ),
+        (
+            "aterm_an_update_rechecks_the_build_after_the_safe_point",
+            aterm_an_update_rechecks_the_build_after_the_safe_point,
+        ),
+        (
+            "aterm_an_update_refuses_an_outside_build_link_after_the_safe_point",
+            aterm_an_update_refuses_an_outside_build_link_after_the_safe_point,
+        ),
+        (
+            "aterm_an_update_waits_if_the_job_loses_foreground_at_the_safe_point",
+            aterm_an_update_waits_if_the_job_loses_foreground_at_the_safe_point,
+        ),
+        (
+            "aterm_an_update_waits_for_foreground_after_the_child_exits",
+            aterm_an_update_waits_for_foreground_after_the_child_exits,
+        ),
+        (
+            "aterm_an_update_waiting_for_foreground_can_be_cancelled",
+            aterm_an_update_waiting_for_foreground_can_be_cancelled,
+        ),
+        (
+            "aterm_an_update_waits_for_foreground_lost_during_child_start",
+            aterm_an_update_waits_for_foreground_lost_during_child_start,
+        ),
+        (
             "aterm_holds_on_each_field_until_it_clears",
             aterm_holds_on_each_field_until_it_clears,
         ),
@@ -475,6 +515,14 @@ fn main() {
         (
             "aterm_a_record_removed_while_settling_is_not_a_crash",
             aterm_a_record_removed_while_settling_is_not_a_crash,
+        ),
+        (
+            "aterm_a_crash_requires_its_record_after_final_policy",
+            || assert_aterm_crash_requires_record(false),
+        ),
+        (
+            "aterm_a_crash_requires_its_record_after_child_start",
+            || assert_aterm_crash_requires_record(true),
         ),
         (
             "aterm_a_crash_is_passed_on_when_the_policy_forbids_a_relaunch",
@@ -531,6 +579,14 @@ fn main() {
         (
             "aterm_a_restart_request_waits_for_the_session_record",
             aterm_a_restart_request_waits_for_the_session_record,
+        ),
+        (
+            "aterm_a_model_restart_waits_and_preserves_the_selected_model",
+            aterm_a_model_restart_waits_and_preserves_the_selected_model,
+        ),
+        (
+            "aterm_a_restart_stays_bound_to_the_conversation_it_read",
+            aterm_a_restart_stays_bound_to_the_conversation_it_read,
         ),
         (
             "aterm_a_restart_request_is_ignored_under_a_drivers_hand_or_without_the_claim",
@@ -595,6 +651,22 @@ fn main() {
         (
             "aterm_a_signal_at_the_end_of_the_crash_pause_ends_the_harness",
             aterm_a_signal_at_the_end_of_the_crash_pause_ends_the_harness,
+        ),
+        (
+            "aterm_a_signal_during_crash_child_start_cancels_the_relaunch",
+            aterm_a_signal_during_crash_child_start_cancels_the_relaunch,
+        ),
+        (
+            "aterm_a_signal_during_update_child_start_cancels_the_relaunch",
+            || assert_aterm_move_child_start_cancellation(true, libc::SIGINT),
+        ),
+        (
+            "aterm_a_signal_during_restart_child_start_cancels_the_relaunch",
+            || assert_aterm_move_child_start_cancellation(false, libc::SIGTERM),
+        ),
+        (
+            "aterm_ctrl_z_during_restart_child_start_stops_the_job",
+            aterm_ctrl_z_during_restart_child_start_stops_the_job,
         ),
         (
             "aterm_a_policy_turned_off_quietly_is_released_at_a_look_and_claimed_again",
@@ -743,6 +815,36 @@ fn prefix_rel() -> &'static str {
     }
 }
 
+/// Copy a fixture to a new inode before any test can execute it.
+fn copy_fixture(source: &Path, dest: &Path) {
+    #[cfg(target_os = "macos")]
+    let cloned = {
+        use std::os::unix::ffi::OsStrExt as _;
+        let from = std::ffi::CString::new(source.as_os_str().as_bytes()).expect("source path");
+        let to = std::ffi::CString::new(dest.as_os_str().as_bytes()).expect("destination path");
+        // SAFETY: both paths are live NUL-terminated strings. clonefile creates
+        // an independent inode and refuses an existing destination.
+        unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) == 0 }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let cloned = false;
+    if !cloned {
+        let mut output = std::fs::File::create_new(dest).expect("create fixture image");
+        let mut input = std::fs::File::open(source).expect("open source fixture image");
+        std::io::copy(&mut input, &mut output).expect("copy fixture image");
+    }
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
+        .expect("make fixture image executable");
+    if cfg!(target_os = "macos") {
+        let sign = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(dest)
+            .output()
+            .expect("sign fixture image");
+        assert!(sign.status.success(), "sign {}: {sign:?}", dest.display());
+    }
+}
+
 /// A private world: a home with an atpkg store, a fake's control directory, a
 /// working directory, and the harness's state directory.
 struct Scenario {
@@ -805,13 +907,19 @@ impl Scenario {
     }
 
     fn add_build_of(&self, number: u64, version: Option<&str>, exe: &Path) {
+        self.add_build_with(number, version, |dest| {
+            // Darwin can assess a repeatedly linked inode using a different
+            // scenario's executable path. Give each launch its own inode.
+            if cfg!(target_os = "macos") || std::fs::hard_link(exe, dest).is_err() {
+                copy_fixture(exe, dest);
+            }
+        });
+    }
+
+    fn add_build_with(&self, number: u64, version: Option<&str>, prepare: impl FnOnce(&Path)) {
         let bin = self.store.join(number.to_string()).join("bin");
         std::fs::create_dir_all(&bin).expect("bin dir");
-        let dest = bin.join("claude");
-        if std::fs::hard_link(exe, &dest).is_err() {
-            std::fs::copy(exe, &dest).expect("copy exe");
-        }
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        prepare(&bin.join("claude"));
         let platform = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
         std::fs::write(
             self.store.join(format!("{number}.ready")),
@@ -1300,7 +1408,9 @@ fn refuses_a_build_atpkg_has_not_marked_ready() {
 
 fn refuses_to_exec_itself() {
     let s = Scenario::new("self");
-    s.add_build_of(BUILD_1, Some("9.9.1"), Path::new(HARNESS));
+    s.add_build_with(BUILD_1, Some("9.9.1"), |dest| {
+        std::fs::hard_link(HARNESS, dest).expect("link the exact running image");
+    });
     s.set_current(BUILD_1);
     let out = s.command(&[]).output().expect("run");
     assert_eq!(out.status.code(), Some(127), "{out:?}");
@@ -1381,7 +1491,7 @@ fn assert_ran_in_place(s: &Scenario, nth: usize, pid: i32, reason: &str, depth: 
 fn a_copy_of_the_harness_as_the_vendor_refuses_at_once() {
     let s = Scenario::new("self-copy");
     let copy = s.root.join("claude-alab-copy");
-    std::fs::copy(HARNESS, &copy).expect("copy the harness");
+    copy_fixture(Path::new(HARNESS), &copy);
     s.add_build_of(BUILD_1, Some("9.9.1"), &copy);
     s.set_current(BUILD_1);
     let (status, err) = run_on_pty(&s, s.command(&[]), Duration::from_secs(20));
@@ -1415,7 +1525,7 @@ fn a_copy_of_the_harness_as_the_vendor_refuses_at_once() {
 fn a_copy_of_the_harness_run_in_place_refuses_as_itself() {
     let s = Scenario::new("self-copy-in-place");
     let copy = s.root.join("claude-alab-copy");
-    std::fs::copy(HARNESS, &copy).expect("copy the harness");
+    copy_fixture(Path::new(HARNESS), &copy);
     s.add_build_of(BUILD_1, Some("9.9.1"), &copy);
     s.set_current(BUILD_1);
     let out = s.command(&[]).output().expect("run");
@@ -1790,12 +1900,32 @@ fn spawn_on_pty(
         }
         None => spawn_guarded(s, pty, cmd),
     };
-    assert!(
-        wait_until(Duration::from_secs(10), || !s.starts().is_empty()),
-        "the fake never started{}\n--- pty ---\n{}",
-        s.report(),
-        pty.output()
-    );
+    let started_or_ended = wait_until(Duration::from_secs(10), || {
+        !s.starts().is_empty() || claude_code_alab::sys::child_has_ended(pid)
+    });
+    // A start can be logged between the read above and observing the exit.
+    if s.starts().is_empty() {
+        let outcome = if started_or_ended {
+            "wrapper ended before the vendor start witness"
+        } else {
+            "timed out waiting for the vendor start witness"
+        };
+        let vendor = s.store.join("current/bin/claude");
+        let image = std::fs::metadata(&vendor).map(|meta| {
+            format!(
+                "device={} inode={} links={}",
+                meta.dev(),
+                meta.ino(),
+                meta.nlink()
+            )
+        });
+        panic!(
+            "{outcome}\nvendor image {}: {image:?}{}\n--- pty ---\n{}",
+            vendor.display(),
+            s.report(),
+            pty.output()
+        );
+    }
     (child, pid)
 }
 
@@ -2705,6 +2835,65 @@ fn the_journal_names_the_childs_model_effort_and_key() {
     end_session(&s, pid);
 }
 
+/// The real supervisor publishes facts from its fake vendor's transcript on
+/// the canonical stream. A fresh host gets its current snapshot without a
+/// second transcript edit. Both records must identify the same live child.
+fn the_c4_stream_reports_the_owned_childs_model_and_resends_it_on_reconnect() {
+    use alab_wire::{Body, ChildProcess, Config, Scope, fake::FakeAterm};
+
+    let s = Scenario::new("model-stream");
+    s.add_build(BUILD_1, Some("9.9.1"));
+    s.set_current(BUILD_1);
+    let project = s.home.join(".claude/projects/-scenario-work");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        project.join(format!("{SID}.jsonl")),
+        concat!(
+            r#"{"type":"assistant","timestamp":"2099-01-01T00:00:00.000Z","effort":"high","message":{"model":"claude-opus-5-5"}}"#,
+            "\n",
+            r#"{"type":"attachment","timestamp":"2099-01-01T00:00:01.000Z","attachment":{"type":"ultra_effort_enter"}}"#,
+            "\n",
+        ),
+    ).expect("transcript");
+    let config = Config::new(
+        "claude-code-alab",
+        "claude",
+        &[Scope::Relaunch, Scope::Upgrade],
+        VERSION,
+    )
+    .unwrap();
+    let fake = FakeAterm::for_harness("claude-model-stream", &config);
+    fake.serve_contracts(&[4]);
+    fake.serve_stream(true);
+    let pty = Pty::open();
+    let mut command = s.command(&["--alab-poll-ms=50"]);
+    command.envs(fake.env());
+    let (_child, pid) = spawn_on_pty(&s, &pty, command, None);
+    let child_pid = u32::try_from(await_record(&s, 0)).unwrap();
+    let child = ChildProcess::of(child_pid).expect("the owned child is still running");
+    let snapshots = || {
+        fake.stream_records().into_iter().filter(|record| {
+            matches!(&record.body, Body::Model { child: Some(bound), model: Some(model), effort: Some(effort), key: Some(true), offers, permission: None }
+                if *bound == child && model == "Opus 5.5" && effort == "high" && offers.is_empty())
+        }).count()
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || snapshots() >= 1),
+        "first model record{}",
+        s.report()
+    );
+    assert_eq!(fake.child(), child.word());
+    let applied = snapshots();
+    fake.restart();
+    assert!(
+        wait_until(Duration::from_secs(60), || snapshots() > applied),
+        "model record after reconnect{}",
+        s.report()
+    );
+    assert_eq!(fake.child(), child.word());
+    end_session(&s, pid);
+}
+
 fn a_broken_stderr_does_not_lose_the_session() {
     let s = Scenario::new("broken-stderr");
     // stderr is a pipe nobody reads any more: every write to it fails (EPIPE).
@@ -3161,7 +3350,7 @@ fn end_session(s: &Scenario, pid: i32) {
 fn aterm_native_child_target_follows_the_first_start_restarts_and_vendor_moves() {
     let s = Scenario::new("aterm-child-proof");
     let fake = rostered_aterm(&s);
-    fake.set_info(&format!("{INFO_ROSTERED} child-proof=1"));
+    fake.set_info_capabilities(&format!("{INFO_ROSTERED} child-proof=1"));
     let pty = Pty::open();
     let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
     let assert_child = |vendor: &str, child: i32| {
@@ -3201,6 +3390,11 @@ fn aterm_native_child_target_follows_the_first_start_restarts_and_vendor_moves()
         4,
         "one initial claim and one for each child"
     );
+    assert_eq!(
+        asked(&fake, "native-act info"),
+        0,
+        "the host answered the opt-in"
+    );
     end_session(&s, pid);
 }
 
@@ -3220,10 +3414,11 @@ fn aterm_claim_precedes_the_first_vendor_start() {
     fake.set_reply_delay(Duration::ZERO);
     let sent = fake.verbs_with_witness();
     assert_eq!(
-        sent.get(..4),
+        sent.get(..5),
         Some(
             &[
                 ("harness policy".to_string(), false),
+                ("native-act info capabilities=1".to_string(), false),
                 ("native-act info".to_string(), false),
                 (claim_text(pid, "9.9.1"), false),
                 ("status".to_string(), false),
@@ -3357,7 +3552,11 @@ fn aterm_without_the_roster_row_is_never_sent_a_claim() {
         "aterm-unrostered",
         |_| {},
         "unrostered",
-        &["harness policy", "native-act info"],
+        &[
+            "harness policy",
+            "native-act info capabilities=1",
+            "native-act info",
+        ],
     );
 }
 
@@ -3369,7 +3568,12 @@ fn aterm_claim_refused_busy_leaves_the_session_unclaimed() {
             fake.set_claim_reply("ERR busy supervisor=someone-else@77");
         },
         "claim reply=ERR:busy",
-        &["harness policy", "native-act info", "{claim}"],
+        &[
+            "harness policy",
+            "native-act info capabilities=1",
+            "native-act info",
+            "{claim}",
+        ],
     );
 }
 
@@ -3385,6 +3589,7 @@ fn aterm_claim_not_proven_is_released() {
         "unproven supervisor=claude-code-alab@{pid} supervisor_proven=0",
         &[
             "harness policy",
+            "native-act info capabilities=1",
             "native-act info",
             "{claim}",
             "status",
@@ -3452,6 +3657,319 @@ fn aterm_moves_on_aterms_word_over_what_the_tracker_calls_a_draft() {
     );
     assert_eq!(fake.holder(), Some(format!("claude-code-alab@{pid}")));
     end_session(&s, pid);
+}
+
+fn aterm_an_update_rechecks_the_conversation_after_the_safe_point() {
+    const SWITCHED: &str = "11111111-2222-3333-4444-555566667777";
+    let s = Scenario::new("aterm-move-record-changed");
+    let fake = rostered_aterm(&s);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_claim(&s, pid, "9.9.1");
+    let first = await_record(&s, 0);
+
+    // Change only the conversation. The original record still supplies the
+    // same idle state and timestamp when aterm is asked to judge the move.
+    let record = record_of(&s, first);
+    let staged = record.with_extension("json.staged");
+    let original = std::fs::read_to_string(&record).expect("session record");
+    let switched = original.replace(SID, SWITCHED);
+    assert_ne!(
+        switched, original,
+        "fixture must name the first conversation"
+    );
+    std::fs::write(&staged, switched).expect("stage the switched conversation");
+    fake.rename_before_reply("status", &staged, &record);
+    s.set_current(BUILD_2);
+
+    assert_aterm_update_reconsidered(&s, first, BUILD_2, SWITCHED, "changed-while-deciding");
+    end_session(&s, pid);
+}
+
+fn aterm_an_update_rechecks_the_build_after_the_safe_point() {
+    let s = Scenario::new("aterm-move-target-changed");
+    let fake = rostered_aterm(&s);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_claim(&s, pid, "9.9.1");
+    let first = await_record(&s, 0);
+
+    s.add_build(BUILD_3, Some("9.9.3"));
+    let staged = s.store.join("current.staged");
+    std::os::unix::fs::symlink(s.store.join(BUILD_3.to_string()), &staged)
+        .expect("stage the new current build");
+    fake.rename_before_reply("status", &staged, &s.store.join("current"));
+    s.set_current(BUILD_2);
+
+    assert_aterm_update_reconsidered(&s, first, BUILD_3, SID, "changed-while-deciding");
+    end_session(&s, pid);
+}
+
+fn aterm_an_update_refuses_an_outside_build_link_after_the_safe_point() {
+    let s = Scenario::new("aterm-move-target-outside");
+    let fake = rostered_aterm(&s);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_claim(&s, pid, "9.9.1");
+    let first = await_record(&s, 0);
+
+    // Keep the build number the same while taking its selector outside the
+    // store, after the harness pins an otherwise valid update plan.
+    let outside = s.root.join("outside").join(BUILD_2.to_string());
+    std::fs::create_dir_all(&outside).expect("outside build directory");
+    let current = s.store.join("current");
+    let staged = s.store.join("current.staged");
+    std::os::unix::fs::symlink(&outside, &staged).expect("stage the outside build link");
+    fake.rename_before_reply("status", &staged, &current);
+    s.set_current(BUILD_2);
+
+    let reconsidered = " wait changed-while-deciding\n";
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            let journal = s.journal();
+            journal.contains(reconsidered) || journal.contains(" end-for-update SIGTERM ")
+        }) && s.journal().contains(reconsidered),
+        "did not refuse the outside build link{}",
+        s.report()
+    );
+    assert_eq!(std::fs::read_link(&current).expect("current link"), outside);
+    assert!(
+        !got_term(&s) && s.starts().len() == 1 && record_of(&s, first).is_file(),
+        "{}",
+        s.report()
+    );
+
+    s.set_current(BUILD_2);
+    assert_aterm_update_reconsidered(&s, first, BUILD_2, SID, "changed-while-deciding");
+    end_session(&s, pid);
+}
+
+fn aterm_an_update_waits_if_the_job_loses_foreground_at_the_safe_point() {
+    let s = Scenario::new("aterm-move-foreground-changed");
+    let fake = rostered_aterm(&s);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_claim(&s, pid, "9.9.1");
+    let first = await_record(&s, 0);
+    command_logged(&s, "foreground-setup", "foreground-ready");
+
+    let staged = s.fake.join("foreground-command");
+    let receipt = s.fake.join("foreground-moved");
+    std::fs::write(&staged, "foreground-away").expect("stage foreground command");
+    fake.rename_before_reply_and_wait("status", &staged, &s.fake.join("command"), &receipt);
+    s.set_current(BUILD_2);
+
+    let background = " wait background\n";
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            let journal = s.journal();
+            journal.contains(background) || journal.contains(" end-for-update SIGTERM ")
+        }) && s.journal().contains(background),
+        "did not hold the update in the background{}",
+        s.report()
+    );
+    assert!(receipt.is_file(), "foreground change was never witnessed");
+    assert!(
+        !got_term(&s) && s.starts().len() == 1 && record_of(&s, first).is_file(),
+        "{}",
+        s.report()
+    );
+
+    command_logged(&s, "foreground-restore", "foreground-restored");
+    assert_aterm_update_reconsidered(&s, first, BUILD_2, SID, "background");
+    end_session(&s, pid);
+}
+
+fn connect_foreground_peer(s: &Scenario, fake: &FakeAterm) -> UnixStream {
+    // Use the existing private short directory so the socket path fits on
+    // Darwin as well as Linux.
+    let socket = fake.sock_dir.join("foreground.sock");
+    let listener = UnixListener::bind(&socket).expect("bind foreground controller");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking foreground listener");
+    s.put(
+        "foreground-socket",
+        socket.to_str().expect("fixture socket path"),
+    );
+    s.put("command", "foreground-peer");
+
+    let mut connected = None;
+    assert!(
+        wait_until(Duration::from_secs(60), || match listener.accept() {
+            Ok((stream, _)) => {
+                connected = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("accept foreground peer: {e}"),
+        }),
+        "foreground peer did not start{}",
+        s.report()
+    );
+    let stream = connected.expect("connected foreground peer");
+    stream
+        .set_nonblocking(false)
+        .expect("blocking foreground peer");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("foreground receipt hang detector");
+    stream
+}
+
+fn move_foreground(peer: &mut UnixStream, command: u8) {
+    peer.write_all(&[command]).expect("send foreground command");
+    let mut receipt = [0];
+    peer.read_exact(&mut receipt)
+        .expect("observe actual foreground change");
+    assert_eq!(receipt, [command]);
+}
+
+fn aterm_an_update_waits_for_foreground_after_the_child_exits() {
+    assert_update_foreground_wait(UpdateForegroundWait::BeforeExit);
+}
+
+fn aterm_an_update_waiting_for_foreground_can_be_cancelled() {
+    assert_update_foreground_wait(UpdateForegroundWait::Cancel);
+}
+
+fn aterm_an_update_waits_for_foreground_lost_during_child_start() {
+    assert_update_foreground_wait(UpdateForegroundWait::DuringBegin);
+}
+
+enum UpdateForegroundWait {
+    BeforeExit,
+    Cancel,
+    DuringBegin,
+}
+
+fn assert_update_foreground_wait(when: UpdateForegroundWait) {
+    let s = Scenario::new("aterm-update-childless-background");
+    let fake = rostered_aterm(&s);
+    fake.set_info(fake_aterm::INFO_CURRENT);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    let first = await_record(&s, 0);
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm reannounced vendor=9.9.1",
+    );
+    let mut peer = connect_foreground_peer(&s, &fake);
+    let claim = claim_text(pid, "9.9.2");
+    let begin = format!("{claim} child-start=2");
+    let begun_before_wait = if matches!(when, UpdateForegroundWait::DuringBegin) {
+        let staged = s.fake.join("foreground-staged");
+        let request = s.fake.join("foreground-request");
+        let receipt = s.fake.join("foreground-receipt");
+        std::fs::write(&staged, b"move foreground").expect("stage foreground request");
+        fake.rename_before_reply_and_wait(&begin, &staged, &request, &receipt);
+        std::thread::scope(|scope| {
+            let moved = scope.spawn(|| {
+                assert!(wait_until(Duration::from_secs(60), || request.is_file()));
+                move_foreground(&mut peer, b'a');
+                std::fs::write(&receipt, b"foreground moved").expect("record foreground change");
+            });
+            s.set_current(BUILD_2);
+            moved.join().expect("move foreground during child-start");
+        });
+        1
+    } else {
+        s.put("term", "ignore");
+        s.set_current(BUILD_2);
+        assert!(
+            wait_until(Duration::from_secs(60), || got_term(&s)),
+            "{}",
+            s.report()
+        );
+        move_foreground(&mut peer, b'a');
+        command_logged(&s, "exit:0", "exit 0");
+        0
+    };
+
+    let held = " replacement-wait foreground\n";
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            s.journal().contains(held) || s.starts().len() > 1
+        }) && s.journal().contains(held),
+        "replacement did not wait in the background{}",
+        s.report()
+    );
+    assert_eq!(
+        asked(&fake, &begin),
+        begun_before_wait,
+        "{:?}",
+        fake.verbs()
+    );
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
+    assert!(!record_of(&s, first).exists(), "{}", s.report());
+    assert!(
+        journal_at(&s, "end-for-update SIGTERM") < journal_at(&s, held),
+        "{}",
+        s.report()
+    );
+    if matches!(when, UpdateForegroundWait::Cancel) {
+        signal(pid, libc::SIGHUP);
+        assert_eq!(
+            wait_status(pid, Duration::from_secs(60)),
+            Some(Status::Signaled(libc::SIGHUP)),
+            "{}",
+            s.report()
+        );
+        assert_eq!(s.starts().len(), 1, "{}", s.report());
+        assert_eq!(asked(&fake, &begin), 0, "{:?}", fake.verbs());
+        assert!(
+            s.journal()
+                .contains(&format!(" replacement-cancelled signal={}\n", libc::SIGHUP)),
+            "{}",
+            s.report()
+        );
+        assert!(fake.holder().is_none(), "{}", s.report());
+    } else {
+        move_foreground(&mut peer, b'r');
+        drop(peer);
+        assert_ne!(await_record(&s, 1), first, "{}", s.report());
+        let starts = s.starts();
+        assert_eq!(starts.len(), 2, "{}", s.report());
+        assert_eq!(starts[1].build(), Some(BUILD_2), "{}", s.report());
+        assert_eq!(starts[1].args, ["--resume", SID], "{}", s.report());
+        let resumed = format!("{claim} child-start={}", 2 + begun_before_wait);
+        assert_eq!(asked(&fake, &resumed), 1, "{:?}", fake.verbs());
+        assert_eq!(asked(&fake, &begin), 1, "{:?}", fake.verbs());
+        end_session(&s, pid);
+    }
+    assert_eq!(
+        s.log().iter().filter(|line| *line == "signal TERM").count(),
+        1,
+        "{}",
+        s.report()
+    );
+}
+
+fn assert_aterm_update_reconsidered(
+    s: &Scenario,
+    first: i32,
+    build: u64,
+    session: &str,
+    wait: &str,
+) {
+    assert_ne!(await_record(s, 1), first, "{}", s.report());
+    let starts = s.starts();
+    assert_eq!(starts.len(), 2, "{}", s.report());
+    assert_eq!(starts[1].build(), Some(build), "{}", s.report());
+    assert_eq!(starts[1].args, ["--resume", session], "{}", s.report());
+    let reconsidered = journal_at(s, &format!(" wait {wait}\n"));
+    let acted = journal_at(
+        s,
+        &format!("end-for-update SIGTERM pid={first} session={session} target-build={build} "),
+    );
+    assert!(reconsidered < acted, "{}", s.report());
+    assert_eq!(
+        s.log().iter().filter(|line| *line == "signal TERM").count(),
+        1,
+        "{}",
+        s.report()
+    );
 }
 
 /// Every field aterm's safe point reads holds the move by name, one after the
@@ -3764,12 +4282,8 @@ fn aterm_policy_turned_off_releases_the_claim() {
     assert_eq!(claims_sent(&fake), 1, "{:?}", fake.verbs());
     assert!(!s.journal().contains("wait aterm"), "{}", s.report());
     fake.set_policy(POLICY_ON);
-    assert!(
-        wait_until(Duration::from_secs(10), || fake.holder()
-            == Some(format!("claude-code-alab@{pid}"))),
-        "no claim once the policy was on again{}",
-        s.report()
-    );
+    await_claim(&s, pid, "9.9.2");
+    assert_eq!(fake.holder(), Some(format!("claude-code-alab@{pid}")));
     assert_eq!(
         asked(&fake, &claim_text(pid, "9.9.2")),
         1,
@@ -4179,6 +4693,86 @@ fn aterm_a_record_removed_while_settling_is_not_a_crash() {
     );
 }
 
+fn assert_aterm_crash_requires_record(during_begin: bool) {
+    const SWITCHED: &str = "11111111-2222-3333-4444-555566667777";
+    let name = if during_begin {
+        "aterm-crash-record-child-start"
+    } else {
+        "aterm-crash-record-final-policy"
+    };
+    let s = Scenario::new(name);
+    let fake = rostered_aterm(&s);
+    fake.set_info(fake_aterm::INFO_CURRENT);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    let first = await_record(&s, 0);
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm reannounced vendor=9.9.1",
+    );
+
+    let record = record_of(&s, first);
+    let staged = record.with_extension("json.staged");
+    let begin = format!("{} child-start=2", claim_text(pid, "9.9.1"));
+    let before = asked(&fake, "status");
+    if during_begin {
+        let original = std::fs::read_to_string(&record).expect("session record");
+        let switched = original.replace(SID, SWITCHED);
+        assert_ne!(
+            switched, original,
+            "the fixture must name the first conversation"
+        );
+        std::fs::write(&staged, switched).expect("stage the switched conversation");
+        fake.rename_before_reply(&begin, &staged, &record);
+    } else {
+        // The first status lets the record settle and starts the pause.
+        // The second judges recovery when the pause is over.
+        fake.rename_before_nth_reply("status", 2, &record, &staged);
+    }
+    s.put("command", "crash:7");
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Exited(7)),
+        "{}",
+        s.report()
+    );
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
+    assert_eq!(staged.is_file(), !during_begin, "{}", s.report());
+    assert_eq!(
+        asked(&fake, &begin),
+        usize::from(during_begin),
+        "{:?}",
+        fake.verbs()
+    );
+    let statuses = if during_begin { 4 } else { 2 };
+    assert_eq!(
+        asked(&fake, "status") - before,
+        statuses,
+        "{:?}",
+        fake.verbs()
+    );
+    let journal = s.journal();
+    assert!(
+        journal.contains(" crash record-stands ")
+            && journal.contains(" crash-passed-on record-removed\n")
+            && !journal.contains(" crash-relaunch "),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        journal.contains(" relaunch child="),
+        during_begin,
+        "{}",
+        s.report()
+    );
+    assert!(
+        fake.holder().is_none(),
+        "the claim outlived the harness{}",
+        s.report()
+    );
+}
+
 /// `[harness] relaunch = false`: the crash is the session's end.
 fn aterm_a_crash_is_passed_on_when_the_policy_forbids_a_relaunch() {
     claimed_crash_is_passed_on(
@@ -4287,7 +4881,11 @@ fn aterm_a_crash_with_no_claim_ends_the_session_as_it_does_outside_aterm() {
     );
     assert_eq!(
         fake.verbs(),
-        ["harness policy", "native-act info"],
+        [
+            "harness policy",
+            "native-act info capabilities=1",
+            "native-act info",
+        ],
         "nothing was asked at the exit{}",
         s.report()
     );
@@ -4752,6 +5350,159 @@ fn aterm_a_restart_request_waits_for_the_session_record() {
     await_record(&s, 1);
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(s.starts().len(), 2, "{}", s.report());
+    end_session(&s, pid);
+}
+
+fn aterm_a_model_restart_waits_and_preserves_the_selected_model() {
+    let s = Scenario::new("aterm-restart-model");
+    let fake = rostered_aterm(&s);
+    let project = s.home.join(".claude/projects/-scenario-work");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        project.join(format!("{SID}.jsonl")),
+        format!(
+            "{{\"type\":\"permission-mode\",\"permissionMode\":\"plan\",\"sessionId\":\"{SID}\"}}\n"
+        ),
+    )
+    .expect("transcript");
+    s.put("record-hold", "");
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm_with(
+        &s,
+        &pty,
+        &fake,
+        40,
+        &[
+            "--model=sonnet",
+            "--name",
+            "kept",
+            "--permission-mode",
+            "default",
+        ],
+    );
+    await_claim(&s, pid, "9.9.1");
+    let first = s.starts()[0].pid;
+    assert!(!record_of(&s, first).exists(), "{}", s.report());
+    fake.event("restart cause=model model=opus[1m]");
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "aterm restart cause=model deferred no-record",
+    );
+    assert!(!got_term(&s), "{}", s.report());
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
+
+    std::fs::remove_file(s.fake.join("record-hold")).expect("release the record");
+    let replacement = await_record(&s, 1);
+    let resume = [
+        "--model",
+        "opus[1m]",
+        "--name",
+        "kept",
+        "--permission-mode",
+        "plan",
+        "--resume",
+        SID,
+    ];
+    assert_ne!(first, replacement, "{}", s.report());
+    assert_eq!(s.starts()[1].build(), Some(BUILD_1), "{}", s.report());
+    assert_eq!(s.starts()[1].args, resume, "{}", s.report());
+
+    fake.set_status("hand", Some("lease:driver@4"));
+    fake.event("restart cause=model model=haiku");
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "aterm restart cause=model ignored held hold=0 hand=lease:driver@4 human_ms=-",
+    );
+    command_logged(&s, "cont-fence", "cont-fence 0");
+    assert_eq!(s.starts().len(), 2, "{}", s.report());
+    assert_eq!(s.starts()[1].pid, replacement, "{}", s.report());
+    assert_eq!(
+        s.log().iter().filter(|line| *line == "signal TERM").count(),
+        1,
+        "{}",
+        s.report()
+    );
+
+    fake.set_status("hand", Some("-"));
+    fake.send_restart("asked");
+    let restarted_again = await_record(&s, 2);
+    assert_ne!(replacement, restarted_again, "{}", s.report());
+    assert_eq!(s.starts().len(), 3, "{}", s.report());
+    assert_eq!(s.starts()[2].build(), Some(BUILD_1), "{}", s.report());
+    assert_eq!(s.starts()[2].args, resume, "{}", s.report());
+    assert_eq!(
+        s.log().iter().filter(|line| *line == "signal TERM").count(),
+        2,
+        "{}",
+        s.report()
+    );
+    assert_eq!(wait_status(pid, Duration::ZERO), None);
+    end_session(&s, pid);
+}
+
+fn aterm_a_restart_stays_bound_to_the_conversation_it_read() {
+    const SWITCHED: &str = "11111111-2222-3333-4444-555566667777";
+    const CURRENT: &str = "22222222-3333-4444-5555-666677778888";
+    let s = Scenario::new("aterm-restart-record-changed");
+    let fake = rostered_aterm(&s);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    let first = await_record(&s, 0);
+    let path = record_of(&s, first);
+    let staged = path.with_extension("json.staged");
+    let original = std::fs::read_to_string(&path).expect("session record");
+    let switched = original.replace(SID, SWITCHED);
+    std::fs::write(&staged, &switched).expect("stage the switched conversation");
+    fake.rename_before_reply("harness policy", &staged, &path);
+    fake.send_restart("stall");
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm restart cause=stall ignored record-changed",
+    );
+    assert!(!got_term(&s) && s.starts().len() == 1, "{}", s.report());
+
+    // A temporarily unavailable policy also cannot carry an old request into
+    // a new conversation. Keep the host busy until the new record is in place.
+    fake.set_policy_reply(ATERM_BUSY);
+    fake.event("restart cause=model model=opus[1m]");
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm restart cause=model deferred aterm policy reply=ERR:aterm",
+    );
+    let current = switched.replace(SWITCHED, CURRENT);
+    std::fs::write(&staged, &current).expect("stage the current conversation");
+    std::fs::rename(&staged, &path).expect("switch while the request waits");
+    fake.clear_policy_reply();
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm restart cause=model ignored record-changed",
+    );
+    command_logged(&s, "cont-fence", "cont-fence 0");
+    assert!(!got_term(&s) && s.starts().len() == 1, "{}", s.report());
+
+    // A fresh request may use this conversation. A change in its activity
+    // during permission checking leaves the conversation identity intact.
+    std::fs::write(
+        &staged,
+        current.replace("\"status\":\"idle\"", "\"status\":\"busy\""),
+    )
+    .expect("stage the current conversation's activity");
+    fake.rename_before_reply("status", &staged, &path);
+    fake.send_restart("asked");
+    let replacement = await_record(&s, 1);
+    assert_ne!(replacement, first, "{}", s.report());
+    assert_eq!(s.starts()[1].args, ["--resume", CURRENT], "{}", s.report());
+    assert_eq!(
+        s.log().iter().filter(|line| *line == "signal TERM").count(),
+        1,
+        "{}",
+        s.report()
+    );
     end_session(&s, pid);
 }
 
@@ -5475,6 +6226,141 @@ fn aterm_a_signal_at_the_end_of_the_crash_pause_ends_the_harness() {
     );
 }
 
+/// Ctrl-C during the native C3 pre-spawn exchange cancels recovery after the
+/// host authorized it and gives back the claim with the crashed child's status.
+fn aterm_a_signal_during_crash_child_start_cancels_the_relaunch() {
+    let s = Scenario::new("aterm-crash-child-start-signal");
+    let fake = rostered_aterm(&s);
+    fake.set_info(fake_aterm::INFO_CURRENT);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_record(&s, 0);
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm reannounced vendor=9.9.1",
+    );
+
+    let begin = format!("{} child-start=2", claim_text(pid, "9.9.1"));
+    fake.signal_before_reply(&begin, pid, libc::SIGINT);
+    s.put("command", "crash:7");
+    let cancelled = format!(" crash-passed-on signal {}\n", libc::SIGINT);
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            let journal = s.journal();
+            journal.contains(&cancelled) || journal.contains(" crash-relaunch ")
+        }) && s.journal().contains(&cancelled),
+        "the signal did not cancel the relaunch{}",
+        s.report()
+    );
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Exited(7)),
+        "{}",
+        s.report()
+    );
+    assert_eq!(asked(&fake, &begin), 1, "{:?}", fake.verbs());
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
+    assert_eq!(asked(&fake, &release_text(pid)), 1, "{:?}", fake.verbs());
+    assert!(fake.holder().is_none(), "{}", s.report());
+}
+
+fn assert_aterm_move_child_start_cancellation(update: bool, sig: i32) {
+    let (scenario, next_vendor) = if update {
+        ("aterm-update-child-start-signal", "9.9.2")
+    } else {
+        ("aterm-restart-child-start-signal", "9.9.1")
+    };
+    let s = Scenario::new(scenario);
+    let fake = rostered_aterm(&s);
+    fake.set_info(fake_aterm::INFO_CURRENT);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_record(&s, 0);
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm reannounced vendor=9.9.1",
+    );
+
+    // The old vendor has already ended by the time the host gets this begin.
+    let begin = format!("{} child-start=2", claim_text(pid, next_vendor));
+    fake.signal_before_reply(&begin, pid, sig);
+    if update {
+        s.set_current(BUILD_2);
+    } else {
+        fake.event("restart cause=asked");
+    }
+
+    let mut status = None;
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            status = wait_status(pid, Duration::ZERO);
+            status.is_some() || s.starts().len() > 1
+        }),
+        "the replacement never reached a decision{}",
+        s.report()
+    );
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
+    assert_eq!(status, Some(Status::Signaled(sig)), "{}", s.report());
+    let journal = s.journal();
+    assert!(
+        journal.contains(&format!(" replacement-cancelled signal={sig}\n"))
+            && !journal.contains(" relaunch-failed ")
+            && !journal.contains(" relaunch-fallback"),
+        "{}",
+        s.report()
+    );
+    assert_eq!(asked(&fake, &begin), 1, "{:?}", fake.verbs());
+    assert_eq!(asked(&fake, &release_text(pid)), 1, "{:?}", fake.verbs());
+    assert!(fake.holder().is_none(), "{}", s.report());
+}
+
+fn aterm_ctrl_z_during_restart_child_start_stops_the_job() {
+    let s = Scenario::new("aterm-restart-child-start-tstp");
+    let fake = rostered_aterm(&s);
+    fake.set_info(fake_aterm::INFO_CURRENT);
+    s.add_build(BUILD_1, Some("9.9.1"));
+    s.set_current(BUILD_1);
+    let pty = Pty::open();
+    let mut cmd = s.command(&["--alab-poll-ms=40"]);
+    cmd.envs(fake.env());
+    // Keep the harness in the controller's session, where a stop signal can
+    // stop this private process group as it would a shell's job.
+    let (_child, pid) = spawn_grouped(&s, &pty, cmd);
+    let first = await_record(&s, 0);
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm reannounced vendor=9.9.1",
+    );
+
+    let begin = format!("{} child-start=2", claim_text(pid, "9.9.1"));
+    fake.signal_before_reply(&begin, pid, libc::SIGTSTP);
+    fake.event("restart cause=asked");
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Stopped),
+        "the job did not stop{}",
+        s.report()
+    );
+    assert_eq!(asked(&fake, &begin), 1, "{:?}", fake.verbs());
+    signal(-pid, libc::SIGCONT);
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(60)),
+        Some(Status::Continued),
+        "{}",
+        s.report()
+    );
+    // The kernel may have stopped the replacement before its first log row.
+    let second = await_record(&s, 1);
+    assert_ne!(second, first, "{}", s.report());
+    let starts = s.starts();
+    assert_eq!(starts.len(), 2, "{}", s.report());
+    assert_eq!(starts[1].args, ["--resume", SID], "{}", s.report());
+    end_session(&s, pid);
+}
+
 /// The policy with the session's own Autopilot off.
 fn autopilot_off() -> String {
     POLICY_ON.replace(
@@ -5902,7 +6788,6 @@ fn aterm_ctrl_z_during_the_launch_claim_stops_the_job() {
         "the job was not stopped{}",
         s.report()
     );
-    assert_eq!(s.starts().len(), 1, "{}", s.report());
     assert!(
         s.journal().contains(" signal passed-on TSTP\n")
             && s.journal().contains(" stopped following the child\n"),
@@ -5915,6 +6800,9 @@ fn aterm_ctrl_z_during_the_launch_claim_stops_the_job() {
         wait_status(pid, Duration::from_secs(10)),
         Some(Status::Continued)
     );
+    // The kernel can stop the child before the fixture records its start.
+    await_record(&s, 0);
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
     end_session(&s, pid);
 }
 
@@ -6633,6 +7521,54 @@ mod fake {
         }
     }
 
+    fn set_foreground(group: libc::pid_t) {
+        // SAFETY: fd 0 is this fixture's controlling PTY. The caller selects
+        // a live fixture group in the same private session.
+        // Both signal sets are initialized before use and the mask is restored.
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            let mut saved: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(libc::sigemptyset(&raw mut block), 0);
+            assert_eq!(libc::sigaddset(&raw mut block, libc::SIGTTOU), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block, &raw mut saved),
+                0
+            );
+            let changed = libc::tcsetpgrp(0, group);
+            let error = (changed != 0).then(std::io::Error::last_os_error);
+            let current = libc::tcgetpgrp(0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const saved, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(changed, 0, "set foreground group {group}: {error:?}");
+            assert_eq!(current, group, "foreground group did not change");
+        }
+    }
+
+    pub(super) fn run_foreground_peer(socket: &Path) -> ! {
+        let owner: libc::pid_t = std::env::var("FAKE_FOREGROUND_OWNER")
+            .expect("foreground owner")
+            .parse()
+            .expect("foreground group number");
+        assert!(owner > 0);
+        // SAFETY: getpgrp reads only this fixture's process group.
+        let peer = unsafe { libc::getpgrp() };
+        assert!(peer > 0 && peer != owner);
+        let mut stream = UnixStream::connect(socket).expect("connect foreground peer");
+        let mut command = [0];
+        while stream.read(&mut command).expect("read foreground command") != 0 {
+            let group = match command[0] {
+                b'a' => peer,
+                b'r' => owner,
+                _ => panic!("unknown foreground peer command"),
+            };
+            set_foreground(group);
+            stream.write_all(&command).expect("send foreground receipt");
+        }
+        std::process::exit(0);
+    }
+
     pub(super) fn run(dir: &Path) -> ! {
         let args: Vec<String> = std::env::args_os()
             .skip(1)
@@ -6724,6 +7660,7 @@ mod fake {
             handle(libc::SIGCONT);
         }
         let mut background: Vec<std::process::Child> = Vec::new();
+        let mut foreground_actor: Option<std::process::Child> = None;
         // While deaf, typed input waits unread in the terminal's input queue.
         let mut deaf = false;
         let session = args
@@ -6735,6 +7672,9 @@ mod fake {
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut continued = 0;
         loop {
+            if let Some(actor) = foreground_actor.as_mut() {
+                assert!(actor.try_wait().expect("foreground actor wait").is_none());
+            }
             let count = CONT.load(Ordering::Relaxed);
             if count != continued {
                 continued = count;
@@ -6830,6 +7770,53 @@ mod fake {
                         let _ = sh.wait();
                     }
                     log(dir, "bg-stopped");
+                } else if cmd == "foreground-setup" {
+                    assert!(tty && foreground_actor.is_none());
+                    assert!(claude_code_alab::sys::in_foreground(0));
+                    // The actor stays in this session and exits when its input
+                    // pipe closes, including if this vendor is killed.
+                    foreground_actor = Some(
+                        Command::new("/bin/cat")
+                            .process_group(0)
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .expect("foreground actor"),
+                    );
+                    log(dir, "foreground-ready");
+                } else if cmd == "foreground-peer" {
+                    assert!(tty && foreground_actor.is_none());
+                    assert!(claude_code_alab::sys::in_foreground(0));
+                    deaf = true;
+                    let socket = std::fs::read_to_string(dir.join("foreground-socket"))
+                        .expect("peer socket");
+                    // SAFETY: getpgrp reads only the vendor's current group.
+                    let owner = unsafe { libc::getpgrp() };
+                    foreground_actor = Some(
+                        Command::new(std::env::current_exe().expect("fixture executable"))
+                            .process_group(0)
+                            .env("FAKE_FOREGROUND_PEER", socket)
+                            .env("FAKE_FOREGROUND_OWNER", owner.to_string())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .expect("persistent foreground peer"),
+                    );
+                    // The controller owns the socket. It can restore the
+                    // foreground after the vendor exits, and EOF retires the peer.
+                } else if cmd == "foreground-away" {
+                    let actor = foreground_actor.as_ref().expect("foreground actor");
+                    deaf = true;
+                    set_foreground(child_pid(actor));
+                    std::fs::write(dir.join("foreground-moved"), b"").expect("foreground receipt");
+                } else if cmd == "foreground-restore" {
+                    let mut actor = foreground_actor.take().expect("foreground actor");
+                    // SAFETY: getpgrp reads only this fixture's process group.
+                    set_foreground(unsafe { libc::getpgrp() });
+                    assert!(actor.wait().expect("foreground actor exit").success());
+                    deaf = false;
+                    log(dir, "foreground-restored");
                 } else if cmd == "deaf" || cmd == "hear" {
                     deaf = cmd == "deaf";
                     log(dir, cmd);
@@ -7067,8 +8054,7 @@ fn inside_aterm_a_new_harness_build_is_held_and_never_probed() {
         let bin = program.join(build.to_string()).join("bin");
         std::fs::create_dir_all(&bin).expect("own bin");
         let exe = bin.join(claude_code_alab::self_image::COMMAND);
-        std::fs::copy(HARNESS, &exe).expect("copy the harness image");
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        copy_fixture(Path::new(HARNESS), &exe);
         std::fs::write(
             program.join(format!("{build}.ready")),
             format!(

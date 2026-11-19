@@ -11,6 +11,8 @@ const ROLE_HOST: &str = "ALAB_TEST_FOLDER_HOST";
 const ROLE_VENDOR: &str = "ALAB_TEST_FOLDER_VENDOR";
 const ROOT: &str = "ALAB_TEST_FOLDER_ROOT";
 const DRIVER: &str = "ALAB_TEST_FOLDER_DRIVER";
+const HOST_PROOF: &str = "host-proof";
+const VENDOR_PROOF: &str = "vendor-proof";
 
 fn mask() -> Vec<i32> {
     // SAFETY: initialized native output storage for this thread's mask.
@@ -124,12 +126,18 @@ pub(super) fn entry() {
         let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
         driver(&root);
     }
-    if !selected(ROLE_HOST) && !selected(ROLE_VENDOR) {
+    let host = selected(ROLE_HOST);
+    if !host && !selected(ROLE_VENDOR) {
         return;
     }
     let root = PathBuf::from(std::env::var_os(ROOT).expect("private folder fixture root"));
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if selected(ROLE_HOST) {
+    if args == ["--folder-proof"] {
+        let receipt = if host { HOST_PROOF } else { VENDOR_PROOF };
+        std::fs::write(root.join(receipt), b"native copied fixture body executed\n").unwrap();
+        std::process::exit(0);
+    }
+    if host {
         if args.starts_with(&["harness".into(), "launch-trust".into(), "gate".into()]) {
             event(&root, "gate");
             if let Some(sidecar) = std::env::var_os("ALAB_TEST_FOLDER_SIDECAR") {
@@ -167,14 +175,6 @@ pub(super) fn entry() {
             panic!("private token exec: {error}");
         }
         panic!("unexpected private host command: {args:?}");
-    }
-    if args == ["--folder-proof"] {
-        std::fs::write(
-            root.join("vendor-proof"),
-            b"native copied vendor body executed\n",
-        )
-        .unwrap();
-        std::process::exit(0);
     }
     if args.first().is_none_or(|arg| arg != "-p") {
         event(&root, "final-vendor");
@@ -310,6 +310,27 @@ pub(super) fn entry() {
     std::process::exit(0);
 }
 
+fn qualify_fixture(s: &Scenario, name: &str, role: &str, receipt: &str) -> PathBuf {
+    let image = s.root.join(name);
+    copy_fixture(&std::env::current_exe().unwrap(), &image);
+    let child = Command::new(&image)
+        .arg("--folder-proof")
+        .env(ROOT, &s.root)
+        .env(role, &image)
+        .process_group(0)
+        .spawn()
+        .expect("spawn native fixture proof");
+    s.guard_group(child_pid(&child));
+    assert_eq!(
+        reap(child, Duration::from_secs(60)),
+        Some(Status::Exited(0)),
+        "fixture proof for {}",
+        image.display()
+    );
+    assert!(s.root.join(receipt).is_file(), "missing {receipt}");
+    image
+}
+
 fn setup(name: &str) -> (Scenario, PathBuf, PathBuf) {
     let s = Scenario::new(name);
     // The launch folder is its own repository root. The harness keys trust by the nearest
@@ -317,45 +338,19 @@ fn setup(name: &str) -> (Scenario, PathBuf, PathBuf) {
     // asked to accept; a scenario under a checkout (Cargo's target folder inside the clone, as
     // `CHECK_CMD_DEFAULT` builds) would otherwise key the clone and never read its record.
     std::fs::create_dir(s.work.join(".git")).expect("the launch folder's repository root");
+    // These stateless images take their working paths and role inputs from each
+    // scenario. Prove each copied image ran before starting the real deadlines.
+    static HOST: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     static VENDOR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let image = VENDOR.get_or_init(|| {
-        let image = s.root.join("vendor-image");
-        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
-        if cfg!(target_os = "macos") {
-            let mut sign = Command::new("/usr/bin/codesign");
-            sign.args(["--force", "--sign", "-"])
-                .arg(&image)
-                .process_group(0);
-            let child = sign.spawn().unwrap();
-            s.guard_group(child_pid(&child));
-            assert_eq!(
-                reap(child, Duration::from_secs(60)),
-                Some(Status::Exited(0))
-            );
-        }
-        let mut proof = Command::new(&image);
-        proof
-            .arg("--folder-proof")
-            .env(ROOT, &s.root)
-            .env(ROLE_VENDOR, &image)
-            .process_group(0);
-        let child = proof.spawn().unwrap();
-        s.guard_group(child_pid(&child));
-        assert_eq!(
-            reap(child, Duration::from_secs(60)),
-            Some(Status::Exited(0))
-        );
-        assert!(s.root.join("vendor-proof").is_file());
-        image
-    });
+    let host = HOST.get_or_init(|| qualify_fixture(&s, "native-host", ROLE_HOST, HOST_PROOF));
+    let image =
+        VENDOR.get_or_init(|| qualify_fixture(&s, "vendor-image", ROLE_VENDOR, VENDOR_PROOF));
     s.add_build_of(BUILD_1, None, image);
     s.set_current(BUILD_1);
-    let host = s.root.join("native-host");
-    std::fs::hard_link(std::env::current_exe().unwrap(), &host).unwrap();
     let vendor = s.store.join(BUILD_1.to_string()).join("bin/claude");
     let config = s.root.join("selected-profile");
     std::fs::create_dir(&config).unwrap();
-    (s, host, vendor)
+    (s, host.to_path_buf(), vendor)
 }
 
 fn command(s: &Scenario, host: &Path, vendor: &Path, mode: &str) -> Command {

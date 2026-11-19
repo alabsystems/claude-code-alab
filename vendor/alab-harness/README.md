@@ -268,23 +268,19 @@ Tracker package HX-21 moved them out of aterm's supervisor and makes this
 crate their one copy: v0.8.0 took aterm's own crate whole, and aterm's swap
 deletes that crate and links a tag of this repository vendored under its own
 `vendor/alab-harness`, pinned by tree id (aterm's `vendor/alab-harness.pin`
-names the tag), while claude-code-alab takes aterm's relay of that copy. From
-then on aterm and every harness read these modules from one source.
+names the tag). Each harness pins its own copy from this repository.
 
 HX-21c added the pure halves of the deciders that judge what aterm probes:
 how much of the span a turn's done row counts the machine slept through
 (`sleeps`), what a git read on a line would load and run (`git_config`), and
-what Claude Code's Bash tool's shell starts with (`claude_code::shell_startup`,
-whose `ShellStartup::assemble` takes every reading as a `StartupInputs`).
+what Claude Code's Bash tool's shell starts with (`claude_code::shell_startup`).
+`ShellStartup::assemble_with` requests one snapshot at a time and stops at
+the first failure. `ShellStartup::assemble` accepts the same readings in
+`StartupInputs`.
 Claude Code's own facts sit in `claude_code`, and a decider asks an agent's
-facts through the `port::Agent` trait each harness implements. These three
-are not the one copy yet: aterm-agent still keeps its own whole `sleeps.rs`,
-`git_config.rs` and `shell_startup.rs`, pure halves included, and calls none
-of `sleeps`, `git_config` or `claude_code`. HX-21c's aterm half (its steps B5
-and B6) moves it onto them, keeping only the live halves, which read files,
-start git or read the clock, and hand their readings in. Until that lands, a
-fix to one of their rules is made in aterm-agent as well, and only
-aterm-agent's copy decides what aterm does.
+facts through the `port::Agent` trait each harness implements. The host reads
+files, starts Git and observes the clock. These modules decide what the
+observations mean. Tracker package HX-21c follows adoption in aterm.
 
 A decider takes its readings as data and returns its answer. The crate has no
 dependencies, no `unsafe` code and no input or output: its `clippy.toml`
@@ -293,9 +289,8 @@ network, the clock, sleep and another thread's channel, which aterm's census
 refused in these files before they moved. A caller passes what it read and
 the time it means.
 
-The modules aterm's crate held are edited here, and aterm and the harnesses
-take a change by a new tag; `sleeps`, `git_config` and `claude_code` are edited
-in both places until HX-21c's aterm half lands (above). v0.8.0 took aterm's
+The shared policy is edited here. A consumer takes a change by pinning its
+release tag. v0.8.0 took aterm's
 own crate whole (`crates/alab-policy` at aterm 6863e1006d47) in place of this
 crate's earlier copies of the same modules, which were a snapshot of aterm's
 supervisor at 7009299. As every move here did, it took two commits: a copy
@@ -692,7 +687,14 @@ it, and the stream's when aterm first answers `stream` (HX-15b1).
       the grammar of the claim word aterm builds from it (D7), so the
       Link's `reannounce` (HX-15k) is one `claim` record and a renewal on
       the stream keeps `supervisor_vendor=` and the claim's `login=`
-      current. The child is the claim's `ChildProcess`.
+      current. The child is the claim's `ChildProcess`. `model` carries the
+      same optional `child` object so aterm can match facts to the claimed
+      child even after a replay. An absent child still decodes, with no
+      identity for aterm to check. `Link::events` delivers exact model ACKs
+      with their sequence and `dropped` reason so a caller can distinguish
+      sending a snapshot from applying it. The retained ACKs are bounded and
+      cleared on reopen, since a new stream can reuse their numbers. An open's
+      `acked=` watermark gives no individual disposition.
     - A `restart` is read by the claim's `Restart` rules, so every record
       that reads maps to a `Restart`: a cause of 1 to 64 letters, digits,
       `-` and `_`; `to` and `home` together, only for `account` or
@@ -1056,6 +1058,12 @@ it, and the stream's when aterm first answers `stream` (HX-15b1).
       `the_default_contracts_are_three_and_four` pins the default; each link
       test has the default config claim at 3 in the same scene as its
       control.
+
+A client that opts into native child tracking asks for `native-act info capabilities=1`
+when it claims under contract 3. Older aterm parsers give an explicit native-act usage
+reply, and the client asks for the bare roster once. Other refusals, invalid capability
+fields and unavailable transport leave it unclaimed. Clients that use only the contract 3
+roster keep the bare request. Contract 4 does not read the roster.
 
 ## Build
 

@@ -270,6 +270,20 @@ impl Out {
         let _ = write!(self.line, "{number}");
     }
 
+    /// The optional child identity used in both claims and model records.
+    fn child(&mut self, child: Option<ChildProcess>) {
+        if let Some(ChildProcess { pid, start }) = child {
+            if !(2..=i32::MAX.unsigned_abs()).contains(&pid) || start == 0 {
+                self.fail(LineError::Malformed("child"));
+            }
+            self.key("child");
+            self.put_object(|out| {
+                out.number("pid", u64::from(pid));
+                out.number("start", start);
+            });
+        }
+    }
+
     /// A count from 1: a `seq`, or the `seq` another record names.
     fn count(&mut self, key: &'static str, number: u64) {
         if number == 0 {
@@ -387,16 +401,7 @@ impl Out {
                 vendor: vendor_version,
                 login,
             } => {
-                if let Some(ChildProcess { pid, start }) = *child {
-                    if !(2..=i32::MAX.unsigned_abs()).contains(&pid) || start == 0 {
-                        self.fail(LineError::Malformed("child"));
-                    }
-                    self.key("child");
-                    self.put_object(|out| {
-                        out.number("pid", u64::from(pid));
-                        out.number("start", start);
-                    });
-                }
+                self.child(*child);
                 if let Some(scope) = scope {
                     if !once(scope) {
                         self.fail(LineError::Repeated("scope"));
@@ -529,12 +534,14 @@ impl Out {
                 self.opt_number("resets_ms", *resets_ms);
             }
             Body::Model {
+                child,
                 model,
                 effort,
                 key,
                 offers,
                 permission,
             } => {
+                self.child(*child);
                 self.opt_text("model", model.as_ref());
                 self.opt_word("effort", effort.as_ref());
                 if let Some(key) = key {
@@ -1196,8 +1203,11 @@ fn takes(value: Option<Value<'_>>, unknown: &mut u32) -> Result<Vec<Kind>, LineE
     Ok(takes)
 }
 
-/// A `claim`'s `child`: `pid` and `start`, each once.
-fn child(value: Value<'_>, unknown: &mut u32) -> Result<ChildProcess, LineError> {
+/// The optional `child` object of a claim or model record.
+fn child(f: &mut Object<'_>, unknown: &mut u32) -> Result<Option<ChildProcess>, LineError> {
+    let Some(value) = f.take("child")? else {
+        return Ok(None);
+    };
     let mut fields = object(value).ok_or(LineError::Malformed("child"))?;
     let pid = fields
         .take("pid")?
@@ -1210,7 +1220,7 @@ fn child(value: Value<'_>, unknown: &mut u32) -> Result<ChildProcess, LineError>
         .and_then(ordinal)
         .ok_or(LineError::Malformed("child"))?;
     *unknown = unknown.saturating_add(fields.unknown());
-    Ok(ChildProcess { pid, start })
+    Ok(Some(ChildProcess { pid, start }))
 }
 
 /// The `0` or `1` of `hand`'s `hold`.
@@ -1354,10 +1364,7 @@ fn body(kind: Kind, f: &mut Object<'_>, unknown: &mut u32) -> Result<Body, LineE
             takes: takes(f.take("takes")?, unknown)?,
         },
         Kind::Claim => Body::Claim {
-            child: f
-                .take("child")?
-                .map(|value| child(value, unknown))
-                .transpose()?,
+            child: child(f, unknown)?,
             scope: f
                 .take("scope")?
                 .map(|value| scope(value, unknown))
@@ -1456,6 +1463,7 @@ fn body(kind: Kind, f: &mut Object<'_>, unknown: &mut u32) -> Result<Body, LineE
             resets_ms: optional("resets_ms", f.take("resets_ms")?, count)?,
         },
         Kind::Model => Body::Model {
+            child: child(f, unknown)?,
             model: optional("model", f.take("model")?, text)?,
             effort: optional("effort", f.take("effort")?, word)?,
             key: optional("key", f.take("key")?, flag)?,

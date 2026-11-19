@@ -215,9 +215,12 @@ fn native(
 }
 
 fn wait(child: &ProbeChild, until: Instant, writable: bool) -> io::Result<()> {
-    let left = until
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        // The phase loop handles expiry. Returning an I/O error here would
+        // discard a reply that admission already validated.
+        return Ok(());
+    }
     let mut fds = child
         .output_fds()
         .map(|fd| libc::pollfd {

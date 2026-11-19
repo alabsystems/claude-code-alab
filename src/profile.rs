@@ -83,6 +83,14 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// Whether both records name the same conversation in the same child.
+    pub(crate) fn same_child_conversation(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.started_at_ms == other.started_at_ms
+            && self.session_id == other.session_id
+            && self.cwd == other.cwd
+    }
+
     /// Parse a record, refusing one that lacks any field this harness relies on.
     ///
     /// # Errors

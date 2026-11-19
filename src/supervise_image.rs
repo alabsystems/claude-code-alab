@@ -1056,7 +1056,8 @@ impl Runtime {
             let facts = pending::Facts {
                 selected: Image::selected(&supervisor.setup.home),
                 moves_allowed,
-                child_unchanged: supervisor.child.identity.as_ref() == Some(&original.child)
+                child_unchanged: !supervisor.no_child()
+                    && supervisor.child.identity.as_ref() == Some(&original.child)
                     && procs::observe_child(&original.child)
                         .is_some_and(|seen| seen.state == ChildState::Live),
                 usable_budget: original
@@ -1436,14 +1437,14 @@ impl Runtime {
         for sig in pipe.wait(0) {
             match sig {
                 libc::SIGHUP | libc::SIGTERM => supervisor.pass_on(sig),
-                libc::SIGTSTP => supervisor.on_tstp(),
+                libc::SIGTSTP => supervisor.on_tstp(pipe),
                 libc::SIGCONT if supervisor.child.stopped => {
                     let _ = supervisor.signal_child(libc::SIGCONT);
                 }
                 _ => {}
             }
         }
-        supervisor.reap();
+        supervisor.reap(pipe);
         if supervisor.ending != Ending::None
             || supervisor.restart_deferred.is_some()
             || supervisor.moved.is_some()
@@ -2135,8 +2136,8 @@ impl Frame {
             }
             // The same owned terminal event is dispatched normally. No claim,
             // seal, live-adoption permission or replacement child is created.
-            if let Some(supervisor) = self.restored.as_mut() {
-                supervisor.reap();
+            if let (Some(supervisor), Some(pipe)) = (self.restored.as_mut(), self.pipe.as_ref()) {
+                supervisor.reap(pipe);
             }
             park(
                 "unreaped terminal event was not consumed",

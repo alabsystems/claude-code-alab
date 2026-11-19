@@ -112,7 +112,7 @@ uses the store and terminal itself, with no tap or account-service helper.
 The usage and account services still live in aterm; their invocation and the
 Claude launch policy now live in this repository.
 
-When aterm advertises native child proof and a pre-spawn barrier, the harness
+On a contract 3 host that advertises native child proof and a pre-spawn barrier, the harness
 announces a fresh generation before each initial start, restart, vendor update,
 and fallback. It confirms the pending claim before spawning and then binds the
 exact native child lifetime to that generation. A request reconnect retains a
@@ -122,8 +122,13 @@ unavailable or different native observation defers reclaim; the original owned
 child's confirmed end or the next explicit start boundary retires that knowledge.
 The pre-spawn status, begin and readback steps share one original 500 ms deadline.
 If that bounded exchange fails, it drops the claim and starts Claude without
-asserting authority; older hosts keep their existing launch behavior. Own-image
-transfer inside aterm remains unqualified.
+asserting authority; older hosts keep their existing launch behavior.
+
+On an admitted contract 4 stream, the harness announces the vendor child's
+kernel identity and sends the model name, effort level and top-effort key that
+its transcript states. It sends the current snapshot again when the stream
+reopens. The records identify their child so the host can refuse a replay
+from a replaced child. Own-image transfer inside aterm remains unqualified.
 
 The metadata-only `--alab-launches=<vendor-word>` and
 `--alab-leads=<vendor-word>` queries describe launch policy ownership and full
@@ -204,12 +209,12 @@ handoff is accepted.
 | Feature | Independent implementation | Structural cost | Remaining aterm ownership |
 |---|---|---|---|
 | First launch | [Launch policy](src/launch.rs) owns argument/default handling, renderer selection, update interception and usage/token helper invocation. | `launch --` execs the vendor in the same process and leaves no resident supervisor or poll loop. | Managed routing still needs the owner handoff; usage and account-token services remain in aterm. |
-| Relaunch and update | The [C3 adapter](src/supervise_link.rs) uses the canonical link for claims, policy, events, child generations and reconnects. Claude keeps its crash and replacement decisions. | Claim/reconnect state lives in the shared lifecycle machine. Eligible `run --` sessions retain a supervisor. | Existing lifecycle consumers remain for paths without those claims. Typing duties, walls and task state still belong to aterm; full leadership is not advertised. |
+| Relaunch and update | The [host link adapter](src/supervise_link.rs) uses the canonical link for claims, policy, events, child generations and reconnects. Claude keeps its crash and replacement decisions. | Claim/reconnect state lives in the shared lifecycle machine. Eligible `run --` sessions retain a supervisor. | Existing lifecycle consumers remain for paths without those claims. Typing duties, walls and task state still belong to aterm; full leadership is not advertised. |
 | Unset defaults | [Priming](src/prime.rs) owns Claude's settings schema and preserves selected effort, survey and compaction choices. | A direct operation on the explicitly selected files starts no vendor child. | The host initializer and its Claude defaults table remain until delegation is accepted. |
 | Legacy hook cleanup | [Cleanup](src/prime/legacy_hooks.rs) owns adapter matching and status-line restoration through the shared settings transaction code. | Nothing managed to remove means no lock or write; replaced bytes retain a backup. | The host's Claude settings editor and cleanup remain until the owner callback handoff is accepted. |
 | Read-only settings findings | [Inspection](src/inspect.rs) uses the same interpretation as priming and returns owner-authored findings. | Reads are bounded at 1 MiB for settings and 2 MiB for state; the response is at most 1 MiB. It creates no files. | Doctor still interprets Claude settings locally until it consumes the independent findings. |
-| Model, effort and key | The [transcript reader](src/model_facts.rs) keeps the three facts separate, including their unread states, across conversation changes. | Each changed transcript replays at most 256 KiB. An unchanged stamp skips payload reads. | These facts currently reach the journal only; host footer/display readers remain. |
-| Shared dependencies | The [canonical pin](vendor/alab-harness.pin) owns policy and wire together at v0.9.3. The [sealed projections](vendor/VENDORED) own only phase readers and agent names. | Canonical policy/link code is reused; screen readers are generated copies, with an independently chosen canonical pin. | The screen grammar is still produced by aterm. Moving that dependency out is part of the remaining extraction. |
+| Model, effort and key | The [transcript reader](src/model_facts.rs) keeps the three facts separate, including their unread states, across conversation changes and reports them on admitted contract 4 streams. | Each changed transcript replays at most 256 KiB. An unchanged stamp skips payload reads. | Aterm consumes the record when its build supports child-bound model records. Existing footer readers cover sessions without an applied record. |
+| Shared dependencies | The [canonical pin](vendor/alab-harness.pin) names the selected tag and tree for shared policy and wire. The [sealed projections](vendor/VENDORED) own only phase readers and agent names. | Canonical policy/link code is reused; screen readers are generated copies, with an independently chosen canonical pin. | The screen grammar is still produced by aterm. Moving that dependency out is part of the remaining extraction. |
 
 The [standalone implementation](src/supervise.rs) also includes signal and exit
 status forwarding, vendor-update fallback to the previous build, and self-update
@@ -247,8 +252,6 @@ Not done yet:
 * **A model changed with `/model`** comes back as the launch flags set it
   after an update or a crash relaunch; the journal names it, and nothing
   carries it.
-* **The model, effort and key reach only the journal.** aterm is not told
-  them until the harness interface's `model` record exists.
 * **Model transcript discovery is bounded.** One look may spend 4096 directory
   reads, including the read that proves enumeration ended. An incomplete,
   unreadable or ambiguous lookup leaves the facts unread and retries at most

@@ -412,3 +412,69 @@ fn the_readings_are_judged_in_the_order_read_made_them() {
     };
     assert!(ShellStartup::assemble(zsh_alone).is_ok());
 }
+
+#[test]
+fn a_refused_snapshot_stops_the_next_read() {
+    let mut reads = 0;
+    let snapshots = std::iter::from_fn(|| {
+        reads += 1;
+        assert_eq!(reads, 1, "a later snapshot was read");
+        Some((Kind::Zsh, SNAPSHOT.to_string(), Ok(String::new())))
+    });
+    let result = ShellStartup::assemble_with(
+        &[Kind::Zsh],
+        snapshots,
+        |_| panic!("worker environment was read"),
+        || panic!("settings were read"),
+        || panic!("zshenv was read"),
+        || panic!("bash environment was read"),
+    );
+    assert_eq!(
+        result,
+        Err(format!("{SNAPSHOT} is no shell snapshot this check reads"))
+    );
+    assert_eq!(reads, 1);
+}
+
+#[test]
+fn live_readings_stop_at_the_first_failed_observation_in_shell_order() {
+    let expected = ["snapshot", "snapshot", "worker", "settings", "bash", "zsh"];
+    for (failure, count) in [(Some("settings"), 4), (Some("bash"), 5), (None, 6)] {
+        let readings = std::cell::RefCell::new(Vec::new());
+        let observe = |name| {
+            readings.borrow_mut().push(name);
+            if Some(name) == failure {
+                Err(name.to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let kinds = [Kind::Bash, Kind::Zsh];
+        let snapshots = kinds.iter().map(|&kind| {
+            let text = observe("snapshot").map(|()| format!("# Snapshot file\n{CLAUDE_PART}\n"));
+            (kind, kind.name().to_string(), text)
+        });
+        let result = ShellStartup::assemble_with(
+            &kinds,
+            snapshots,
+            |var| {
+                if var == READER_ENV[0].0 {
+                    observe("worker").unwrap();
+                }
+                false
+            },
+            || observe("settings").map(|()| Vec::new()),
+            || observe("zsh").map(|()| (false, Vec::new())),
+            || observe("bash").map(|()| false),
+        );
+        assert_eq!(&*readings.borrow(), &expected[..count]);
+        match failure {
+            Some(name) => assert_eq!(result, Err(name.to_string())),
+            None => {
+                let state = result.expect("both shell snapshots were read");
+                assert!(!state.may_extended_glob());
+                assert!(!state.may_dot_glob());
+            }
+        }
+    }
+}

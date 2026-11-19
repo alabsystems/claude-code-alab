@@ -54,8 +54,9 @@
 //! text aterm gives a refused contract-4 claim is not designed yet; the fake's
 //! is its own.
 //!
-//! The optional C3 child protocol is enabled only when [`FakeAterm::set_info`]
+//! The optional C3 child protocol is enabled when [`FakeAterm::set_info_capabilities`]
 //! advertises `child-proof=1` and, for the pre-spawn barrier, `child-start=1`.
+//! The older parser's usage reply leaves the bare [`FakeAterm::set_info`] in use.
 //! The fake retains synthetic tuples and generation acknowledgements; explicit
 //! [`FakeAterm::set_child_live`] data models the old-child refusal. It reads no
 //! kernel identity and proves no process or output authority.
@@ -518,6 +519,8 @@ struct State {
     /// A whole reply sent in place of the `native-act info` line built from
     /// `rows`, when set.
     info_reply: Option<String>,
+    /// A reply to the opt-in roster request. By default the fake parses the older verb.
+    info_capabilities_reply: Option<String>,
     /// A whole reply sent in place of the subscription ACK, after which the
     /// connection is closed, when set.
     subscribe_reply: Option<String>,
@@ -865,7 +868,7 @@ impl State {
             word(claim.and_then(|claim| claim.words.version.as_ref())),
             word(claim.and_then(|claim| claim.words.vendor.as_ref())),
         ));
-        let mode = crate::c3_child::Mode::parse(&self.info()).unwrap_or_default();
+        let mode = self.child_mode();
         if mode != crate::c3_child::Mode::Absent {
             line.push_str(&format!(
                 " supervisor_child={}",
@@ -904,6 +907,17 @@ impl State {
         })
     }
 
+    /// What the fake's configured roster response advertises about C3 children.
+    fn child_mode(&self) -> crate::c3_child::Mode {
+        let mode = match self.info_capabilities_reply.as_deref() {
+            Some(crate::claim::INFO_CAPABILITIES_UNSUPPORTED) | None => {
+                crate::c3_child::Mode::parse(&self.info())
+            }
+            Some(reply) => crate::c3_child::Mode::parse(reply),
+        };
+        mode.unwrap_or_default()
+    }
+
     /// The scope words the roster row of `holder` (`<id>@<pid>`) allows, when
     /// its id is rostered.
     fn row_of(&self, holder: &str) -> Option<&[Scope]> {
@@ -926,7 +940,7 @@ impl State {
         let row = self.row_of(&words.holder);
         let served = self.served();
         let contract = words.contract.as_deref();
-        let mode = crate::c3_child::Mode::parse(&self.info()).unwrap_or_default();
+        let mode = self.child_mode();
         if contract == Some("3") {
             if mode != crate::c3_child::Mode::Absent
                 && words
@@ -1118,6 +1132,10 @@ impl State {
                 .unwrap_or_else(|| format!("OK gen={} {}", self.generation, self.policy_body()))
         } else if verb == "native-act info" {
             self.info()
+        } else if verb == crate::claim::INFO_CAPABILITIES {
+            self.info_capabilities_reply
+                .clone()
+                .unwrap_or_else(|| crate::claim::INFO_CAPABILITIES_UNSUPPORTED.to_string())
         } else if verb == "status" {
             self.status_reply
                 .clone()
@@ -1306,6 +1324,7 @@ impl FakeAterm {
             policy_reply: None,
             rows: Vec::new(),
             info_reply: None,
+            info_capabilities_reply: None,
             subscribe_reply: None,
             claim_reply: "OK".to_string(),
             release_reply: None,
@@ -1594,6 +1613,12 @@ impl FakeAterm {
     /// a claim is read against is still [`FakeAterm::set_row`]'s.
     pub fn set_info(&self, reply: &str) {
         lock(&self.state).info_reply = Some(reply.to_string());
+    }
+
+    /// Set the answer to `native-act info capabilities=1`. `None` restores
+    /// the older parser's unsupported-argument reply. The bare roster is separate.
+    pub fn set_info_capabilities(&self, reply: Option<&str>) {
+        lock(&self.state).info_capabilities_reply = reply.map(str::to_string);
     }
 
     /// Answer `native-act info` from the roster again, after

@@ -31,7 +31,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::claim::Restart;
+use crate::claim::{ReplyError, Restart};
 use crate::config::EnvNames;
 
 const MAX_TOKEN_BYTES: usize = 256;
@@ -742,6 +742,12 @@ impl Connection {
         let result = (|| {
             self.write_until(format!("{request}\n").as_bytes(), until)?;
             let header = self.line_until(until)?;
+            if header == "ERR" || header.starts_with("ERR ") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    ReplyError::refused(&header),
+                ));
+            }
             if header != "OK subscribe 1" {
                 return Err(invalid("subscription ACK must name exactly one target"));
             }

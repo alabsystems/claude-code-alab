@@ -358,12 +358,11 @@ fn adopt(fake: &FakeAterm, clock: &Clock) -> Link {
 }
 
 /// A harness image that took over a running child from an earlier image of
-/// itself has that image's duty: a claim aterm cannot make now, refused or
-/// unreachable, keeps the link lost and claimed again on the clock. A fresh
-/// launch also retries unavailable transport, but has no earlier claim or grace.
-/// NEGATIVE CONTROL: a permanent refusal still leaves a fresh launch absent.
+/// itself has that image's duty: a refusal before events or an unavailable
+/// connection keeps the link lost and claimed again on the clock. A fresh
+/// launch retries unavailable transport and ends absent on a roster refusal.
 #[test]
-fn an_adopted_child_keeps_its_claim_through_any_refusal() {
+fn an_adopted_child_retries_a_roster_refusal_or_unavailable_connection() {
     let mut clock = Clock::new();
     let fake = FakeAterm::for_harness("adopt", &config());
     let mut link = adopt(&fake, &clock);
@@ -977,7 +976,7 @@ fn a_launch_whose_subscription_aterm_refuses_is_absent_and_never_claims_again() 
     assert!(link.is_absent() && !link.claims() && !link.judges());
     let notes = link.take_notes();
     assert_eq!(notes.len(), 1);
-    assert!(notes[0].starts_with("aterm unclaimed events "), "{notes:?}");
+    assert_eq!(notes, ["aterm unclaimed events reply=ERR:denied"]);
     assert_eq!(fake.holder(), None);
     let claims = |verbs: &[String]| {
         verbs
@@ -1000,8 +999,186 @@ fn a_launch_whose_subscription_aterm_refuses_is_absent_and_never_claims_again() 
     assert!(link.take_notes().is_empty());
 
     fake.set_subscribe_reply(None);
-    let held = launch(&fake, &clock);
+    let mut held = launch(&fake, &clock);
     assert!(held.judges());
+    held.release(clock.now());
+
+    fake.set_subscribe_reply(Some("ERR denied"));
+    let adopted = adopt(&fake, &clock);
+    assert!(adopted.is_absent() && fake.holder().is_none());
+}
+
+#[test]
+fn a_permanent_subscription_refusal_ends_an_established_reclaim() {
+    for (contract, release_reply) in [(Contract::Three, Some("ERR busy")), (Contract::Four, None)] {
+        let config = config().with_contracts(&[contract]).unwrap();
+        let release = format!(
+            "meta unset supervisor holder={}",
+            config.holder(std::process::id())
+        );
+        let fake = FakeAterm::for_harness("reclaim-events-refused", &config);
+        let mut clock = Clock::new();
+        let mut link = launched(&fake, config, child(), clock.now());
+        assert!(link.judges());
+
+        fake.restart();
+        link.safe_point(Duration::ZERO, clock.now());
+        assert!(link.is_lost() && link.claims());
+        link.take_notes();
+        fake.set_subscribe_reply(Some("ERR denied"));
+        fake.set_release_reply(release_reply);
+        clock.pass(RECLAIM_EVERY_MS);
+        link.tick(child(), clock.now());
+
+        assert!(link.is_absent() && !link.claims());
+        assert_eq!(
+            link.take_notes(),
+            ["aterm unclaimed events reply=ERR:denied"]
+        );
+        eventually("the provisional claim released", || fake.holder().is_none());
+        let verbs = fake.verbs();
+        assert_eq!(
+            verbs
+                .iter()
+                .filter(|verb| verb.starts_with("meta set supervisor "))
+                .count(),
+            2
+        );
+        assert_eq!(verbs.iter().filter(|verb| **verb == release).count(), 1);
+        fake.set_subscribe_reply(None);
+        clock.pass(RECLAIM_EVERY_MS);
+        link.tick(child(), clock.now());
+        assert_eq!(fake.verbs(), verbs);
+        assert!(link.take_notes().is_empty());
+    }
+}
+
+#[test]
+fn a_refused_subscription_with_an_unreleased_c4_claim_keeps_fresh_grace() {
+    for exiting in [false, true] {
+        let config = config().with_contracts(&[Contract::Four]).unwrap();
+        let release = format!(
+            "meta unset supervisor holder={}",
+            config.holder(std::process::id())
+        );
+        let fake = FakeAterm::for_harness("reclaim-events-graced", &config);
+        fake.serve_stream(true);
+        fake.set_reexec_grace(true);
+        let mut clock = Clock::new();
+        let mut link = launched(&fake, config, child(), clock.now());
+        assert!(link.judges() && link.streaming());
+        settle_open(&fake, &mut link, clock.now());
+        let epoch = link.epoch().expect("the original epoch").to_owned();
+
+        fake.restart();
+        link.safe_point(Duration::ZERO, clock.now());
+        assert!(link.is_lost() && link.claims());
+        assert_eq!(link.epoch(), Some(epoch.as_str()));
+        assert!(link.send(title(), WALL, clock.now()).is_ok());
+        link.take_notes();
+        fake.set_subscribe_reply(Some("ERR denied"));
+        fake.set_release_reply(Some("ERR busy"));
+        clock.pass(REEXEC_GRACE_MS + 1);
+        link.tick(child(), clock.now());
+
+        assert!(link.is_lost() && link.claims() && !link.judges());
+        assert_eq!(link.epoch(), None);
+        assert_eq!(
+            link.send(title(), WALL, clock.now()),
+            Err(SendError::NoStream)
+        );
+        assert_eq!(
+            link.take_notes(),
+            [
+                "aterm unclaimed events reply=ERR:denied (release unconfirmed)",
+                "aterm stream-given-up records=1"
+            ]
+        );
+        eventually("the provisional claim in grace", || fake.in_grace());
+        let mut releases = fake
+            .requests()
+            .into_iter()
+            .filter(|(_, verb)| *verb == release);
+        let original = releases
+            .next()
+            .expect("the release on the claim connection")
+            .0;
+        let fallback = releases
+            .next()
+            .expect("the release on a fresh connection")
+            .0;
+        assert_ne!(original, fallback);
+        assert_eq!(releases.next(), None);
+
+        clock.pass(RECLAIM_EVERY_MS);
+        link.tick(child(), clock.now());
+        assert!(link.is_lost() && fake.in_grace());
+        fake.set_release_reply(None);
+        if exiting {
+            link.release(clock.now());
+        } else {
+            clock.pass(RECLAIM_EVERY_MS);
+            link.tick(child(), clock.now());
+        }
+        assert_eq!(fake.holder(), None);
+        assert!(link.is_absent());
+        assert_eq!(
+            fake.verbs().iter().filter(|verb| **verb == release).count(),
+            4
+        );
+        assert_eq!(
+            fake.verbs()
+                .iter()
+                .filter(|verb| verb.starts_with("meta set supervisor "))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn a_full_subscription_lane_releases_the_claim_and_retries_on_the_clock() {
+    let config = config();
+    let holder = config.holder(std::process::id());
+    let fake = FakeAterm::for_harness("events-retry", &config);
+    fake.set_subscribe_reply(Some("ERR subscription capacity busy; retry"));
+    let mut clock = Clock::new();
+    let mut link = launch(&fake, &clock);
+    assert!(link.is_lost() && !link.claims() && !link.judges());
+    assert_eq!(
+        link.take_notes(),
+        ["aterm unclaimed events reply=ERR:subscription"]
+    );
+    assert_eq!(fake.holder(), None);
+    assert_eq!(
+        fake.verbs().last(),
+        Some(&format!("meta unset supervisor holder={holder}"))
+    );
+
+    fake.set_subscribe_reply(None);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.judges());
+    assert_eq!(fake.holder().as_deref(), Some(holder.as_str()));
+    assert_eq!(fake.subscriptions(), 1);
+
+    fake.restart();
+    link.safe_point(Duration::ZERO, clock.now());
+    assert!(link.is_lost() && link.claims());
+    link.take_notes();
+    fake.set_subscribe_reply(Some("ERR subscription capacity busy; retry"));
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.is_lost() && link.claims() && fake.holder().is_none());
+    assert_eq!(
+        link.take_notes(),
+        ["aterm unclaimed events reply=ERR:subscription"]
+    );
+    fake.set_subscribe_reply(None);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.judges());
+    assert_eq!(fake.subscriptions(), 2);
 }
 
 /// A reply no client may read is an aterm this client cannot speak to, not a
@@ -1863,6 +2040,7 @@ fn await_stream(
         gathered.drained |= drained.drained;
         gathered.restart = drained.restart.or(gathered.restart);
         gathered.incoming.extend(drained.incoming);
+        gathered.model_acks.extend(drained.model_acks);
         gathered.hand = drained.hand.or(gathered.hand);
         gathered.policy = drained.policy.or(gathered.policy);
         gathered.fresh |= drained.fresh;
@@ -2673,13 +2851,22 @@ fn a_full_resend_keeps_under_aterms_budget_and_a_claim_dropped_for_the_rate_is_s
     );
     assert_eq!(link.counts().rate, 0);
 
+    assert!(!link.claim_in_flight());
     fake.drop_next_record(Dropped::Rate);
     link.reannounce(started(6262, 88, "2.1.312"), clock.now());
-    eventually("the placement", || {
-        link.tick(child(), clock.now());
-        fake.child().as_deref() == Some("6262:88")
+    assert!(link.claim_in_flight());
+    await_stream("the rate drop", &mut link, clock.now(), |_, link| {
+        link.counts().rate == 1
+    });
+    assert!(
+        link.claim_in_flight(),
+        "the replacement still awaits its ACK"
+    );
+    await_stream("the replacement ACK", &mut link, clock.now(), |_, link| {
+        !link.claim_in_flight()
     });
     assert!(link.streaming() && !link.is_lost());
+    assert_eq!(fake.child().as_deref(), Some("6262:88"));
     assert_eq!(link.counts().rate, 1);
     link.release(clock.now());
 }
@@ -2727,6 +2914,120 @@ fn an_aterm_restart_is_a_new_epoch_and_the_kept_records_are_numbered_from_one() 
     assert!(drained.fresh);
     assert_eq!(drained.renumbered, [(3, 1), (4, 2)]);
     link.release(clock.now());
+}
+
+fn model_snapshot() -> Body {
+    Body::Model {
+        child: started(5151, 77, "2.1.311").process,
+        model: Some("Opus 5.5".into()),
+        effort: Some("high".into()),
+        key: Some(false),
+        offers: Vec::new(),
+        permission: None,
+    }
+}
+
+#[test]
+fn the_caller_sees_each_models_exact_ack_and_no_receipt_for_skipped_numbers() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("model-acks", started(5151, 77, "2.1.311"), clock.now());
+    assert!(
+        settle_open(&fake, &mut link, clock.now())
+            .model_acks
+            .is_empty()
+    );
+    let mut expected = Vec::new();
+    for dropped in [
+        None,
+        Some(Dropped::Rate),
+        Some(Dropped::Refused("child".into())),
+        Some(Dropped::Applied),
+    ] {
+        if let Some(dropped) = dropped.clone() {
+            fake.drop_next_record(dropped);
+        }
+        let seq = link.send(model_snapshot(), WALL, clock.now()).unwrap();
+        expected.push(ModelAck { seq, dropped });
+        eventually("the exact model ACK", || fake.stream_numbers().0 >= seq);
+        // The reactor may hear an ACK during tick before its next event drain.
+        link.tick(child(), clock.now());
+    }
+    let title_seq = link.send(title(), WALL, clock.now()).unwrap();
+    let observed = await_stream("the last ACK", &mut link, clock.now(), |_, link| {
+        link.counts().acks >= title_seq
+    });
+    assert_eq!(observed.model_acks, expected);
+    assert!(link.events(child(), clock.now()).model_acks.is_empty());
+
+    fake.set_stream_deaf(true);
+    let skipped = link.send(model_snapshot(), WALL, clock.now()).unwrap();
+    let later = link.send(title(), WALL, clock.now()).unwrap();
+    link.acked(later, None, clock.now());
+    link.acked(skipped, Some(Dropped::Rate), clock.now());
+    assert!(link.events(child(), clock.now()).model_acks.is_empty());
+    link.release(clock.now());
+}
+
+#[test]
+fn undrained_model_receipts_keep_the_newest_bound_and_end_at_reopen() {
+    let mut clock = Clock::new();
+    let (fake, mut link) = streamed_at("model-ack-bound", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(true);
+    let mut receipts = Vec::new();
+    for _ in 0..=stream::RESEND_MAX {
+        let seq = link.send(model_snapshot(), WALL, clock.now()).unwrap();
+        link.acked(seq, None, clock.now());
+        receipts.push(ModelAck { seq, dropped: None });
+    }
+    assert_eq!(link.inbox.model_acks, receipts[1..]);
+
+    fake.restart();
+    eventually("the lost stream", || {
+        link.tick(child(), clock.now());
+        link.is_lost()
+    });
+    fake.set_stream_deaf(false);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.streaming());
+    let opened = link.events(child(), clock.now());
+    assert!(opened.fresh);
+    assert!(
+        opened.model_acks.is_empty(),
+        "old sequence numbers were retired"
+    );
+    link.release(clock.now());
+}
+
+#[test]
+fn retiring_a_c4_child_keeps_the_last_host_hold_if_the_stream_then_fails() {
+    let clock = Clock::new();
+    for (name, process, expected) in [
+        (
+            "retired-c4",
+            child(),
+            Some("wait link-lost aterm agent=working"),
+        ),
+        ("replaced-c4", started(6262, 88, "2.1.312"), None),
+    ] {
+        let (fake, mut link) = streamed_at(name, started(5151, 77, "2.1.311"), clock.now());
+        settle_open(&fake, &mut link, clock.now());
+        fake.set_status("agent", Some("working"));
+        assert_eq!(
+            link.safe_point(Duration::ZERO, clock.now()),
+            Verdict::Hold("wait aterm agent=working".into())
+        );
+        link.reannounce(process, clock.now());
+        await_stream(
+            "the reannouncement ACK",
+            &mut link,
+            clock.now(),
+            |_, link| !link.claim_in_flight(),
+        );
+        close_and_lose(&fake, &mut link, clock.now());
+        assert_eq!(link.lost_hold().as_deref(), expected);
+    }
 }
 
 /// Each `dropped=` reason is counted and noted once a stream; a `claim` record aterm refuses

@@ -28,7 +28,7 @@ fn host(name: &str, caps: &str, tracked: bool, contract: Contract) -> (FakeAterm
     let config = config(tracked, contract);
     let fake = FakeAterm::for_harness(name, &config);
     fake.serve_contracts(&[contract.number()]);
-    fake.set_info(&format!("{} {caps}", info_with_rows(&[ID])));
+    fake.set_info_capabilities(Some(&format!("{} {caps}", info_with_rows(&[ID]))));
     let link = Link::launch_at(
         config,
         std::process::id(),
@@ -78,6 +78,11 @@ fn negotiated_c3_begin_binds_the_native_child_and_the_next_attempt_advances() {
         true,
         Contract::Three,
     );
+    assert_eq!(
+        &fake.verbs()[..2],
+        ["harness policy", "native-act info capabilities=1"]
+    );
+    assert!(!fake.verbs().iter().any(|verb| verb == "native-act info"));
     let first = pending(&mut link, 0);
     assert!(fake.child().is_none());
     let at = fake.verbs().len();
@@ -102,6 +107,92 @@ fn negotiated_c3_begin_binds_the_native_child_and_the_next_attempt_advances() {
         fake.claim_words().unwrap().child_start,
         Some(next.to_string())
     );
+}
+
+#[test]
+fn a_tracking_c3_claim_uses_bare_info_only_after_an_old_usage_reply() {
+    for old_host in [false, true] {
+        let config = config(true, Contract::Three);
+        let fake = FakeAterm::for_harness("c3-info-without-child-proof", &config);
+        fake.serve_contracts(&[3]);
+        let roster = info_with_rows(&[ID]);
+        fake.set_info_capabilities(Some(if old_host {
+            "ERR usage: native-act <prepare|precommit|commit|query|signal|resume> <bounded fields>"
+        } else {
+            &roster
+        }));
+        let mut link = Link::launch_at(
+            config,
+            std::process::id(),
+            &fake.locator(),
+            Child::default(),
+            0,
+        );
+        assert!(link.judges());
+        let reads: Vec<_> = fake
+            .verbs()
+            .into_iter()
+            .filter(|verb| verb.starts_with("native-act info"))
+            .collect();
+        let expected = if old_host {
+            vec!["native-act info capabilities=1", "native-act info"]
+        } else {
+            vec!["native-act info capabilities=1"]
+        };
+        assert_eq!(reads, expected);
+        assert_eq!(link.before_spawn(None, 0), ChildStart::NoBarrier);
+        link.reannounce_native(Child::default(), native(4242, 12_345), 0);
+        assert!(fake.child().is_none());
+    }
+}
+
+#[test]
+fn refusal_or_malformed_capability_replies_never_fall_back_or_claim() {
+    let roster = info_with_rows(&[ID]);
+    let malformed = format!("{roster} child-proof=1 child-proof=1");
+    let wrong_kind = roster.replace("state=info", "state=unknown");
+    let unrostered = info_with_rows(&[]);
+    for reply in [
+        "ERR permission denied",
+        "ERR usage: native-act rejection-domain unsupported",
+        "OKAY invalid reply",
+        malformed.as_str(),
+        wrong_kind.as_str(),
+        unrostered.as_str(),
+    ] {
+        let config = config(true, Contract::Three);
+        let fake = FakeAterm::for_harness("c3-info-fail-closed", &config);
+        fake.serve_contracts(&[3]);
+        fake.set_info_capabilities(Some(reply));
+        let link = Link::launch_at(
+            config,
+            std::process::id(),
+            &fake.locator(),
+            Child::default(),
+            0,
+        );
+        assert!(!link.claims(), "{reply}");
+        assert_eq!(
+            fake.verbs(),
+            ["harness policy", "native-act info capabilities=1"]
+        );
+        assert!(fake.holder().is_none());
+    }
+}
+
+#[test]
+fn a_lost_roster_connection_keeps_its_transport_failure() {
+    let config = config(true, Contract::Three);
+    let fake = FakeAterm::for_harness("c3-info-disconnected", &config);
+    let locator = fake.locator();
+    let mut conn = Connection::connect(&locator.socket().unwrap(), REQUEST_TIMEOUT).unwrap();
+    assert_eq!(
+        conn.request_line("version").unwrap(),
+        "OK version=fake-aterm"
+    );
+    fake.restart();
+    let failure = read_c3_roster(&mut conn, locator.sid(), true).unwrap_err();
+    assert!(matches!(failure, Failure::Gone(why) if why.starts_with("roster ")));
 }
 
 #[test]
@@ -184,6 +275,13 @@ fn c3_tracking_defaults_off_even_when_the_fake_advertises_it() {
     link.reannounce_native(Child::default(), native(4242, 12_345), 0);
     assert!(fake.child().is_none());
     assert!(begins(&fake).is_empty());
+    assert_eq!(&fake.verbs()[..2], ["harness policy", "native-act info"]);
+    assert!(
+        !fake
+            .verbs()
+            .iter()
+            .any(|verb| verb == "native-act info capabilities=1")
+    );
     assert!(!fake.verbs().iter().any(|verb| {
         verb.split_ascii_whitespace()
             .any(|word| word.starts_with("child=") || word.starts_with("child-start="))
@@ -209,7 +307,12 @@ fn c4_keeps_its_epoch_child_and_never_activates_c3_tracking() {
     link.reannounce_native(child, native(4242, 12_345), 0);
     assert_eq!(fake.child().as_deref(), Some("4242:987654"));
     assert!(begins(&fake).is_empty());
-    assert!(!fake.verbs().iter().any(|verb| verb == "native-act info"));
+    assert!(
+        !fake
+            .verbs()
+            .iter()
+            .any(|verb| verb.starts_with("native-act info"))
+    );
 }
 
 #[test]
@@ -449,6 +552,7 @@ fn a_fresh_attempt_without_a_standing_claim_discards_the_unbound_generation() {
             Contract::Three,
         );
         let first = pending(&mut link, 0);
+        let subscription = link.event_fd().expect("the original event subscription");
         if lost {
             fake.set_status("hold", Some("1"));
             assert!(matches!(
@@ -462,10 +566,12 @@ fn a_fresh_attempt_without_a_standing_claim_discards_the_unbound_generation() {
             fake.set_policy_quietly(&off);
             assert_eq!(link.safe_point(Duration::ZERO, 1), Verdict::Local);
             assert!(matches!(&link.state, State::Held(claimed) if !claimed.standing));
+            assert!(fake.holder().is_none());
             fake.set_policy_quietly(&on);
         }
         let held = link.lost_hold();
         let requests = fake.requests().len();
+        let due = link.due_ms();
         assert!(matches!(
             link.before_spawn(None, 2),
             ChildStart::Unclaimed(_)
@@ -476,13 +582,27 @@ fn a_fresh_attempt_without_a_standing_claim_discards_the_unbound_generation() {
             "no unclaimed begin was sent"
         );
         assert_eq!(link.lost_hold(), held, "a fresh attempt withdrew no hold");
-        assert!(matches!(&link.state, State::Lost { native, .. }
-            if native.known.is_none() && native.generation.is_none()));
+        if lost {
+            assert!(matches!(&link.state, State::Lost { native, .. }
+                if native.known.is_none() && native.generation.is_none()));
+        } else {
+            assert_eq!(link.event_fd(), Some(subscription));
+            assert_eq!(link.due_ms(), due, "the policy clock survived the spawn");
+            assert!(matches!(&link.state, State::Held(claimed)
+                if claimed.native.known.is_none()
+                    && claimed.native.generation.is_none()
+                    && !claimed.native.pending));
+        }
+        let replacement = native(4243, 12_346);
+        link.reannounce_native(Child::default(), replacement, 2);
+        assert_eq!(fake.requests().len(), requests, "no claim was announced");
+        assert!(link.grant().is_none());
         // The cached hold survived the declaration. Recovery requires the host
         // to admit a claim again; a held host must not be expected to do so.
         fake.set_status("hold", Some("0"));
-        link.tick_native(Child::default(), native(4243, 12_346), 2 + RECLAIM_EVERY_MS);
+        link.tick_native(Child::default(), replacement, due.unwrap());
         assert!(link.judges());
+        assert_eq!(fake.subscriptions(), if lost { 2 } else { 1 });
         assert_eq!(fake.child().as_deref(), Some("4243:12346"));
         assert!(
             fake.claim_words().unwrap().child_start.is_none(),

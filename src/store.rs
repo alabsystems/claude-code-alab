@@ -305,12 +305,12 @@ impl Store {
         self.program_dir.join("current")
     }
 
-    /// The build number `current` names, read without validating the build: the
-    /// cheap check the update watch runs on every tick.
+    /// The in-store build number `current` names. The update watch checks the
+    /// link on every tick and validates the build's files when it needs them.
     #[must_use]
     pub fn current_number(&self) -> Option<u64> {
         let target = std::fs::read_link(self.current_link()).ok()?;
-        parse_build_name(target.file_name()?.to_str()?)
+        self.selected_number(&target).ok()
     }
 
     /// The build `current` names, validated: a build directory of this program
@@ -337,33 +337,41 @@ impl Store {
             }
         };
         let unusable = |why: String| Missing::Unusable(link.clone(), why);
-        let number = target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(parse_build_name)
-            .ok_or_else(|| unusable(format!("{} is not a build directory", target.display())))?;
-        // atpkg writes `current` as an absolute link into the same program store;
-        // a relative one resolves against the link's own directory.
-        let dir = if target.is_absolute() {
-            target.clone()
-        } else {
-            self.program_dir.join(&target)
-        };
-        if dir.parent() != Some(self.program_dir.as_path())
-            || dir.components().any(|c| matches!(c, Component::ParentDir))
-        {
-            return Err(unusable(format!(
-                "{} is outside {}",
-                dir.display(),
-                self.program_dir.display()
-            )));
-        }
+        let number = self.selected_number(&target).map_err(unusable)?;
         self.build(number, own_exe)
             .map_err(|refusal| match refusal {
                 Refusal::IsSelf(exe) => Missing::IsSelf(exe),
                 Refusal::Uncompared(exe, why) => Missing::Uncompared(exe, why),
                 Refusal::Unusable(why) => unusable(why),
             })
+    }
+
+    /// Check the link's destination lexically without opening the build.
+    fn selected_number(&self, target: &Path) -> Result<u64, String> {
+        let number = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse_build_name)
+            .ok_or_else(|| format!("{} is not a build directory", target.display()))?;
+        // atpkg writes `current` as an absolute link into the same program store;
+        // a relative one resolves against the link's own directory.
+        let resolved;
+        let dir = if target.is_absolute() {
+            target
+        } else {
+            resolved = self.program_dir.join(target);
+            resolved.as_path()
+        };
+        if dir.parent() != Some(self.program_dir.as_path())
+            || dir.components().any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(format!(
+                "{} is outside {}",
+                dir.display(),
+                self.program_dir.display()
+            ));
+        }
+        Ok(number)
     }
 
     /// Validate build `number` of this store.
@@ -657,6 +665,26 @@ mod tests {
         assert_eq!(read_small(&fifo), None, "fifo");
         assert_eq!(read_bounded(&fifo, 64, true), None, "fifo followed");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_selected_build_must_be_directly_in_its_store() {
+        let store = Store::new(Path::new("/atpkg"), "claude", "claude");
+        for target in ["7", "./7", "/atpkg/store/claude/7"] {
+            assert_eq!(store.selected_number(Path::new(target)), Ok(7), "{target}");
+        }
+        for target in [
+            "nested/7",
+            "../claude/7",
+            "/outside/7",
+            "/atpkg/store/claude/nested/../7",
+            "007",
+        ] {
+            assert!(
+                store.selected_number(Path::new(target)).is_err(),
+                "{target}"
+            );
+        }
     }
 
     #[test]

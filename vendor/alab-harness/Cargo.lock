@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "alab-policy"
-version = "0.9.4"
+version = "0.9.11"
 
 [[package]]
 name = "alab-wire"
-version = "0.9.4"
+version = "0.9.11"
 dependencies = [
  "libc",
 ]

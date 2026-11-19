@@ -177,6 +177,10 @@ fn full(kind: Kind) -> Body {
             resets_ms: Some(1_795_000_000_000),
         },
         Kind::Model => Body::Model {
+            child: Some(ChildProcess {
+                pid: 4242,
+                start: 1_794_510_000_000_123,
+            }),
             model: Some(s("Opus 5.5")),
             effort: Some(s("high")),
             key: Some(false),
@@ -356,6 +360,7 @@ fn bare(kind: Kind) -> Body {
             resets_ms: None,
         },
         Kind::Model => Body::Model {
+            child: None,
             model: None,
             effort: None,
             key: None,
@@ -1955,6 +1960,58 @@ fn a_known_field_out_of_its_grammar_is_refused() {
 }
 
 #[test]
+fn a_model_names_its_exact_child_in_the_claims_grammar() {
+    let identity = ChildProcess {
+        pid: 7,
+        start: 1_794_510_000_000_001,
+    };
+    let model = |child| Body::Model {
+        child,
+        model: None,
+        effort: None,
+        key: None,
+        offers: Vec::new(),
+        permission: None,
+    };
+    let line = round_trip(&record(model(Some(identity))));
+    assert!(line.contains(r#""child":{"pid":7,"start":1794510000000001}"#));
+
+    for spelling in ["", r#", "child":null"#] {
+        let line = format!(r#"{{"k":"model","seq":1,"ms":0{spelling}}}"#);
+        assert_eq!(body(&line), model(None));
+    }
+    let future = read(concat!(
+        r#"{"k":"model","seq":1,"ms":0,"#,
+        r#""child":{"pid":7,"start":1794510000000001,"future":0}}"#,
+    ))
+    .unwrap();
+    assert_eq!(future.record.body, model(Some(identity)));
+    assert_eq!(future.unknown, 1);
+
+    for (child, error) in [
+        (r#"{"pid":1,"start":1}"#, LineError::Malformed("child")),
+        (
+            r#"{"pid":2147483648,"start":1}"#,
+            LineError::Malformed("child"),
+        ),
+        (r#"{"pid":7,"start":0}"#, LineError::Malformed("child")),
+        (r#"{"pid":7}"#, LineError::Malformed("child")),
+        (r#"{"pid":7,"pid":8,"start":1}"#, LineError::Repeated("pid")),
+        (
+            r#"{"pid":7,"start":1,"start":2}"#,
+            LineError::Repeated("start"),
+        ),
+    ] {
+        let line = format!(r#"{{"k":"model","seq":1,"ms":0,"child":{child}}}"#);
+        assert_eq!(read(&line), Err(error));
+    }
+    assert_eq!(
+        record(model(Some(ChildProcess { pid: 7, start: 0 }))).line(),
+        Err(LineError::Malformed("child")),
+    );
+}
+
+#[test]
 fn the_writer_refuses_what_the_reader_would() {
     let refused = |body: Body| record(body).line().expect_err("refused");
     assert_eq!(
@@ -2189,6 +2246,7 @@ fn the_writer_refuses_what_the_reader_would() {
     assert_eq!(refused(Body::Touch { ask: 0 }), LineError::Malformed("ask"));
     assert_eq!(
         refused(Body::Model {
+            child: None,
             model: None,
             effort: None,
             key: None,

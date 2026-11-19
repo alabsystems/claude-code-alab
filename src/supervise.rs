@@ -72,18 +72,21 @@
 //! in all for one crash.
 //!
 //! **A restart aterm asks for.** aterm sends a claim holder `restart
-//! cause=<why>` instead of signalling its child. Under the same claim and one
-//! fresh permission read the harness ends the child with SIGTERM, at once
+//! cause=<why>` with an optional `model=` instead of signalling its child.
+//! Under the same claim and one fresh permission read the harness ends the
+//! child with SIGTERM at once
 //! (the request is aterm's or a person's through aterm, so no safe point is
 //! waited for), and SIGKILL after [`RESTART_GRACE_MS`] if it is still running,
 //! as aterm's own restart act does, then starts the same build on the same
 //! conversation. That is no crash and does not move the back-off. With no
 //! session record yet there is no conversation to resume, and the request
-//! waits for one.
+//! waits for one, including its requested model.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use alab_wire::claim::Restart;
 
 use crate::cli::{EXIT_VENDOR_MISSING, Options, say};
 use crate::journal::Journal;
@@ -386,6 +389,13 @@ enum Ending {
     /// child cannot act on a signal then); time the child spends stopped
     /// does not count either ([`Supervisor::follow_stop`]).
     ForUpdate { sent: Instant, plan: vendor::Plan },
+    /// The old child has been reaped. Retain the automatic replacement and
+    /// its leases until the job has the foreground. Its synchronous launch
+    /// attempt borrows this state and temporarily takes the plan.
+    AwaitingUpdate {
+        launch: UpdateLaunch,
+        plan: Option<vendor::Plan>,
+    },
     /// HUP or TERM was passed on: the session ends with the child.
     Passed(libc::c_int),
     /// The harness sent SIGTERM because aterm asked for a restart (`cause`),
@@ -398,6 +408,8 @@ enum Ending {
         sent: Instant,
         plan: vendor::Plan,
         cause: String,
+        /// The updated model basis, installed when the replacement starts.
+        selected_args: Option<Vec<OsString>>,
         killed: bool,
     },
     /// The child crashed and was reaped: **no child runs**, and
@@ -407,15 +419,24 @@ enum Ending {
     Crashed { event: ChildEvent, crash: Crash },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateLaunch {
+    Target(ChildEvent),
+    Fallback(FallbackCause),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FallbackCause {
+    FailedSpawn,
+    EarlyExit(ChildEvent),
+}
+
 /// A crash being answered: what is known of the conversation, and what the
 /// harness waits for before its next step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Crash {
-    /// The conversation the crashed child's record named.
-    session_id: String,
-    /// That record's `startedAt`, so a record still standing later is known to
-    /// be the same one.
-    started_at_ms: u64,
+    /// The crashed child's record, held for its conversation identity.
+    record: SessionRecord,
     /// When the child's end was read (epoch ms); the pause runs from here.
     exit_ms: u64,
     /// When (epoch ms) the back-off's pause is over; set once the record is
@@ -545,7 +566,6 @@ enum CrashWait {
 }
 
 /// Why the child is started again on its conversation.
-#[derive(Clone, Debug, PartialEq, Eq)]
 enum Cause {
     /// A move onto another vendor build (or the fallback of one).
     Update,
@@ -558,8 +578,10 @@ enum Cause {
 /// A restart aterm asked for that cannot be made yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Deferred {
-    /// aterm's `cause=`.
-    cause: String,
+    /// The request, including any model for the replacement child.
+    restart: Restart,
+    /// The conversation already selected, if the child supplied a record.
+    record: Option<SessionRecord>,
     /// Why it waits, as journal words.
     why: String,
     /// When (epoch ms) it began to wait for aterm, for a request that waits
@@ -798,17 +820,18 @@ impl Supervisor {
             let timeout = self
                 .crash_wake_ms()
                 .map_or(next_look, |wake| wake.min(next_look))
+                .min(self.link.due_ms().unwrap_or(u64::MAX))
                 .saturating_sub(now)
                 .min(poll);
             // The first pass waits for nothing (`next_look` is 0).
             let mut tstp = std::mem::take(&mut early_tstp);
             // With no event stream this is `pipe.wait(timeout)`.
-            let (signals, events) = pipe.wait_with(timeout, self.link.event_fd());
+            let (signals, events) = pipe.wait_with(timeout, self.link.fds());
             for sig in signals {
                 match sig {
                     libc::SIGHUP | libc::SIGTERM => self.pass_on(sig),
                     // With no child, INT and QUIT are nobody's but the harness's.
-                    libc::SIGINT | libc::SIGQUIT => self.crash_signalled(sig),
+                    libc::SIGINT | libc::SIGQUIT => self.childless_signalled(sig),
                     libc::SIGTSTP => tstp = true,
                     libc::SIGCONT if self.child.stopped => {
                         let _ = self.signal_child(libc::SIGCONT);
@@ -822,23 +845,31 @@ impl Supervisor {
             // one that has stopped. (A relaunch drains what aterm had sent
             // for the child that ended before it starts another,
             // [`Supervisor::relaunch`].)
-            self.reap();
+            self.reap(pipe);
             // An event from aterm is drained at once (never left readable, which
             // would spin this loop) and makes a look due now. The poll stays:
             // nothing announces a move of the store's `current` link.
-            let woken = events && self.link_events(false);
+            let mut woken = events && self.link_events(false);
             if self.no_child() {
-                // Before the image runtime's tick: a crash never waits beside
-                // an own-image move in flight.
-                self.crash_tick(pipe);
+                if self.awaiting_update() {
+                    if tstp {
+                        self.stop_pending_update();
+                    }
+                } else {
+                    // A crash never waits beside an own-image move in flight.
+                    self.crash_tick(pipe);
+                }
             } else if self.child.stopped {
-                self.follow_stop();
+                self.follow_stop(pipe);
                 continue;
             } else if tstp {
-                self.on_tstp();
+                self.on_tstp(pipe);
                 continue;
             }
             let due = now_ms() >= next_look;
+            if due || woken {
+                self.resume_update(pipe);
+            }
             if due {
                 next_look = now_ms().saturating_add(poll);
                 if !self.no_child() && !self.image.blocks_vendor_move() {
@@ -847,7 +878,14 @@ impl Supervisor {
                 let mut image = std::mem::take(&mut self.image);
                 image.tick(self, pipe);
                 self.image = image;
+            }
+            if due || self.link.due_ms().is_some_and(|at| now_ms() >= at) {
                 self.link_tick();
+                if self.link.streaming() {
+                    woken |= self.link_events(false);
+                }
+            }
+            if due {
                 self.restart_retry();
             }
             if (due || woken) && !self.image.blocks_vendor_move() {
@@ -856,11 +894,14 @@ impl Supervisor {
         }
     }
 
-    /// Whether no child runs: a crash is being answered ([`Ending::Crashed`]),
-    /// and [`Child::pid`] is a reaped pid that must be neither signalled nor
-    /// waited for.
+    /// Whether [`Child::pid`] has been reaped and must be neither signalled
+    /// nor waited for while its replacement is prepared.
     const fn no_child(&self) -> bool {
-        matches!(self.ending, Ending::Crashed { .. })
+        self.awaiting_update() || matches!(self.ending, Ending::Crashed { .. })
+    }
+
+    const fn awaiting_update(&self) -> bool {
+        matches!(self.ending, Ending::AwaitingUpdate { .. })
     }
 
     /// Send the child `sig`; `true` when the kernel accepted it. With no child
@@ -873,29 +914,28 @@ impl Supervisor {
     /// Read every pending child event; an end is handled here (relaunch or
     /// exit). With no child there is nothing to read, and a reaped pid is never
     /// waited for again.
-    fn reap(&mut self) {
+    fn reap(&mut self, pipe: &SignalPipe) {
         while !self.no_child()
             && let Some(event) = sys::wait_child(self.child.pid)
         {
-            self.dispatch(event);
+            self.dispatch(event, pipe);
         }
     }
 
     /// Act on one child event: a stop or a continue is recorded, an end is
     /// handled ([`Supervisor::on_end`]).
-    fn dispatch(&mut self, event: ChildEvent) {
+    fn dispatch(&mut self, event: ChildEvent, pipe: &SignalPipe) {
         match event {
             ChildEvent::Stopped(_) => self.child.stopped = true,
             ChildEvent::Continued => self.child.stopped = false,
-            ChildEvent::Exited(_) | ChildEvent::Signaled(_) => self.on_end(event),
+            ChildEvent::Exited(_) | ChildEvent::Signaled(_) => self.on_end(event, pipe),
         }
     }
 
     /// HUP or TERM reached the harness: pass it on to the child, and the
-    /// session then ends with it. With no child (a crash is being answered) the
-    /// signal ends the harness itself, as the crashed child ended.
+    /// session then ends with it. With no child the signal ends the harness.
     fn pass_on(&mut self, sig: libc::c_int) {
-        self.crash_signalled(sig);
+        self.childless_signalled(sig);
         let _ = self.signal_child(sig);
         if self.child.stopped {
             // A stopped child acts on HUP or TERM only once continued.
@@ -908,7 +948,10 @@ impl Supervisor {
             Ending::ForRestart { cause, .. } => self.journal.note(&format!(
                 "restart-cancelled cause={cause} a passed-on signal ends the session"
             )),
-            Ending::None | Ending::Passed(_) | Ending::Crashed { .. } => {}
+            Ending::None
+            | Ending::Passed(_)
+            | Ending::Crashed { .. }
+            | Ending::AwaitingUpdate { .. } => {}
         }
         self.ending = Ending::Passed(sig);
         self.moved = None;
@@ -919,7 +962,7 @@ impl Supervisor {
     /// job is continued. With no child there is nothing to follow. The grace
     /// of a SIGTERM the harness sent starts again: a stopped child acts on no
     /// signal but SIGKILL, so its time stopped is not time it had to end.
-    fn follow_stop(&mut self) {
+    fn follow_stop(&mut self, pipe: &SignalPipe) {
         if self.no_child() {
             return;
         }
@@ -927,7 +970,10 @@ impl Supervisor {
         sys::stop_self();
         // A shell's fg continues the whole group. Consume that native event
         // before deciding whether a harness-only CONT must wake the child.
-        self.reap();
+        self.reap(pipe);
+        if self.no_child() {
+            return;
+        }
         if self.child.stopped
             && self
                 .child
@@ -948,17 +994,24 @@ impl Supervisor {
     /// A TSTP reached the harness: follow the child if it stops with it, else
     /// pass it on. With no child, and from the moment a child read here turns
     /// out to have crashed, nothing is waited for and nothing is sent.
-    fn on_tstp(&mut self) {
+    fn on_tstp(&mut self, pipe: &SignalPipe) {
         let deadline = now_ms().saturating_add(TSTP_WAIT_MS);
         while !self.no_child() && now_ms() < deadline {
             if let Some(event) = sys::wait_child(self.child.pid) {
-                self.dispatch(event);
+                self.dispatch(event, pipe);
+                if self.no_child() {
+                    break;
+                }
                 if self.child.stopped {
-                    self.follow_stop();
+                    self.follow_stop(pipe);
                     return;
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if self.awaiting_update() {
+            self.stop_pending_update();
+            return;
         }
         if self.no_child() {
             return;
@@ -972,23 +1025,33 @@ impl Supervisor {
     /// a moved build that refused to start falls back; an abnormal end nobody
     /// asked for may be a crash to answer ([`Supervisor::crash_begins`]).
     /// Every other end is the session's, and the harness ends the same way.
-    fn on_end(&mut self, event: ChildEvent) {
+    fn on_end(&mut self, event: ChildEvent, pipe: &SignalPipe) {
         // dispatch reaches this only after consuming this current child's
         // terminal wait event. Retire its binding before any restart or reclaim.
-        self.link.child_ended();
+        self.link
+            .child_ended(&self.journal, self.child.build.version.as_deref());
         let ending = std::mem::replace(&mut self.ending, Ending::None);
         let moved = self.moved.take();
         match ending {
             Ending::ForUpdate { sent, plan }
                 if sent.elapsed() <= Duration::from_millis(self.setup.opts.term_grace_ms) =>
             {
-                self.relaunch(event, plan, &Cause::Update);
+                self.await_update(UpdateLaunch::Target(event), plan);
+                self.resume_update(pipe);
             }
             // The restart stands until the child has ended or was abandoned
             // after SIGKILL ([`Supervisor::look`]): an end that comes late is
             // still the one the harness asked for.
-            Ending::ForRestart { plan, cause, .. } => {
-                self.relaunch(event, plan, &Cause::Asked(cause));
+            Ending::ForRestart {
+                plan,
+                cause,
+                selected_args,
+                ..
+            } => {
+                self.relaunch(event, plan, &Cause::Asked(cause), pipe);
+                if let Some(args) = selected_args {
+                    self.setup.args = args;
+                }
             }
             Ending::None
                 if let Some(plan) = moved
@@ -997,7 +1060,11 @@ impl Supervisor {
                     && self.terminal_is_original()
                     && refused_start(event) =>
             {
-                self.fallback_from_move(event, plan);
+                self.await_update(
+                    UpdateLaunch::Fallback(FallbackCause::EarlyExit(event)),
+                    plan,
+                );
+                self.resume_update(pipe);
             }
             Ending::None => {
                 if !self.crash_begins(event) {
@@ -1058,7 +1125,7 @@ impl Supervisor {
         if let Some(deferred) = self.restart_deferred.take() {
             self.journal.note(&format!(
                 "aterm restart cause={} ignored child-ended",
-                deferred.cause
+                deferred.restart.cause
             ));
         }
         let now = now_ms();
@@ -1072,8 +1139,7 @@ impl Supervisor {
         self.ending = Ending::Crashed {
             event,
             crash: Crash {
-                session_id: record.session_id,
-                started_at_ms: record.started_at_ms,
+                record,
                 exit_ms: now,
                 due_ms: now,
                 resume: Vec::new(),
@@ -1123,6 +1189,11 @@ impl Supervisor {
         }
     }
 
+    fn crash_record(&self, crash: &Crash) -> Option<SessionRecord> {
+        self.record()
+            .filter(|current| crash.record.same_child_conversation(current))
+    }
+
     /// The crash is not answered with a relaunch (`why`, journalled as
     /// `crash-passed-on <why>`): the harness ends as the crashed child did.
     /// What was typed at the dead screen is discarded first: it was meant for
@@ -1135,12 +1206,13 @@ impl Supervisor {
         self.end_like(event)
     }
 
-    /// `sig` reached the harness. With no child it ends the harness with the
-    /// crashed child's status: whoever sent it wants the session over, and a
-    /// relaunch would fight them. With a child this does nothing.
-    fn crash_signalled(&mut self, sig: libc::c_int) {
+    /// A session-ending signal while no child runs cancels the replacement.
+    fn childless_signalled(&mut self, sig: libc::c_int) {
         if let Ending::Crashed { event, .. } = self.ending {
             self.crash_passed_on(event, &format!("signal {sig}"));
+        }
+        if self.awaiting_update() {
+            self.cancel_replacement(sig);
         }
     }
 
@@ -1200,24 +1272,21 @@ impl Supervisor {
     /// graceful exit has removed its own by now), and the conversation must be
     /// resumable here. Then the back-off gives the pause, and aterm is asked.
     fn crash_settled(&mut self, event: ChildEvent) {
-        let Some((session_id, started_at_ms, exit_ms)) = self
-            .crash_mut()
-            .map(|crash| (crash.session_id.clone(), crash.started_at_ms, crash.exit_ms))
-        else {
+        let Ending::Crashed { crash, .. } = &self.ending else {
             return;
         };
-        let Some(record) = self.record().filter(|record| {
-            record.session_id == session_id && record.started_at_ms == started_at_ms
-        }) else {
+        let exit_ms = crash.exit_ms;
+        let Some(record) = self.crash_record(crash) else {
             self.crash_passed_on(event, "record-removed");
         };
-        let resume = match self.resume_plan(&record) {
+        let resume = match self.resume_plan(&record, &self.setup.args) {
             Ok(resume) => resume,
             Err(why) => self.crash_passed_on(event, &why),
         };
         let pause = u64::try_from(self.ladder.crashed(exit_ms).as_millis()).unwrap_or(u64::MAX);
         self.journal.note(&format!(
-            "crash record-stands session={session_id} streak={} pause-ms={pause}",
+            "crash record-stands session={} streak={} pause-ms={pause}",
+            record.session_id,
             self.ladder.streak()
         ));
         if let Some(crash) = self.crash_mut() {
@@ -1282,34 +1351,32 @@ impl Supervisor {
     /// start the same build on the same conversation through
     /// [`Supervisor::relaunch`]. A plan that cannot be pinned, or a build that
     /// cannot be started, passes the crash on, and so does a session signal
-    /// caught while aterm was asked and the plan pinned (nothing read the
-    /// signals meanwhile, and the child started next would never see it).
-    /// What was typed at the dead screen is discarded before the start: it
-    /// was meant for the child that crashed, not for the conversation resumed.
+    /// caught while aterm was asked, the plan pinned or the pre-spawn
+    /// handshake completed. The original conversation must still stand
+    /// through those steps. What was typed at the dead screen is discarded
+    /// before the start.
     fn crash_due(&mut self, event: ChildEvent, pipe: &SignalPipe) {
         if !self.crash_judged(event) {
             return;
         }
-        let Some((session_id, resume)) = self
-            .crash_mut()
-            .map(|crash| (crash.session_id.clone(), crash.resume.clone()))
-        else {
+        let Ending::Crashed { crash, .. } = &self.ending else {
             return;
         };
-        let plan = match self.same_build_plan(session_id, resume) {
+        let plan = match self.same_build_plan(crash.record.session_id.clone(), crash.resume.clone())
+        {
             Ok(plan) => plan,
             Err(why) => self.crash_passed_on(event, &why),
         };
         if let Some(sig) = session_ending(&pipe.wait(0)) {
             self.crash_passed_on(event, &format!("signal {sig}"));
         }
+        if self.crash_record(crash).is_none() {
+            self.crash_passed_on(event, "record-removed");
+        }
         if let Some(t) = &self.termios {
             t.discard_input();
         }
-        // From here a child is about to exist again; `relaunch` either starts
-        // it or ends the harness.
-        self.ending = Ending::None;
-        self.relaunch(event, plan, &Cause::Crash);
+        self.relaunch(event, plan, &Cause::Crash, pipe);
         self.ladder.relaunched(now_ms());
         self.journal.note(&format!(
             "crash-relaunch pid={} build={} streak={}",
@@ -1362,7 +1429,8 @@ impl Supervisor {
     /// * one fresh policy and status read shows this harness's proven claim
     ///   taking `relaunch`, and the session neither halted nor driven
     ///   ([`Supervisor::link_relaunch_word`], [`alab_wire::relaunch::permitted`]);
-    /// * the plan can be pinned and the kernel accepts the signal.
+    /// * the plan can be pinned, the child still names the same conversation,
+    ///   and the kernel accepts the signal.
     ///
     /// With no session record yet (the child has not written one), while the
     /// child is stopped, or while an own-image move is in flight, the request
@@ -1371,13 +1439,22 @@ impl Supervisor {
     /// does one aterm could not answer now, or whose link is being claimed
     /// again, asked again every [`link::LATER_RETRY_MS`] and for at most
     /// [`link::RECLAIM_HOLD_MS`]: aterm has already answered the asker that
-    /// the restart is under way.
-    fn restart_asked(&mut self, cause: &str) {
+    /// the restart is under way. An already selected conversation stays
+    /// bound to the request as it waits.
+    fn restart_asked(&mut self, restart: &Restart) {
+        if restart.account.is_some() {
+            return self.restart_ignored(&restart.cause, "account-assignment-unsupported");
+        }
+        self.restart_for(restart, None);
+    }
+
+    fn restart_for(&mut self, restart: &Restart, bound: Option<SessionRecord>) {
+        let cause = &restart.cause;
         let before = self.restart_deferred.take();
         let refusal = match &self.ending {
             Ending::None if sys::child_has_ended(self.child.pid) => Some("child-ended"),
             Ending::None => None,
-            Ending::ForUpdate { .. } => Some("update-ending"),
+            Ending::ForUpdate { .. } | Ending::AwaitingUpdate { .. } => Some("update-ending"),
             Ending::ForRestart { .. } => Some("restart-ending"),
             Ending::Passed(_) => Some("session-ending"),
             Ending::Crashed { .. } => Some("crash-pending"),
@@ -1387,15 +1464,39 @@ impl Supervisor {
             return;
         }
         if self.image.blocks_vendor_move() {
-            return self.restart_waits(cause, before, "own-image-move", false);
+            return self.restart_waits(restart, bound, before, "own-image-move", false);
         }
         if self.child.stopped {
-            return self.restart_waits(cause, before, "child-stopped", false);
+            return self.restart_waits(restart, bound, before, "child-stopped", false);
         }
-        let Some(record) = self.record() else {
-            return self.restart_waits(cause, before, "no-record", false);
+        let record = match self.record() {
+            Some(record)
+                if bound
+                    .as_ref()
+                    .is_none_or(|bound| bound.same_child_conversation(&record)) =>
+            {
+                record
+            }
+            None if bound.is_none() => {
+                return self.restart_waits(restart, None, before, "no-record", false);
+            }
+            _ => return self.restart_ignored(cause, "record-changed"),
         };
-        let resume = match self.resume_plan(&record) {
+        let selected = match &restart.model {
+            Some(model) => {
+                match crate::launch::override_model(
+                    self.setup.args.clone(),
+                    model.clone(),
+                    self.setup.args.len(),
+                ) {
+                    Ok(args) => Some(args),
+                    Err(why) => return self.restart_ignored(cause, &why),
+                }
+            }
+            None => None,
+        };
+        let launch_args = selected.as_deref().unwrap_or(&self.setup.args);
+        let resume = match self.resume_plan(&record, launch_args) {
             Ok(resume) => resume,
             Err(why) => return self.restart_ignored(cause, &why),
         };
@@ -1403,13 +1504,28 @@ impl Supervisor {
             link::Relaunch::Permitted => {}
             link::Relaunch::Denied(why) => return self.restart_ignored(cause, &why),
             link::Relaunch::Away(why) | link::Relaunch::Later(why) => {
-                return self.restart_waits(cause, before, &format!("aterm {why}"), true);
+                return self.restart_waits(
+                    restart,
+                    Some(record),
+                    before,
+                    &format!("aterm {why}"),
+                    true,
+                );
             }
         }
         let plan = match self.same_build_plan(record.session_id.clone(), resume) {
             Ok(plan) => plan,
             Err(why) => return self.restart_ignored(cause, &why),
         };
+        if sys::child_has_ended(self.child.pid) {
+            return self.restart_ignored(cause, "child-ended");
+        }
+        if !self
+            .record()
+            .is_some_and(|current| record.same_child_conversation(&current))
+        {
+            return self.restart_ignored(cause, "record-changed");
+        }
         if !self.signal_child(libc::SIGTERM) {
             return self.restart_ignored(cause, "signal-failed");
         }
@@ -1423,25 +1539,34 @@ impl Supervisor {
         self.ending = Ending::ForRestart {
             sent: Instant::now(),
             plan,
-            cause: cause.to_string(),
+            cause: cause.clone(),
+            selected_args: selected,
             killed: false,
         };
     }
 
-    /// Keep the restart request `cause` for a later pass because of `why`,
+    /// Keep the restart request for a later pass because of `why`,
     /// journalled as `aterm restart cause=<cause> deferred <why>` unless that
     /// is what was waiting already (`before`). A request that waits on aterm
     /// (`on_aterm`) is asked again after [`link::LATER_RETRY_MS`], and once it
     /// has waited [`link::RECLAIM_HOLD_MS`] in all it is ignored.
-    fn restart_waits(&mut self, cause: &str, before: Option<Deferred>, why: &str, on_aterm: bool) {
+    fn restart_waits(
+        &mut self,
+        restart: &Restart,
+        record: Option<SessionRecord>,
+        before: Option<Deferred>,
+        why: &str,
+        on_aterm: bool,
+    ) {
+        let cause = &restart.cause;
         let now = now_ms();
         let same = before
             .as_ref()
-            .filter(|before| before.cause == cause && before.why == why);
+            .filter(|before| before.restart == *restart && before.why == why);
         let on_aterm_since_ms = on_aterm.then(|| {
             before
                 .as_ref()
-                .filter(|before| before.cause == cause)
+                .filter(|before| before.restart.cause == *cause)
                 .and_then(|before| before.on_aterm_since_ms)
                 .unwrap_or(now)
         });
@@ -1454,7 +1579,8 @@ impl Supervisor {
                 .note(&format!("aterm restart cause={cause} deferred {why}"));
         }
         self.restart_deferred = Some(Deferred {
-            cause: cause.to_string(),
+            restart: restart.clone(),
+            record,
             why: why.to_string(),
             on_aterm_since_ms,
             retry_at_ms: if on_aterm {
@@ -1476,29 +1602,111 @@ impl Supervisor {
     /// ([`Supervisor::restart_asked`]).
     fn restart_retry(&mut self) {
         let now = now_ms();
-        if let Some(cause) = self
+        if let Some((restart, bound)) = self
             .restart_deferred
             .as_ref()
             .filter(|deferred| now >= deferred.retry_at_ms)
-            .map(|deferred| deferred.cause.clone())
+            .map(|deferred| (deferred.restart.clone(), deferred.record.clone()))
         {
-            self.restart_asked(&cause);
+            self.restart_for(&restart, bound);
         }
     }
 
+    /// Handle signals caught after the old child was reaped. A stop is for
+    /// the job the replacement joins and goes back to the regular loop.
+    fn replacement_signals(&mut self, pipe: &SignalPipe) {
+        let queued = pipe.wait(0);
+        if let Some(sig) = session_ending(&queued) {
+            self.cancel_replacement(sig);
+        }
+        if queued.contains(&libc::SIGTSTP) {
+            pipe.defer_stop();
+        }
+    }
+
+    fn cancel_replacement(&mut self, sig: libc::c_int) -> ! {
+        self.journal
+            .note(&format!("replacement-cancelled signal={sig}"));
+        if let Some(t) = &self.termios {
+            t.discard_input();
+        }
+        self.end_like(ChildEvent::Signaled(sig));
+    }
+
+    fn await_update(&mut self, launch: UpdateLaunch, plan: vendor::Plan) {
+        self.child.stopped = false;
+        self.ending = Ending::AwaitingUpdate {
+            launch,
+            plan: Some(plan),
+        };
+    }
+
+    fn stop_pending_update(&self) {
+        self.journal
+            .note("replacement-stopped waiting for foreground");
+        sys::stop_self();
+    }
+
+    fn resume_update(&mut self, pipe: &SignalPipe) {
+        let Ending::AwaitingUpdate { launch, plan } = &mut self.ending else {
+            return;
+        };
+        if !sys::in_foreground(0) {
+            self.note_wait("replacement-wait foreground");
+            return;
+        }
+        let launch = *launch;
+        let plan = plan.take().expect("automatic replacement owns its plan");
+        match launch {
+            UpdateLaunch::Target(event) => self.relaunch(event, plan, &Cause::Update, pipe),
+            UpdateLaunch::Fallback(why) => self.fall_back(why, plan, pipe),
+        }
+    }
+
+    /// Start a pinned launch, or keep an automatic replacement pending when
+    /// its job loses foreground. Only a real start error permits fallback.
     fn start_launch(
         &mut self,
         plan: &vendor::Plan,
         launch: &vendor::Launch,
-    ) -> std::io::Result<Child> {
-        plan.revalidate_for(launch)?;
+        pipe: &SignalPipe,
+    ) -> std::io::Result<Option<Child>> {
+        let crash = matches!(self.ending, Ending::Crashed { .. });
+        let pinned = plan.revalidate_for(launch);
+        if !crash {
+            self.replacement_signals(pipe);
+        }
+        if self.awaiting_update() && !sys::in_foreground(0) {
+            return Ok(None);
+        }
+        pinned?;
         // All callers arrive after the prior child's wait event was consumed.
         // The server also refuses a begin while its named old child is alive.
         self.link
             .before_spawn(&self.journal, launch.build.version.as_deref());
-        plan.revalidate_for(launch)?;
+        let pinned = plan.revalidate_for(launch);
+        let mut command = launch.command();
+        if !crash {
+            self.replacement_signals(pipe);
+        }
+        if self.awaiting_update() && !sys::in_foreground(0) {
+            return Ok(None);
+        }
+        pinned?;
+        if let Ending::Crashed { event, crash } = &self.ending {
+            let record_stands = self.crash_record(crash).is_some();
+            if let Some(sig) = session_ending(&pipe.wait(0)) {
+                self.crash_passed_on(*event, &format!("signal {sig}"));
+            }
+            if !record_stands {
+                self.crash_passed_on(*event, "record-removed");
+            }
+            if !sys::in_foreground(0) {
+                self.crash_passed_on(*event, "background");
+            }
+        }
         let spawned_ms = now_ms();
-        let proc = launch.command().spawn()?;
+        let proc = command.spawn()?;
         launched(
             proc,
             &launch.build,
@@ -1506,6 +1714,7 @@ impl Supervisor {
             &self.setup.opts,
             spawned_ms,
         )
+        .map(Some)
     }
 
     /// The child ended (`event`) and is started again from `plan` on the same
@@ -1517,7 +1726,13 @@ impl Supervisor {
     /// crashed child's status after a crash, and otherwise with
     /// [`EXIT_VENDOR_MISSING`], because the child ended at the harness's own
     /// signal and its status would say nothing.
-    fn relaunch(&mut self, event: ChildEvent, plan: vendor::Plan, cause: &Cause) {
+    fn relaunch(
+        &mut self,
+        event: ChildEvent,
+        plan: vendor::Plan,
+        cause: &Cause,
+        pipe: &SignalPipe,
+    ) {
         let (old, new, session_id, resume) = (
             &plan.old.build,
             &plan.target.build,
@@ -1545,8 +1760,8 @@ impl Supervisor {
             new.version.as_deref().unwrap_or("-"),
             resume.join("\u{1f}")
         ));
-        let started = match self.start_launch(&plan, &plan.target) {
-            Ok(child) => {
+        let started = match self.start_launch(&plan, &plan.target, pipe) {
+            Ok(Some(child)) => {
                 // Said only now: the line claims a resume on the new build, so
                 // the new build has to have been started. A target that could
                 // not be spawned gets the fallback's own line instead.
@@ -1559,11 +1774,16 @@ impl Supervisor {
                 });
                 child
             }
+            Ok(None) => {
+                self.await_update(UpdateLaunch::Target(event), plan);
+                self.note_wait("replacement-wait foreground");
+                return;
+            }
             Err(e) => {
                 self.journal
                     .note(&format!("relaunch-failed build={} {e}", new.number));
                 if new.number == old.number {
-                    if *cause == Cause::Crash {
+                    if matches!(cause, Cause::Crash) {
                         say(&format!("{TOOL}: cannot restart {COMMAND}: {e}"));
                         self.crash_passed_on(event, &format!("relaunch-failed {e}"));
                     }
@@ -1573,12 +1793,18 @@ impl Supervisor {
                     self.link_release();
                     std::process::exit(EXIT_VENDOR_MISSING);
                 }
-                self.fall_back("spawn-failed", &plan)
+                self.fall_back(FallbackCause::FailedSpawn, plan, pipe);
+                return;
             }
         };
-        let moved_to_target = started.build.number == new.number && new.number != old.number;
-        self.child = started;
-        self.moved = moved_to_target.then_some(plan);
+        let moved = (new.number != old.number).then_some(plan);
+        self.install_replacement(started, moved);
+    }
+
+    fn install_replacement(&mut self, child: Child, moved: Option<vendor::Plan>) {
+        self.child = child;
+        self.ending = Ending::None;
+        self.moved = moved;
         self.noted.clear();
         self.seen_target = None;
         self.restart_moot();
@@ -1589,22 +1815,8 @@ impl Supervisor {
     /// one's record has nothing left to restart.
     fn restart_moot(&mut self) {
         if let Some(deferred) = self.restart_deferred.take() {
-            self.restart_ignored(&deferred.cause, "child-replaced");
+            self.restart_ignored(&deferred.restart.cause, "child-replaced");
         }
-    }
-
-    /// A newly relaunched target build failed before writing its session
-    /// record: mark it abandoned and resume the conversation on the previous build.
-    fn fallback_from_move(&mut self, event: ChildEvent, plan: vendor::Plan) {
-        if let Some(t) = &self.termios {
-            t.restore();
-        }
-        self.link_events(true);
-        self.child = self.fall_back(&format!("child={event:?}"), &plan);
-        self.noted.clear();
-        self.seen_target = None;
-        self.restart_moot();
-        self.link_reannounce();
     }
 
     /// The moved build `plan.target` refused to start (Decision 28): remember it
@@ -1615,11 +1827,19 @@ impl Supervisor {
     /// cannot be started either, one line says that both failed and why, the
     /// journal records `relaunch-fallback-failed`, and the harness exits: no
     /// build is left to run the session on.
-    fn fall_back(&mut self, cause: &str, plan: &vendor::Plan) -> Child {
+    fn fall_back(&mut self, why: FallbackCause, plan: vendor::Plan, pipe: &SignalPipe) {
+        if let Some(t) = &self.termios {
+            t.restore();
+        }
+        self.link_events(true);
         let (old, new, session_id) = (&plan.old.build, &plan.target.build, &plan.session_id);
         self.abandoned.remember(new.number);
-        match self.start_launch(plan, &plan.old) {
-            Ok(child) => {
+        let cause = match why {
+            FallbackCause::FailedSpawn => "spawn-failed".to_string(),
+            FallbackCause::EarlyExit(event) => format!("child={event:?}"),
+        };
+        match self.start_launch(&plan, &plan.old, pipe) {
+            Ok(Some(child)) => {
                 say(&fallback_notice(
                     new.version.as_deref(),
                     old.version.as_deref(),
@@ -1630,7 +1850,11 @@ impl Supervisor {
                     "relaunch-fallback {cause} failed-build={} fallback-build={} session={session_id}",
                     new.number, old.number
                 ));
-                child
+                self.install_replacement(child, None);
+            }
+            Ok(None) => {
+                self.await_update(UpdateLaunch::Fallback(why), plan);
+                self.note_wait("replacement-wait foreground");
             }
             Err(e) => {
                 self.image.finish_probe();
@@ -1660,9 +1884,11 @@ impl Supervisor {
     /// no others: the tracker's gate (the record must still read idle for the
     /// quiet period, [`crate::quiet::record_idle`]), the unread-input check,
     /// and the unread-input and input-clock part of the final re-read. The
-    /// last step before SIGTERM is then one fresh policy and status read
+    /// terminal input is judged by one fresh policy and status read
     /// ([`Supervisor::link_safe_point`]). A link that fails at that step is
     /// lost, and the same look decides on the three local checks instead.
+    /// The pinned plan, idle conversation and selected build must still
+    /// stand after that exchange and before SIGTERM.
     fn look(&mut self) {
         if let Ending::ForUpdate { sent, plan } = &self.ending
             && sent.elapsed() > Duration::from_millis(self.setup.opts.term_grace_ms)
@@ -1775,7 +2001,7 @@ impl Supervisor {
                 self.child.build.number
             ));
         }
-        let resume = match self.resume_plan(&record) {
+        let resume = match self.resume_plan(&record, &self.setup.args) {
             Ok(resume) => resume,
             Err(why) => {
                 self.note_wait(&format!("wait {why}"));
@@ -1807,32 +2033,14 @@ impl Supervisor {
                 return;
             }
         };
-        if let Err(error) = plan.revalidate_all() {
-            self.note_wait(&format!("wait vendor-plan changed {error}"));
-            return;
-        }
-        // Reading the transcript and the process table took time: the record,
-        // the empty input queue and the input clock must still be what the
-        // safe point was decided on. This is the last look before SIGTERM, so
-        // nothing slow runs between it and the signal. The queue is read
-        // before the clock: a key still queued then is counted, and a read
-        // that starts before the clock is read moves it. Under a proven claim
-        // the queue and the clock are aterm's to judge (`input=`, `human_ms=`),
-        // in the one exchange that follows.
-        let still = self.record().is_some_and(|r| {
-            r.status == profile::STATUS_IDLE
-                && r.status_updated_at_ms == record.status_updated_at_ms
-        }) && (claimed
-            || (sys::stdin_unread().is_ok_and(|queued| queued == 0)
-                && sys::stdin_input_ms() == input))
-            && self.setup.store.current_number() == Some(plan.target.build.number);
-        if !still {
-            self.note_wait("wait changed-while-deciding");
-            return;
-        }
-        if claimed {
+        let target = plan.target.build.number;
+        let check_local_input = if claimed {
+            if !self.update_snapshot_matches(&record, target) {
+                self.note_wait("wait changed-while-deciding");
+                return;
+            }
             match self.link_safe_point() {
-                link::Verdict::Safe => {}
+                link::Verdict::Safe => false,
                 link::Verdict::Hold(why) => {
                     self.note_wait(&why);
                     return;
@@ -1840,8 +2048,7 @@ impl Supervisor {
                 link::Verdict::Local => {
                     // aterm did not answer, or the claim no longer stands: the
                     // three checks its word stood in for are made now, on this
-                    // look's own readings, and the record and the selection are
-                    // read once more because the exchange took time.
+                    // look's own readings.
                     if let Err(wait) = gate {
                         self.note_wait(&format!("wait {}", wait.word()));
                         return;
@@ -1849,25 +2056,38 @@ impl Supervisor {
                     if self.unread_input_holds() {
                         return;
                     }
-                    let still = self.record().is_some_and(|r| {
-                        r.status == profile::STATUS_IDLE
-                            && r.status_updated_at_ms == record.status_updated_at_ms
-                    }) && sys::stdin_unread().is_ok_and(|queued| queued == 0)
-                        && sys::stdin_input_ms() == input
-                        && self.setup.store.current_number() == Some(plan.target.build.number);
-                    if !still {
-                        self.note_wait("wait changed-while-deciding");
-                        return;
-                    }
+                    true
                 }
             }
+        } else {
+            true
+        };
+        if let Err(error) = plan.revalidate_all() {
+            self.note_wait(&format!("wait vendor-plan changed {error}"));
+            return;
         }
-        if self.term_for_update(plan.target.build.number) {
+        // The plan and the exchange took time. Re-read the local witnesses
+        // that the plan depends on. If input is ours to check, read the queue
+        // before the clock so an already queued or newly read key holds.
+        if !self.update_snapshot_matches(&record, target)
+            || (check_local_input
+                && (!sys::stdin_unread().is_ok_and(|queued| queued == 0)
+                    || sys::stdin_input_ms() != input))
+            || sys::child_has_ended(self.child.pid)
+        {
+            self.note_wait("wait changed-while-deciding");
+            return;
+        }
+        if !sys::in_foreground(0) {
+            self.note_wait("wait background");
+            return;
+        }
+        if self.term_for_update(target) {
             self.journal.note(&format!(
                 "end-for-update SIGTERM pid={} session={} target-build={} argv={}",
                 self.child.pid,
                 record.session_id,
-                plan.target.build.number,
+                target,
                 plan.resume.join("\u{1f}")
             ));
             self.ending = Ending::ForUpdate {
@@ -1875,6 +2095,16 @@ impl Supervisor {
                 plan,
             };
         }
+    }
+
+    /// The conversation, its idle interval and the selected build the update
+    /// plan was prepared for still stand.
+    fn update_snapshot_matches(&self, record: &SessionRecord, target: u64) -> bool {
+        self.record().is_some_and(|fresh| {
+            record.same_child_conversation(&fresh)
+                && fresh.status == profile::STATUS_IDLE
+                && fresh.status_updated_at_ms == record.status_updated_at_ms
+        }) && self.setup.store.current_number() == Some(target)
     }
 
     /// A restart's child that outlived its grace ([`RESTART_GRACE_MS`], or a
@@ -1967,7 +2197,11 @@ impl Supervisor {
     }
 
     /// The resume argv for `record`'s conversation, or why it cannot be resumed here.
-    fn resume_plan(&self, record: &SessionRecord) -> Result<Vec<String>, String> {
+    fn resume_plan(
+        &self,
+        record: &SessionRecord,
+        args: &[OsString],
+    ) -> Result<Vec<String>, String> {
         if !profile::is_session_id(&record.session_id) {
             return Err("unresumable session-id".to_string());
         }
@@ -1975,7 +2209,7 @@ impl Supervisor {
             // `--resume` finds a conversation by the directory it started in.
             return Err("unresumable cwd-moved".to_string());
         }
-        let argv = launch_argv(&self.setup.args).ok_or("unresumable argv-not-utf8")?;
+        let argv = launch_argv(args).ok_or("unresumable argv-not-utf8")?;
         let flags = profile::resume_argv(&argv, &record.session_id)
             .map_err(|r| format!("unresumable {r}"))?;
         // The conversation's own permission mode, as aterm's relaunch carries it
@@ -2013,9 +2247,11 @@ impl Supervisor {
             record: record.map(|r| (r.session_id.as_str(), r.started_at_ms)),
             args: &self.child.args,
         };
-        if let Some(line) = self.facts.look(&self.config, &process, now).journal_line {
+        let update = self.facts.look(&self.config, &process, now);
+        if let Some(line) = update.journal_line {
             self.journal.note(line);
         }
+        self.link.model(update.facts, now);
     }
 
     /// The child's own record, when it is this child's (pid, start, kind).
@@ -2046,6 +2282,14 @@ mod tests {
 
     fn os(words: &[&str]) -> Vec<OsString> {
         words.iter().map(OsString::from).collect()
+    }
+
+    fn restart(cause: &str) -> Restart {
+        Restart {
+            cause: cause.into(),
+            account: None,
+            model: None,
+        }
     }
 
     #[test]
@@ -2353,8 +2597,16 @@ mod tests {
         Ending::Crashed {
             event,
             crash: Crash {
-                session_id: "sid".to_string(),
-                started_at_ms: 1,
+                record: SessionRecord {
+                    pid: 2,
+                    session_id: "sid".to_string(),
+                    cwd: "/".to_string(),
+                    status: profile::STATUS_IDLE.to_string(),
+                    status_updated_at_ms: 1,
+                    started_at_ms: 1,
+                    kind: profile::KIND_INTERACTIVE.to_string(),
+                    version: "9.9.1".to_string(),
+                },
                 exit_ms: 1_000,
                 due_ms: 2_000,
                 resume: Vec::new(),
@@ -2494,15 +2746,21 @@ mod tests {
     fn a_restart_waiting_on_aterm_is_ignored_after_forty_five_seconds() {
         let state = fresh_state("restart-expiry");
         let mut sup = supervisor_of_an_unsignallable_child(&state);
+        let request = Restart {
+            model: Some("opus[1m]".into()),
+            ..restart("stall")
+        };
         let waiting = |since: u64| Deferred {
-            cause: "stall".to_string(),
+            restart: request.clone(),
+            record: None,
             why: "aterm link-lost".to_string(),
             on_aterm_since_ms: Some(since),
             retry_at_ms: 0,
         };
         let now = now_ms();
         sup.restart_waits(
-            "stall",
+            &request,
+            None,
             Some(waiting(now - 44_000)),
             "aterm link-lost",
             true,
@@ -2514,9 +2772,11 @@ mod tests {
             Some(now - 44_000),
             "the wait keeps its start"
         );
+        assert_eq!(sup.restart_deferred.as_ref().unwrap().restart, request);
         sup.restart_deferred = None;
         sup.restart_waits(
-            "stall",
+            &request,
+            None,
             Some(waiting(now - 45_000)),
             "aterm link-lost",
             true,
@@ -2598,7 +2858,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        sup.restart_asked("stall");
+        sup.restart_asked(&restart("stall"));
         assert_eq!(sup.ending, Ending::None);
         assert_eq!(sup.restart_deferred, None);
         assert_eq!(
@@ -2673,20 +2933,25 @@ mod tests {
         let mut sup = supervisor_of_an_unsignallable_child(&state);
         // No record yet: the request waits, journalled once however often it
         // is looked at again, and the latest request replaces it.
-        sup.restart_asked("asked");
+        sup.restart_asked(&restart("asked"));
         sup.restart_retry();
         sup.restart_retry();
         assert_eq!(
             sup.restart_deferred.as_ref().map(|d| (
-                d.cause.as_str(),
+                d.restart.cause.as_str(),
                 d.why.as_str(),
                 d.on_aterm_since_ms
             )),
             Some(("asked", "no-record", None))
         );
-        sup.restart_asked("stall");
+        sup.restart_asked(&restart("stall"));
+        let account = Restart::parse("cause=account to=work home=- model=haiku".split_whitespace())
+            .expect("typed account restart");
+        sup.restart_asked(&account);
         assert_eq!(
-            sup.restart_deferred.as_ref().map(|d| d.cause.as_str()),
+            sup.restart_deferred
+                .as_ref()
+                .map(|d| d.restart.cause.as_str()),
             Some("stall")
         );
         // The child it was for is gone: nothing is left to restart.
@@ -2695,19 +2960,53 @@ mod tests {
         sup.restart_retry();
         // Whatever else is ending the child, or has, decides alone.
         sup.ending = Ending::Passed(libc::SIGTERM);
-        sup.restart_asked("asked");
+        sup.restart_asked(&restart("asked"));
         sup.ending = crashed(ChildEvent::Exited(7));
-        sup.restart_asked("asked");
+        sup.restart_asked(&restart("asked"));
         assert_eq!(sup.restart_deferred, None);
         assert_eq!(
             events(&state),
             [
                 "aterm restart cause=asked deferred no-record",
                 "aterm restart cause=stall deferred no-record",
+                "aterm restart cause=account ignored account-assignment-unsupported",
                 "aterm restart cause=stall ignored child-replaced",
                 "aterm restart cause=asked ignored session-ending",
                 "aterm restart cause=asked ignored crash-pending",
             ]
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn an_abandoned_model_restart_leaves_the_launch_basis_intact() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let state = fresh_state("restart-model-abandoned");
+        let mut sup = supervisor_of_an_unsignallable_child(&state);
+        sup.setup.args = os(&["--model", "sonnet"]);
+        sup.child.build.dir = state.join("store/claude/1");
+        sup.child.build.exe = sup.child.build.dir.join("bin/claude");
+        std::fs::create_dir_all(sup.child.build.exe.parent().unwrap()).unwrap();
+        std::fs::write(&sup.child.build.exe, b"lease fixture").unwrap();
+        std::fs::set_permissions(&sup.child.build.exe, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let plan = sup
+            .same_build_plan("conversation".into(), vec!["--model".into(), "opus".into()])
+            .unwrap();
+        sup.ending = Ending::ForRestart {
+            sent: Instant::now() - Duration::from_millis(RESTART_GRACE_MS + 1),
+            plan,
+            cause: "model".into(),
+            selected_args: Some(os(&["--model", "opus"])),
+            killed: false,
+        };
+        sup.restart_escalate();
+        assert_eq!(sup.ending, Ending::None);
+        assert_eq!(sup.setup.args, os(&["--model", "sonnet"]));
+        assert_eq!(
+            events(&state),
+            ["restart-abandoned cause=model the child kept running after SIGTERM"]
         );
         let _ = std::fs::remove_dir_all(&state);
     }
@@ -2735,7 +3034,11 @@ mod tests {
         // The fixture is no transferable supervisor, but it passes this gate.
         assert_ne!(refused(&sup), Err(GATE.to_string()));
         sup.restart_deferred = Some(Deferred {
-            cause: "asked".to_string(),
+            restart: Restart {
+                model: Some("opus".into()),
+                ..restart("asked")
+            },
+            record: None,
             why: "no-record".to_string(),
             on_aterm_since_ms: None,
             retry_at_ms: 0,

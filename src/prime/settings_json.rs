@@ -28,10 +28,7 @@ impl Json {
     /// # Errors
     /// The byte offset and a word about what was expected.
     pub fn parse(text: &str) -> Result<Self, String> {
-        let mut p = Parser {
-            src: text.as_bytes(),
-            at: 0,
-        };
+        let mut p = Parser { src: text, at: 0 };
         p.ws();
         let value = p.value(0)?;
         p.ws();
@@ -182,7 +179,7 @@ fn string_into(out: &mut String, s: &str) {
 }
 
 struct Parser<'a> {
-    src: &'a [u8],
+    src: &'a str,
     at: usize,
 }
 
@@ -192,14 +189,15 @@ impl Parser<'_> {
     }
 
     const fn ws(&mut self) {
-        while self.at < self.src.len() && matches!(self.src[self.at], b' ' | b'\t' | b'\n' | b'\r')
+        while self.at < self.src.len()
+            && matches!(self.src.as_bytes()[self.at], b' ' | b'\t' | b'\n' | b'\r')
         {
             self.at += 1;
         }
     }
 
     fn peek(&self) -> Option<u8> {
-        self.src.get(self.at).copied()
+        self.src.as_bytes().get(self.at).copied()
     }
 
     fn eat(&mut self, want: u8) -> Result<(), String> {
@@ -228,7 +226,7 @@ impl Parser<'_> {
     }
 
     fn literal(&mut self, word: &str, value: Json) -> Result<Json, String> {
-        if self.src[self.at..].starts_with(word.as_bytes()) {
+        if self.src.as_bytes()[self.at..].starts_with(word.as_bytes()) {
             self.at += word.len();
             Ok(value)
         } else {
@@ -264,7 +262,10 @@ impl Parser<'_> {
             self.digits();
         }
         Ok(Json::Number(
-            String::from_utf8_lossy(&self.src[start..self.at]).into_owned(),
+            self.src
+                .get(start..self.at)
+                .ok_or_else(|| self.err("a digit"))?
+                .to_owned(),
         ))
     }
 
@@ -287,7 +288,9 @@ impl Parser<'_> {
                 self.at += 1;
             }
             out.push_str(
-                std::str::from_utf8(&self.src[start..self.at]).map_err(|_| self.err("UTF-8"))?,
+                self.src
+                    .get(start..self.at)
+                    .ok_or_else(|| self.err("UTF-8"))?,
             );
             let Some(b) = self.peek() else {
                 return Err(self.err("a closing quote"));
@@ -313,7 +316,7 @@ impl Parser<'_> {
                             let hi = self.hex4()?;
                             let ch = if (0xD800..0xDC00).contains(&hi) {
                                 // A surrogate pair: `\uD83D\uDE00`.
-                                if !self.src[self.at..].starts_with(b"\\u") {
+                                if !self.src.as_bytes()[self.at..].starts_with(b"\\u") {
                                     return Err(self.err("the low half of a surrogate pair"));
                                 }
                                 self.at += 2;
@@ -337,7 +340,7 @@ impl Parser<'_> {
 
     fn hex4(&mut self) -> Result<u32, String> {
         let end = self.at + 4;
-        let value = self.src.get(self.at..end).and_then(|digits| {
+        let value = self.src.as_bytes().get(self.at..end).and_then(|digits| {
             digits
                 .iter()
                 .try_fold(0, |v, &b| Some((v << 4) | char::from(b).to_digit(16)?))

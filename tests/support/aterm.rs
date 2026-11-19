@@ -92,12 +92,14 @@ pub const INFO_ROSTERED: &str = "OK native-act state=info epoch=d1a48b482e4c6b39
     native-act=1 handoff=blocked clock=monotonic-us \
     own-image=grok-alab:upgrade,muse-alab:upgrade,kimi-alab:upgrade,claude-code-alab:upgrade";
 
-/// The current native host's canonical info grammar on kernels with child proof:
-/// `native_act.rs`'s `Request::Info` inserts `harness_claim::child_capabilities()`
-/// before the roster. The epoch is synthetic; the field order and capability words are not.
+/// A roster response carrying both C3 child capabilities and a synthetic epoch.
 pub const INFO_CURRENT: &str = "OK native-act state=info epoch=d1a48b482e4c6b391c4715137ce246b6 \
     native-act=1 handoff=close clock=monotonic-us child-proof=1 child-start=1 \
     own-image=grok-alab:upgrade,muse-alab:upgrade,kimi-alab:upgrade,claude-code-alab:upgrade";
+
+/// The response from an aterm build whose Info parser predates capabilities.
+const INFO_CAPABILITIES_UNSUPPORTED: &str =
+    "ERR usage: native-act <prepare|precommit|commit|query|signal|resume> <bounded fields>";
 
 /// What `native-act info` answers today (aterm `d29d3887c4d`, read from a
 /// running aterm on 2026-11-12): no `claude-code-alab` row. A new fake starts
@@ -213,6 +215,26 @@ struct Claim {
     child_generation: Option<u64>,
 }
 
+#[derive(Debug)]
+enum ReplyEffect {
+    Rename {
+        source: PathBuf,
+        target: PathBuf,
+        receipt: Option<PathBuf>,
+    },
+    Signal {
+        pid: i32,
+        sig: i32,
+    },
+}
+
+#[derive(Debug)]
+struct ReplyHook {
+    verb: String,
+    remaining_matches: usize,
+    effect: ReplyEffect,
+}
+
 /// What a [`FakeAterm`] answers, and what it was asked.
 #[derive(Debug)]
 struct State {
@@ -221,6 +243,7 @@ struct State {
     /// A whole reply sent in place of the policy line, when set.
     policy_reply: Option<String>,
     info: String,
+    info_capabilities: Option<String>,
     claim_reply: String,
     start_reply: Option<String>,
     proven: bool,
@@ -242,6 +265,7 @@ struct State {
     streams: Vec<UnixStream>,
     /// How long each addressed request waits before it is answered.
     delay: Duration,
+    reply_hook: Option<ReplyHook>,
     /// A path whose existence is recorded as each addressed request arrives.
     witness: Option<PathBuf>,
     /// For each of `verbs`, whether the witness path existed when it arrived.
@@ -721,6 +745,10 @@ impl State {
                 .unwrap_or_else(|| format!("OK gen={} {}", self.generation, self.policy_body()))
         } else if verb == "native-act info" {
             self.info.clone()
+        } else if verb == "native-act info capabilities=1" {
+            self.info_capabilities
+                .clone()
+                .unwrap_or_else(|| INFO_CAPABILITIES_UNSUPPORTED.to_string())
         } else if verb == "status" {
             self.status_line()
         } else if verb == "text --json" {
@@ -806,6 +834,7 @@ impl FakeAterm {
             policy: POLICY_ON.to_string(),
             policy_reply: None,
             info: INFO_UNROSTERED.to_string(),
+            info_capabilities: None,
             claim_reply: "OK".to_string(),
             start_reply: None,
             proven: true,
@@ -823,6 +852,7 @@ impl FakeAterm {
             connections: 0,
             streams: Vec::new(),
             delay: Duration::ZERO,
+            reply_hook: None,
             witness: None,
             witnessed: Vec::new(),
             body_log: None,
@@ -935,6 +965,11 @@ impl FakeAterm {
         lock(&self.state).info = reply.to_string();
     }
 
+    /// Answer the opt-in Info request with exactly `reply`.
+    pub fn set_info_capabilities(&self, reply: &str) {
+        lock(&self.state).info_capabilities = Some(reply.to_string());
+    }
+
     /// Answer `meta set supervisor …` with exactly `reply`. Only `OK` stores a
     /// claim; `ERR unproven: …` is what aterm answers a rostered holder it could
     /// not prove.
@@ -1011,6 +1046,62 @@ impl FakeAterm {
     /// show.
     pub fn set_reply_delay(&self, delay: Duration) {
         lock(&self.state).delay = delay;
+    }
+
+    /// Atomically replace a fixture file before replying to the next request
+    /// for `verb`. The request has reached aterm while the old file still stands.
+    pub fn rename_before_reply(&self, verb: &str, source: &Path, target: &Path) {
+        self.rename_before_nth_reply(verb, 1, source, target);
+    }
+
+    /// Atomically rename a fixture file before the `nth` matching reply after
+    /// this call, counting from one.
+    pub fn rename_before_nth_reply(&self, verb: &str, nth: usize, source: &Path, target: &Path) {
+        self.before_nth_reply(
+            verb,
+            nth,
+            ReplyEffect::Rename {
+                source: source.to_path_buf(),
+                target: target.to_path_buf(),
+                receipt: None,
+            },
+        );
+    }
+
+    /// Publish a fixture command and wait until its actor supplies the receipt.
+    pub fn rename_before_reply_and_wait(
+        &self,
+        verb: &str,
+        source: &Path,
+        target: &Path,
+        receipt: &Path,
+    ) {
+        self.before_nth_reply(
+            verb,
+            1,
+            ReplyEffect::Rename {
+                source: source.to_path_buf(),
+                target: target.to_path_buf(),
+                receipt: Some(receipt.to_path_buf()),
+            },
+        );
+    }
+
+    /// Signal this scenario's harness before answering the next matching request.
+    pub fn signal_before_reply(&self, verb: &str, pid: i32, sig: i32) {
+        assert!(pid > 0, "the hook signals a single process");
+        self.before_nth_reply(verb, 1, ReplyEffect::Signal { pid, sig });
+    }
+
+    fn before_nth_reply(&self, verb: &str, nth: usize, effect: ReplyEffect) {
+        assert_ne!(nth, 0, "reply indices start at one");
+        let mut state = lock(&self.state);
+        assert!(state.reply_hook.is_none(), "a reply hook is already set");
+        state.reply_hook = Some(ReplyHook {
+            verb: verb.to_string(),
+            remaining_matches: nth,
+            effect,
+        });
     }
 
     /// Record, as each addressed request arrives from now on, whether `path`
@@ -1348,8 +1439,39 @@ fn serve(stream: UnixStream, id: u64, state: &Mutex<State>, stop: &AtomicBool, s
             "OK version=fake-aterm".to_string()
         } else if let Some(verb) = line.strip_prefix(&format!("@{sid} ")) {
             // The request is recorded as it arrives and answered after the delay.
-            let delay = lock(state).delay;
-            let reply = lock(state).answer(id, verb);
+            let (reply, delay, hook) = {
+                let mut state = lock(state);
+                let ready = state.reply_hook.as_mut().is_some_and(|hook| {
+                    if hook.verb != verb {
+                        return false;
+                    }
+                    hook.remaining_matches -= 1;
+                    hook.remaining_matches == 0
+                });
+                let hook = if ready { state.reply_hook.take() } else { None };
+                (state.answer(id, verb), state.delay, hook)
+            };
+            if let Some(hook) = hook {
+                match hook.effect {
+                    ReplyEffect::Rename {
+                        source,
+                        target,
+                        receipt,
+                    } => {
+                        std::fs::rename(source, target).expect("replace the fixture file");
+                        if let Some(receipt) = receipt {
+                            let until = Instant::now() + HANG;
+                            while !receipt.is_file() && !stop.load(Ordering::Relaxed) {
+                                assert!(Instant::now() < until, "fixture receipt at {receipt:?}");
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
+                    }
+                    ReplyEffect::Signal { pid, sig } => {
+                        assert!(claude_code_alab::sys::kill(pid, sig), "kill({pid}, {sig})");
+                    }
+                }
+            }
             if !delay.is_zero() {
                 std::thread::sleep(delay);
             }

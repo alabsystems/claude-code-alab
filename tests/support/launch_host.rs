@@ -272,7 +272,7 @@ pub(super) fn entry() {
 
 fn helper(s: &Scenario) -> PathBuf {
     let path = s.root.join("aterm-host");
-    std::fs::hard_link(std::env::current_exe().expect("test image"), &path).expect("host image");
+    copy_fixture(&std::env::current_exe().expect("test image"), &path);
     path
 }
 
@@ -531,9 +531,9 @@ fn signal_scenario(name: &str) -> Scenario {
     let s = Scenario::new(name);
     // This actor calls the actual CLI library in the test image. A separate
     // native inode for the vendor preserves the product's self-image refusal.
-    let vendor = s.root.join("vendor-image");
-    std::fs::copy(std::env::current_exe().unwrap(), &vendor).unwrap();
-    s.add_build_of(BUILD_1, Some("9.9.1"), &vendor);
+    s.add_build_with(BUILD_1, Some("9.9.1"), |dest| {
+        copy_fixture(&std::env::current_exe().expect("test image"), dest);
+    });
     s.set_current(BUILD_1);
     s.put("mode", "echo:7");
     s
@@ -845,7 +845,7 @@ pub(super) fn managed_child_proof_and_image_pinning_follow_the_token_exec() {
     s.add_build(BUILD_2, Some("9.9.2"));
     s.set_current(BUILD_1);
     let host = s.root.join("distinct-aterm-host");
-    std::fs::copy(std::env::current_exe().unwrap(), &host).expect("distinct helper image");
+    copy_fixture(&std::env::current_exe().unwrap(), &host);
     let fake = rostered_aterm(&s);
     fake.set_info(&format!("{INFO_ROSTERED} child-proof=1"));
     let pty = Pty::open();
@@ -1241,6 +1241,83 @@ pub(super) fn managed_option_values_stay_exact_and_keep_host_services() {
             log.lines().count(),
             (at + 1) * 2,
             "tap and token route remain enabled for {value}: {log}"
+        );
+    }
+}
+
+pub(super) fn managed_model_relaunch_preserves_resume_and_host_services() {
+    let s = Scenario::new("managed-model-relaunch");
+    s.add_build(BUILD_1, Some("9.9.1"));
+    s.set_current(BUILD_1);
+    s.put("mode", "echo:7");
+    let host = helper(&s);
+    let resume = [
+        "--resume",
+        SID,
+        "--system-prompt",
+        "--no-harness",
+        "--append-system-prompt",
+        "--model=literal-value",
+        "--",
+        "--model",
+        "literal-model",
+        "--alab-help",
+        "",
+    ];
+    let tap_args = ["--model", "opus[1m]"]
+        .into_iter()
+        .chain(resume)
+        .collect::<Vec<_>>();
+    let vendor_args = [
+        "--settings",
+        "{\"statusLine\":{\"type\":\"command\",\"command\":\"fake-tap\"}}",
+    ]
+    .into_iter()
+    .chain(tap_args.iter().copied())
+    .collect::<Vec<_>>();
+    let tap = ["harness", "tap", "--launch", "--"]
+        .into_iter()
+        .chain(tap_args.iter().copied())
+        .collect::<Vec<_>>()
+        .join("\t");
+
+    for (at, old_model) in [&["--model", "sonnet"][..], &["--model=sonnet"][..]]
+        .into_iter()
+        .enumerate()
+    {
+        let sent = ["--alab-poll-ms=50", "run", "--model", "opus[1m]", "--"]
+            .into_iter()
+            .chain(resume[..2].iter().copied())
+            .chain(old_model.iter().copied())
+            .chain(resume[2..].iter().copied())
+            .collect::<Vec<_>>();
+        let output = command(&s, &host, &sent)
+            .stdin(Stdio::null())
+            .output()
+            .expect("model relaunch");
+        assert_eq!(output.status.code(), Some(7), "{output:?}{}", s.report());
+        let starts = s.starts();
+        assert_eq!(starts.len(), at + 1, "{}", s.report());
+        let start = &starts[at];
+        assert_eq!(start.args, vendor_args, "{sent:?}{}", s.report());
+
+        let token = [
+            "harness",
+            "accounts",
+            "token-run",
+            "--auto",
+            "--",
+            &start.exe,
+        ]
+        .into_iter()
+        .chain(vendor_args.iter().copied())
+        .collect::<Vec<_>>()
+        .join("\t");
+        let log = std::fs::read_to_string(s.fake.join("host-log")).expect("host services");
+        assert_eq!(
+            log.lines().skip(at * 2).collect::<Vec<_>>(),
+            [tap.as_str(), token.as_str()],
+            "{log}"
         );
     }
 }

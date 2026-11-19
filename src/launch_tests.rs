@@ -8,20 +8,49 @@ fn os(words: &[&str]) -> Vec<OsString> {
 }
 
 #[test]
-fn only_the_managed_envelope_selects_launch_policy() {
-    assert!(managed(&os(&["run", "--"])));
-    assert!(managed(&os(&["launch", "--"])));
-    assert!(managed(&os(&[
-        "--alab-poll-ms=50",
-        "run",
+fn the_live_launch_scan_can_distinguish_a_separator_value_from_the_literal_tail() {
+    let args = os(&[
+        "--append-system-prompt",
         "--",
-        "--version"
-    ])));
-    assert!(!managed(&os(&["run"])));
-    assert!(!managed(&os(&["--model", "run", "--"])));
-    assert!(!managed(&os(&["run", "a task"])));
-    assert!(!managed(&os(&["launch", "a task"])));
-    assert!(!managed(&os(&["--", "launch", "--"])));
+        "--model=sonnet",
+        "--resume",
+        "conversation",
+        "--",
+        "--model=literal",
+    ]);
+    let option_end = args.len();
+    assert_eq!(
+        override_model(args, "opus".into(), option_end).unwrap(),
+        os(&[
+            "--model",
+            "opus",
+            "--append-system-prompt",
+            "--",
+            "--resume",
+            "conversation",
+            "--",
+            "--model=literal",
+        ])
+    );
+}
+
+#[test]
+fn only_the_managed_envelope_selects_launch_policy() {
+    let managed = |words| {
+        let crate::cli::Command::Run { managed, .. } = crate::cli::parse(os(words)).unwrap() else {
+            panic!("expected a vendor launch");
+        };
+        managed
+    };
+    assert!(managed(&["run", "--"]));
+    assert!(managed(&["run", "--model", "opus", "--"]));
+    assert!(managed(&["launch", "--"]));
+    assert!(managed(&["--alab-poll-ms=50", "run", "--", "--version"]));
+    assert!(!managed(&["run"]));
+    assert!(!managed(&["--model", "run", "--"]));
+    assert!(!managed(&["run", "a task"]));
+    assert!(!managed(&["launch", "a task"]));
+    assert!(!managed(&["--", "launch", "--"]));
 }
 
 #[test]

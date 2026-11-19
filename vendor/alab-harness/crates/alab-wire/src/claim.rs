@@ -504,6 +504,17 @@ pub fn info_verb(sid: &str) -> Option<String> {
     addressed(sid, "native-act info")
 }
 
+/// The opt-in roster question for a C3 native child tracking client.
+pub(crate) const INFO_CAPABILITIES: &str = "native-act info capabilities=1";
+
+/// aterm's parser reply before `info` accepted the opt-in argument.
+pub(crate) const INFO_CAPABILITIES_UNSUPPORTED: &str =
+    "ERR usage: native-act <prepare|precommit|commit|query|signal|resume> <bounded fields>";
+
+pub(crate) fn info_capabilities_verb(sid: &str) -> Option<String> {
+    addressed(sid, INFO_CAPABILITIES)
+}
+
 /// The roster guard: whether a `native-act info` reply names harness `id`'s row
 /// with the `upgrade` duty.
 ///

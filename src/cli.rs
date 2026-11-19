@@ -222,7 +222,7 @@ pub fn nesting_depth(inherited: Option<&OsStr>) -> Result<u32, String> {
 /// hands a session to this harness as `claude-alab run -- <the launch's
 /// arguments>` (aterm `crates/atpkg/src/platform/mod.rs`, `sh_harness_prelude`),
 /// as it does for the sibling harnesses.
-pub const ENTRY_WORD: &str = "run";
+pub const ENTRY_WORD: &str = alab_wire::run::VERB;
 
 /// Managed launch preparation followed by same-PID vendor exec, without a
 /// supervisor, claim, signal handler or terminal-mode change.
@@ -315,7 +315,9 @@ pub enum Command {
         /// `--alab-no-live-update`, which runs the vendor alone
         /// ([`crate::supervise::live_update_refusal`]).
         live_update: bool,
-        /// The vendor's arguments, unchanged.
+        /// Whether to apply managed launch policy.
+        managed: bool,
+        /// The vendor's arguments, with the requested relaunch model applied.
         args: Vec<OsString>,
     },
     /// Print the version headline and shared origin line.
@@ -332,7 +334,7 @@ pub fn usage() -> String {
          {ORIGIN_LINE}\n\
          \n\
          usage: {TOOL} [--alab-<option>…] [{COMMAND} arguments…]\n\
-         \x20      {TOOL} [--alab-<option>…] {ENTRY_WORD} -- [{COMMAND} arguments…]\n\
+         \x20      {TOOL} [--alab-<option>…] {ENTRY_WORD} [--model <word>] -- [{COMMAND} arguments…]\n\
          \x20      {TOOL} [--alab-<option>…] {LAUNCH_ENTRY_WORD} -- [{COMMAND} arguments…]\n\
          \x20      {TOOL} prime <settings-defaults|legacy-hooks> --home <absolute-path> --config <absolute-path>\n\
          \x20      {TOOL} inspect settings-defaults --home <absolute-path> --config <absolute-path> --auto-prime=0|1\n\
@@ -363,15 +365,14 @@ pub fn usage() -> String {
 
 /// Parse the arguments after `argv[0]`.
 ///
-/// The harness's own words lead: `--alab-` options, then, optionally, atpkg's
-/// envelope `run --` or `launch --`. The latter always execs the vendor in
-/// place. After either envelope nothing is the
-/// harness's: an `--alab-` word and a lone `--version` there are the vendor's.
-/// Either entry word with any other word after it, or none, is not the envelope and goes to
-/// the vendor like every other first vendor word (docs/DECISIONS.md, 37).
+/// The harness options lead. `run --` and `run --model <word> --` select
+/// managed launch policy. `launch --` prepares a same-PID vendor exec.
+/// The words after the envelope's separator belong to the vendor. Bare
+/// `run` and vendor `run` arguments without the envelope pass through.
 ///
 /// # Errors
-/// A malformed or unknown `--alab-` option.
+/// A malformed harness option or relaunch envelope, or a relaunch asking
+/// for an account the Claude adapter cannot select.
 pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     let mut opts = Options::default();
     let mut live_update = true;
@@ -407,18 +408,43 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         }
         rest.next();
     }
-    let mut args: Vec<OsString> = rest.collect();
-    if crate::launch::managed(&args) {
-        if args[0] == LAUNCH_ENTRY_WORD {
+    let args: Vec<OsString> = rest.collect();
+    use alab_wire::run::{ACCOUNT, HOME, MODEL, Run, SEPARATOR};
+    let (managed, args) = match args.as_slice() {
+        [verb, separator, ..] if verb == LAUNCH_ENTRY_WORD && separator == SEPARATOR => {
             live_update = false;
+            (true, args.into_iter().skip(2).collect())
         }
-        args.drain(..2);
-    } else if args.len() == 1 && (args[0] == "--version" || args[0] == "-v") {
-        return Ok(Command::Version);
-    }
+        [verb, first, tail @ ..]
+            if verb == ENTRY_WORD
+                && (first == SEPARATOR
+                    || (matches!(first.to_str(), Some(ACCOUNT | HOME | MODEL))
+                        && tail.iter().any(|word| word == SEPARATOR))) =>
+        {
+            let run = Run::parse(args).map_err(|error| format!("invalid run envelope: {error}"))?;
+            if run.account.is_some() {
+                return Err("Claude account selection requires a host assignment".into());
+            }
+            let vendor = match run.model {
+                Some(model) => {
+                    let option_end = run
+                        .resume
+                        .iter()
+                        .position(|word| word == "--")
+                        .unwrap_or(run.resume.len());
+                    crate::launch::override_model(run.resume, model, option_end)?
+                }
+                None => run.resume,
+            };
+            (true, vendor)
+        }
+        [word] if word == "--version" || word == "-v" => return Ok(Command::Version),
+        _ => (false, args),
+    };
     Ok(Command::Run {
         opts,
         live_update,
+        managed,
         args,
     })
 }
@@ -607,7 +633,6 @@ pub fn main_with_image_host(
             }
         }
     }
-    let managed = crate::launch::managed(&words);
     let command = match parse(words) {
         Ok(c) => c,
         Err(why) => {
@@ -616,7 +641,7 @@ pub fn main_with_image_host(
             std::process::exit(EXIT_USAGE);
         }
     };
-    let (opts, live_update, args) = match command {
+    let (opts, live_update, managed, args) = match command {
         Command::Help => {
             put(&usage());
             std::process::exit(0);
@@ -636,8 +661,9 @@ pub fn main_with_image_host(
         Command::Run {
             opts,
             live_update,
+            managed,
             args,
-        } => (opts, live_update, args),
+        } => (opts, live_update, managed, args),
     };
     let (mut args, disabled) = if managed {
         crate::launch::switches(args)
@@ -736,19 +762,21 @@ mod tests {
     }
 
     /// A launch of the vendor with `words` that may be moved.
-    fn run(opts: Options, words: &[&str]) -> Result<Command, String> {
+    fn run(opts: Options, words: &[&str], managed: bool) -> Result<Command, String> {
         Ok(Command::Run {
             opts,
             live_update: true,
+            managed,
             args: os(words),
         })
     }
 
     /// The same launch after `--alab-no-live-update`.
-    fn never_moved(opts: Options, words: &[&str]) -> Result<Command, String> {
+    fn never_moved(opts: Options, words: &[&str], managed: bool) -> Result<Command, String> {
         Ok(Command::Run {
             opts,
             live_update: false,
+            managed,
             args: os(words),
         })
     }
@@ -758,8 +786,8 @@ mod tests {
         // After the first vendor word an `--alab-` word is the vendor's, and
         // changes nothing about the launch.
         let args = ["--model", "opus", "--alab-no-live-update", "-p", "hi"];
-        assert_eq!(parse(os(&args)), run(Options::default(), &args));
-        assert_eq!(parse(Vec::new()), run(Options::default(), &[]));
+        assert_eq!(parse(os(&args)), run(Options::default(), &args, false));
+        assert_eq!(parse(Vec::new()), run(Options::default(), &[], false));
         use std::os::unix::ffi::OsStringExt as _;
         let owned = OsString::from_vec(b"--alab-poll-ms=\xff".to_vec());
         for words in [
@@ -773,6 +801,7 @@ mod tests {
                 Ok(Command::Run {
                     opts: Options::default(),
                     live_update: true,
+                    managed: false,
                     args: words,
                 })
             );
@@ -788,6 +817,7 @@ mod tests {
             Ok(Command::Run {
                 opts: Options::default(),
                 live_update: false,
+                managed: true,
                 args: vec![opaque],
             })
         );
@@ -799,7 +829,10 @@ mod tests {
         ] {
             let mut args = vec!["launch", "--"];
             args.extend_from_slice(vendor);
-            assert_eq!(parse(os(&args)), never_moved(Options::default(), vendor));
+            assert_eq!(
+                parse(os(&args)),
+                never_moved(Options::default(), vendor, true)
+            );
         }
         assert_eq!(
             parse(os(&["--alab-poll-ms=50", "launch", "--", "task"])),
@@ -808,7 +841,8 @@ mod tests {
                     poll_ms: 50,
                     ..Options::default()
                 },
-                &["task"]
+                &["task"],
+                true
             )
         );
         for words in [
@@ -816,7 +850,7 @@ mod tests {
             &["launch", "a task"],
             &["--", "launch", "--"],
         ] {
-            assert_eq!(parse(os(words)), run(Options::default(), words));
+            assert_eq!(parse(os(words)), run(Options::default(), words, false));
         }
     }
 
@@ -863,14 +897,15 @@ mod tests {
                     poll_ms: 50,
                     term_grace_ms: TERM_GRACE_MS,
                 },
-                &["--resume", "x"]
+                &["--resume", "x"],
+                false
             )
         );
         // The option is one word: alone it changes only whether the launch
         // may be moved.
         assert_eq!(
             parse(os(&["--alab-no-live-update"])),
-            never_moved(Options::default(), &[])
+            never_moved(Options::default(), &[], false)
         );
     }
 
@@ -883,15 +918,19 @@ mod tests {
             Ok(Command::Run {
                 opts: Options::default(),
                 live_update: true,
+                managed: true,
                 args: vec![opaque],
             })
         );
         // What the twin sends: `run --`, then the launch's own arguments.
         assert_eq!(
             parse(os(&["run", "--", "--model", "opus", "fix it"])),
-            run(Options::default(), &["--model", "opus", "fix it"])
+            run(Options::default(), &["--model", "opus", "fix it"], true)
         );
-        assert_eq!(parse(os(&["run", "--"])), run(Options::default(), &[]));
+        assert_eq!(
+            parse(os(&["run", "--"])),
+            run(Options::default(), &[], true)
+        );
         // Nothing after the envelope is the harness's: not an `--alab-` word
         // (known, unknown or private), not a lone version flag, not a second
         // `run --`, not an empty word.
@@ -910,7 +949,7 @@ mod tests {
             words.extend_from_slice(vendor);
             assert_eq!(
                 parse(os(&words)),
-                run(Options::default(), vendor),
+                run(Options::default(), vendor, true),
                 "{vendor:?}"
             );
         }
@@ -930,7 +969,8 @@ mod tests {
                     poll_ms: 50,
                     ..Options::default()
                 },
-                &["--alab-poll-ms=60", "--resume", "x"]
+                &["--alab-poll-ms=60", "--resume", "x"],
+                true
             )
         );
         assert_eq!(
@@ -941,12 +981,105 @@ mod tests {
     }
 
     #[test]
+    fn a_model_relaunch_keeps_the_resume_and_replaces_only_model_options() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let opaque = OsString::from_vec(b"--alab-poll-ms=\xff".to_vec());
+        let mut resume = os(&[
+            "--model=sonnet",
+            "--system-prompt",
+            "--model",
+            "--resume",
+            "conversation",
+            "--model",
+            "haiku",
+            "--",
+            "--model",
+            "literal",
+            "",
+        ]);
+        resume.push(opaque.clone());
+        let envelope = alab_wire::run::Run {
+            account: None,
+            model: Some("opus[1m]".into()),
+            resume,
+        };
+        let mut args = os(&["--alab-poll-ms=50"]);
+        args.extend(envelope.args().unwrap());
+        let mut vendor = os(&[
+            "--model",
+            "opus[1m]",
+            "--system-prompt",
+            "--model",
+            "--resume",
+            "conversation",
+            "--",
+            "--model",
+            "literal",
+            "",
+        ]);
+        vendor.push(opaque);
+        assert_eq!(
+            parse(args),
+            Ok(Command::Run {
+                opts: Options {
+                    poll_ms: 50,
+                    ..Options::default()
+                },
+                live_update: true,
+                managed: true,
+                args: vendor,
+            })
+        );
+    }
+
+    #[test]
+    fn a_recognized_run_envelope_refuses_invalid_or_unavailable_options() {
+        for words in [
+            &["run", "--model", "--"][..],
+            &["run", "--model", "mixed case with spaces", "--"],
+            &["run", "--model", "opus", "--model", "sonnet", "--"],
+            &["run", "--model", "opus", "--unknown", "--"],
+            &["run", "--home", "/copied", "--"],
+            &["run", "--account", "work", "--"],
+            &["run", "--account", "work", "--home", "/copied", "--"],
+            &["run", "--model", "opus", "--", "update"],
+            &[
+                "run",
+                "--model",
+                "opus",
+                "--",
+                "--unknown",
+                "--model",
+                "sonnet",
+            ],
+        ] {
+            assert!(parse(os(words)).is_err(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_saved_model_value_cannot_consume_the_vendor_separator() {
+        assert_eq!(
+            parse(os(&[
+                "run", "--model", "opus", "--", "--model", "--", "--model", "literal"
+            ])),
+            run(
+                Options::default(),
+                &["--model", "opus", "--", "--model", "literal"],
+                true
+            )
+        );
+    }
+
+    #[test]
     fn run_without_its_dashes_is_the_vendors_word() {
-        // `claude run` is a launch with the prompt "run": only `run --` is the envelope.
+        // `claude run` is a launch with the prompt "run".
         for words in [
             &["run"][..],
             &["run", "fix it"],
             &["run", "--version"],
+            &["run", "--model", "opus"],
+            &["run", "fix it", "--", "--model"],
             &["run", "--alab-help"],
             &["run", "-", "-"],
             &["run", "---"],
@@ -956,7 +1089,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse(os(words)),
-                run(Options::default(), words),
+                run(Options::default(), words, false),
                 "{words:?}"
             );
         }
@@ -968,10 +1101,11 @@ mod tests {
             Ok(Command::Run {
                 opts: Options::default(),
                 live_update: true,
+                managed: false,
                 args: odd
             })
         );
-        assert!(usage().contains(&format!("{ENTRY_WORD} -- [")));
+        assert!(usage().contains(&format!("{ENTRY_WORD} [--model <word>] -- [")));
     }
 
     #[test]
@@ -1122,7 +1256,8 @@ mod tests {
                     term_grace_ms: 1500,
                     ..Options::default()
                 },
-                &["-c"]
+                &["-c"],
+                false
             )
         );
     }

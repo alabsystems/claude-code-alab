@@ -145,33 +145,27 @@ pub fn inherited_read_end(saved: &SignalSnapshot) -> io::Result<RawFd> {
     Ok(saved.read_fd)
 }
 
-/// One bounded `poll` over the signal pipe's read end `fd` and, when given, one
-/// descriptor of the caller's; then the queued signals, and whether `extra`
-/// would not block a read. A negative `extra` is no descriptor and never ready
-/// (`poll` ignores it). An interrupted or failed `poll` reports `extra` as not
-/// ready: the caller's next wait asks again, and a signal that interrupted this
-/// one is drained here.
-fn wait_two(fd: RawFd, extra: Option<RawFd>, timeout_ms: u64) -> (Vec<libc::c_int>, bool) {
-    let mut pfds = [
-        libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: extra.unwrap_or(-1),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    let count: libc::nfds_t = if extra.is_some() { 2 } else { 1 };
+/// Wait on the signal pipe and both optional harness descriptors. An interrupted
+/// or failed `poll` still drains the signals but reports no socket readiness.
+fn wait_extra(fd: RawFd, extra: [Option<RawFd>; 2], timeout_ms: u64) -> (Vec<libc::c_int>, bool) {
+    let mut pfds = [Some(fd), extra[0], extra[1]].map(|fd| libc::pollfd {
+        fd: fd.unwrap_or(-1),
+        events: libc::POLLIN,
+        revents: 0,
+    });
     let timeout = libc::c_int::try_from(timeout_ms).unwrap_or(libc::c_int::MAX);
-    // SAFETY: pfds holds `count` initialized, writable poll records.
-    let ready = unsafe { libc::poll(pfds.as_mut_ptr(), count, timeout) };
-    let extra_ready = ready > 0
-        && extra.is_some_and(|extra| extra >= 0)
-        && pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
-    (queued_on(fd), extra_ready)
+    // SAFETY: pfds holds three initialized, writable poll records. A negative fd is ignored.
+    let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 3, timeout) };
+    let socket_ready = ready > 0
+        && pfds[1..].iter().any(|pfd| {
+            pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        });
+    (queued_on(fd), socket_ready)
+}
+
+#[cfg(test)]
+fn wait_two(fd: RawFd, extra: Option<RawFd>, timeout_ms: u64) -> (Vec<libc::c_int>, bool) {
+    wait_extra(fd, [extra, None], timeout_ms)
 }
 
 /// [`queued_signals`] on a read end the caller keeps open throughout.
@@ -933,18 +927,23 @@ impl SignalPipe {
         queued_on(fd)
     }
 
-    /// [`SignalPipe::wait`] that also wakes for one more descriptor: wait at most
-    /// `timeout_ms` for a caught signal or for `extra` to become readable, then
-    /// drain the queued signals, in order, and say whether `extra` is readable.
-    ///
-    /// The descriptor stays the caller's and is only polled, never read. It
-    /// reads `true` for anything that keeps a read from blocking: bytes, the end
-    /// of the stream, or an error on it, so the caller's own nonblocking read
-    /// finds out which. With `None` this is exactly [`SignalPipe::wait`] and the
-    /// flag is `false`.
+    /// Wait for a signal or either of the caller's two descriptors to become readable.
+    /// Return the signals and whether either socket has bytes, EOF or an error to read.
+    /// Polling does not read or take ownership of either socket.
     #[must_use]
-    pub fn wait_with(&self, timeout_ms: u64, extra: Option<RawFd>) -> (Vec<libc::c_int>, bool) {
-        wait_two(self.read_fd(), extra, timeout_ms)
+    pub fn wait_with(
+        &self,
+        timeout_ms: u64,
+        extra: [Option<RawFd>; 2],
+    ) -> (Vec<libc::c_int>, bool) {
+        wait_extra(self.read_fd(), extra, timeout_ms)
+    }
+
+    /// Carry an already caught stop into the next loop pass without raising
+    /// another terminal signal or disturbing the kernel's pending signals.
+    pub(crate) fn defer_stop(&self) {
+        debug_assert!(self.active);
+        on_signal(libc::SIGTSTP);
     }
 
     /// The read endpoint, where caught signals wait as bytes.

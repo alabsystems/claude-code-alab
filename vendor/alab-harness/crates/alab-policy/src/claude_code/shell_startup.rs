@@ -6,12 +6,8 @@
 //! The pure half of aterm's `supervise/policy/shell_startup.rs`: how a Claude Code shell
 //! snapshot ([`parse_snapshot`]) and a `.zshenv` ([`zshenv_hazard`], [`zshenv_sets_no_option`],
 //! [`reader_vars_named`]) are judged, what the startup they describe admits
-//! ([`ShellStartup::admits`]), and the startup itself, assembled from every reading
-//! ([`ShellStartup::assemble`] over [`StartupInputs`]). aterm is to keep only the live half in its
-//! file of the same name, once HX-21c's aterm half moves it onto this module: `read` making its
-//! checks, gathering the readings (`tool_kinds`, `snapshots`, `hook_env_scripts`, `zshenv`,
-//! `bash_env`, bounded by its `MAX_*`) and calling [`ShellStartup::assemble`]. Until then
-//! aterm-agent's file is a whole copy, this half included, and it alone decides what aterm does.
+//! ([`ShellStartup::admits`]). [`ShellStartup::assemble_with`] requests each observation from the
+//! host in decision order. [`ShellStartup::assemble`] takes the same readings as [`StartupInputs`].
 
 use super::CLAUDE_PART;
 use crate::git_config::git_relevant;
@@ -547,17 +543,45 @@ impl ShellStartup {
             zshenv,
             bash,
         } = inputs;
+        let unread = |kind: Kind| {
+            format!(
+                "the Bash tool may run {}, whose startup besides its snapshot was not read",
+                kind.name()
+            )
+        };
+        Self::assemble_with(
+            &kinds,
+            snapshots,
+            |var| env_set.iter().any(|v| v == var),
+            || settings_env,
+            || zshenv.clone().ok_or_else(|| unread(Kind::Zsh))?,
+            || bash.clone().ok_or_else(|| unread(Kind::Bash))?,
+        )
+    }
+
+    /// Reads and judges snapshots one at a time, then the worker's reader variables, settings
+    /// and each shell's startup in `kinds` order. A failed reading or snapshot parse returns
+    /// immediately. A host can supply a lazy iterator to keep only the current snapshot's text.
+    pub fn assemble_with(
+        kinds: &[Kind],
+        snapshots: impl IntoIterator<Item = (Kind, String, Result<String, String>)>,
+        mut env_set: impl FnMut(&str) -> bool,
+        settings_env: impl FnOnce() -> Result<Vec<(String, String, String)>, String>,
+        mut zshenv: impl FnMut() -> Result<(bool, Vec<(String, String)>), String>,
+        mut bash: impl FnMut() -> Result<bool, String>,
+    ) -> Result<ShellStartup, String> {
         let mut state = ShellStartup {
             zsh: kinds.contains(&Kind::Zsh),
             ..ShellStartup::default()
         };
-        for (kind, path, text) in &snapshots {
-            let text = text.as_ref().map_err(String::clone)?;
-            parse_snapshot(*kind, text, path, &mut state)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for (kind, path, text) in snapshots {
+            parse_snapshot(kind, &text?, &path, &mut state)?;
+            seen.insert(kind);
         }
         let mut set: Vec<(String, String)> = READER_ENV
             .iter()
-            .filter(|(var, _)| env_set.iter().any(|v| v == var))
+            .filter(|(var, _)| env_set(var))
             .map(|(var, _)| {
                 (
                     (*var).to_string(),
@@ -565,7 +589,7 @@ impl ShellStartup {
                 )
             })
             .collect();
-        for (source, key, _) in settings_env? {
+        for (source, key, _) in settings_env()? {
             if READER_ENV.iter().any(|(v, _)| *v == key) {
                 set.push((
                     key,
@@ -573,16 +597,10 @@ impl ShellStartup {
                 ));
             }
         }
-        let unread = |kind: Kind| {
-            format!(
-                "the Bash tool may run {}, whose startup besides its snapshot was not read",
-                kind.name()
-            )
-        };
-        for kind in kinds {
+        for &kind in kinds {
             match kind {
                 Kind::Zsh => {
-                    let (unproven, named) = zshenv.clone().ok_or_else(|| unread(kind))??;
+                    let (unproven, named) = zshenv()?;
                     state.extended_glob |= unproven;
                     state.dot_glob |= unproven;
                     for (var, path) in named {
@@ -590,13 +608,13 @@ impl ShellStartup {
                     }
                 }
                 Kind::Bash => {
-                    let globignore = bash.clone().ok_or_else(|| unread(kind))??;
+                    let globignore = bash()?;
                     state.dot_glob |= globignore;
                 }
             }
             // A shell that may run with no snapshot of its own read: Claude Code writes one from
             // the person's startup before the command it runs, unseen by this check.
-            if !snapshots.iter().any(|(k, _, _)| *k == kind) {
+            if !seen.contains(&kind) {
                 state.extended_glob |= kind == Kind::Zsh;
                 state.dot_glob = true;
             }

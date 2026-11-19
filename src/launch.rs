@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Claude Code's managed launch policy. The atpkg launcher supplies only the
-//! `run --` or `launch --` envelope and the path of its host; vendor arguments, renderer and
+//! `run` or `launch` envelope and the path of its host; vendor arguments, renderer and
 //! host services are selected here so changing them needs no aterm rebuild.
 
 use std::ffi::{OsStr, OsString};
@@ -64,19 +64,54 @@ fn info_flag(name: &str) -> bool {
     matches!(name, "--help" | "-h" | "--version" | "-v")
 }
 
-/// Whether the arguments use atpkg's managed envelope after leading harness options.
-#[must_use]
-pub fn managed(args: &[OsString]) -> bool {
-    let at = args
+/// Select the relaunch model once. A saved resume can contain an older model.
+/// Use the vendor option arities so model-looking values and literal suffixes
+/// keep their original bytes and order. `option_end` bounds the option scan
+/// for an envelope whose literal suffix has already been identified.
+pub(crate) fn override_model(
+    mut args: Vec<OsString>,
+    model: String,
+    option_end: usize,
+) -> Result<Vec<OsString>, String> {
+    use alab_wire::run::MODEL;
+    if args
+        .first()
+        .and_then(|word| word.to_str())
+        .is_some_and(|word| UPDATE_WORDS.contains(&word))
+    {
+        return Err("use `run --` for vendor maintenance commands".into());
+    }
+    let prefix = &args[..option_end];
+    let words: Vec<_> = std::iter::once(OsStr::new(crate::profile::COMMAND))
+        .chain(prefix.iter().map(OsString::as_os_str))
+        .collect();
+    if let Some(scan) = crate::profile::launch_words(&words, LAUNCH_FLAGS) {
+        let models: Vec<_> = scan
+            .flags
+            .into_iter()
+            .rev()
+            .filter(|(name, _)| *name == MODEL)
+            .map(|(_, position)| {
+                let at = position - 1;
+                let len = if prefix[at] == MODEL && at + 1 < option_end {
+                    2
+                } else {
+                    1
+                };
+                at..at + len
+            })
+            .collect();
+        for range in models {
+            args.drain(range);
+        }
+    } else if prefix
         .iter()
-        .take_while(|word| {
-            word.to_str()
-                .is_some_and(|word| word.starts_with("--alab-"))
-        })
-        .count();
-    args.get(at)
-        .is_some_and(|word| word == crate::cli::ENTRY_WORD || word == crate::cli::LAUNCH_ENTRY_WORD)
-        && args.get(at + 1).is_some_and(|word| word == "--")
+        .any(|word| word == MODEL || word.as_encoded_bytes().starts_with(b"--model="))
+    {
+        return Err("cannot identify the previous model in these relaunch arguments".into());
+    }
+    args.splice(..0, [OsString::from(MODEL), OsString::from(model)]);
+    Ok(args)
 }
 
 /// Vendor help and version queries require neither account services nor launch

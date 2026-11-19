@@ -22,7 +22,8 @@ pub enum ChildStart {
     },
     /// No negotiated C3 start barrier; existing C4 and absent-capability words stand.
     NoBarrier,
-    /// No claim supports the attempt. A failed held C3 begin closed both sockets.
+    /// No claim supports the attempt. A confirmed policy release keeps the
+    /// idle subscription, while a failed held C3 begin closes both sockets.
     Unclaimed(Failure),
 }
 
@@ -145,8 +146,9 @@ impl Link {
     ///
     /// A negotiated begin uses one original 500-ms deadline for high-water sync,
     /// begin, pending proof and at most one same-generation retry. Failure closes
-    /// both C3 sockets. It withdraws no cached host hold. Capability-absent C3
-    /// and all C4 claims return `NoBarrier`.
+    /// both C3 sockets. It withdraws no cached host hold. A confirmed policy
+    /// release skips the begin and keeps listening for policy changes.
+    /// Capability-absent C3 and all C4 claims return `NoBarrier`.
     pub fn before_spawn(&mut self, vendor: Option<&str>, now_ms: u64) -> ChildStart {
         self.before_spawn_clock(vendor, now_ms, &CHILD_GENERATION, Instant::now)
     }
@@ -183,7 +185,12 @@ impl Link {
                 "child-start prior child not retired".into(),
             )),
             State::Held(claimed) if !claimed.standing => {
-                Err(Failure::Gone("child-start no-standing-claim".into()))
+                let why = Failure::Gone("child-start no-standing-claim".into());
+                if !claimed.unreleased {
+                    claimed.native.pending = false;
+                    return ChildStart::Unclaimed(why);
+                }
+                Err(why)
             }
             State::Held(claimed) if claimed.native.mode == Mode::Absent => {
                 return ChildStart::NoBarrier;

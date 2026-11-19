@@ -85,7 +85,7 @@
 //! * `model`: `model` (text: the name as the vendor states it), `effort` (word), `key` (boolean:
 //!   whether the vendor's top-effort key is on; its word is not sent), `offers` (list of objects
 //!   `{"model","levels"}`: a model word, required, and a list of level words), `permission`
-//!   (word: the permission mode).
+//!   (word: the permission mode), `child` (as in `claim`: the process these facts belong to).
 //! * `act`: `act` (word, required: what it did), and the fields of that act, no others:
 //!   * `wait` ([`Did::WAIT`]: the continuation observation of `meta set harness_activity`):
 //!     `reason` (`person`, `composing`, `dialog`, `paused`, `working`, `ready`, `retry` or
@@ -1011,6 +1011,8 @@ pub enum Body {
     },
     /// `model`: the model, its effort and what is on offer, each only as the vendor states it.
     Model {
+        /// The child whose state this record reports. A replay keeps this identity.
+        child: Option<ChildProcess>,
         /// The model's name.
         model: Option<String>,
         /// Its effort level.

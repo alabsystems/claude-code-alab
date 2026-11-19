@@ -275,6 +275,13 @@ pub struct Counts {
     pub unanswered: u64,
 }
 
+/// A kept record aterm acknowledged by its own sequence number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Acknowledged {
+    pub(crate) kind: Kind,
+    pub(crate) own: bool,
+}
+
 /// One kept record, its line, and whether the link made it.
 #[derive(Debug)]
 struct Kept {
@@ -604,10 +611,14 @@ impl Outbox {
         self.counts.written += 1;
     }
 
-    /// aterm acknowledged `seq`: it and every record before it are no longer kept. The kind of
-    /// the record acknowledged, when it was kept; `Err` for an acknowledgement of a record not
-    /// written on this stream, a fault.
-    pub(crate) fn ack(&mut self, seq: u64, dropped: Option<&Dropped>) -> Result<Option<Kind>, ()> {
+    /// aterm acknowledged `seq`: it and every record before it are no longer kept. Returns the
+    /// exact record's kind and ownership when it was kept. An acknowledgement of a record not
+    /// written on this stream is a fault.
+    pub(crate) fn ack(
+        &mut self,
+        seq: u64,
+        dropped: Option<&Dropped>,
+    ) -> Result<Option<Acknowledged>, ()> {
         if seq > self.written {
             return Err(());
         }
@@ -621,7 +632,7 @@ impl Outbox {
             Some(Dropped::Refused(_)) => self.counts.refused += 1,
             Some(Dropped::Other(_)) => self.counts.other += 1,
         }
-        let mut kind = None;
+        let mut exact = None;
         while self
             .queue
             .front()
@@ -630,11 +641,14 @@ impl Outbox {
             if let Some(kept) = self.pop()
                 && kept.record.seq == seq
             {
-                kind = kept.record.body.kind();
+                exact = kept.record.body.kind().map(|kind| Acknowledged {
+                    kind,
+                    own: kept.own,
+                });
             }
         }
         self.acked = self.acked.max(seq);
-        Ok(kind)
+        Ok(exact)
     }
 
     /// One of aterm's records, at `seq`, was read: whether it is new (above the last heard).

@@ -69,12 +69,10 @@
 //! away, so it is [`Failure::Later`] and the claim is made again on the clock
 //! (kimi-alab's rule, measured there). Only a timeout is busy. A reply no
 //! client may read (over its size bound, not UTF-8, without an `OK`/`ERR`
-//! header) or a connection aterm closed stays [`Failure::Gone`], and an event
-//! subscription aterm answered with anything but its ACK is
-//! [`Failure::Refused`] (an incompatible aterm): either ends a launch as
-//! absent, as the client this was ported from did, rather than claiming and
-//! releasing again every [`RECLAIM_EVERY_MS`] and switching aterm's built-in
-//! engine between standing down and resuming each time.
+//! header) or a connection aterm closed stays [`Failure::Gone`]. An event
+//! subscription can ask to be retried ([`Failure::Later`]). A permanent
+//! subscription refusal ends the link once the provisional claim is released.
+//! If aterm might have kept a contract-4 claim, only its release is retried.
 //!
 //! **Bounds.** Opening at launch may take [`CONNECT_TIMEOUT`]; every later
 //! exchange, the reopening of a lost link included, is bounded by
@@ -314,6 +312,27 @@ fn transport_failure(step: &str, error: std::io::Error) -> Failure {
     }
 }
 
+/// Read the C3 roster, asking for child capabilities only when they are used.
+/// The old parser's explicit usage reply permits one ordinary roster request.
+fn read_c3_roster(
+    conn: &mut Connection,
+    sid: &str,
+    track_native_child: bool,
+) -> Result<String, Failure> {
+    if track_native_child {
+        let reply = ask(conn, "roster", claim::info_capabilities_verb(sid))?;
+        if reply != claim::INFO_CAPABILITIES_UNSUPPORTED {
+            if !reply.starts_with("OK native-act ")
+                || c3_child::unique(&reply, "state=") != Ok(Some("info"))
+            {
+                return Err(Failure::Refused(format!("roster {}", reply_words(&reply))));
+            }
+            return Ok(reply);
+        }
+    }
+    ask(conn, "roster", claim::info_verb(sid))
+}
+
 /// One fresh `harness policy`.
 fn read_policy(conn: &mut Connection, sid: &str) -> Result<Policy, Failure> {
     let reply = ask(conn, "policy", claim::policy_verb(sid))?;
@@ -472,7 +491,7 @@ fn guarded_claim(
     // not show proven is released below (the interface design, section 2.2
     // and HX-11).
     let mode = if contract == Contract::Three {
-        let info = ask(conn, "roster", claim::info_verb(sid)).map_err(made)?;
+        let info = read_c3_roster(conn, sid, config.c3_child_tracking()).map_err(made)?;
         if !claim::rostered(&info, config.id()) {
             return Err(made(Failure::Refused("unrostered".to_string())));
         }
@@ -581,12 +600,16 @@ fn busy(failure: Failure, timed_out: bool) -> Failure {
     }
 }
 
-/// The event subscription could not be made: aterm answered it with anything
-/// but its ACK ([`std::io::ErrorKind::InvalidData`], which the strict reader
-/// gives an `ERR` or an ACK of another shape) is [`Failure::Refused`], since
-/// asking again will be answered the same; a socket that could not be opened,
-/// authenticated or answered in time is [`Failure::Gone`].
+/// Classify an event subscription failure. An explicit refusal uses the same
+/// retry marker as other control replies. A malformed ACK is permanent, and
+/// an unavailable event connection is [`Failure::Gone`].
 fn events_failure(error: &std::io::Error) -> Failure {
+    if let Some(reply) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<claim::ReplyError>())
+    {
+        return unreadable("events", reply);
+    }
     if error.kind() == std::io::ErrorKind::InvalidData {
         Failure::Refused(format!("events {error}"))
     } else {
@@ -595,24 +618,70 @@ fn events_failure(error: &std::io::Error) -> Failure {
 }
 
 /// Give `config`'s claim by harness process `pid` back on a connection of its
-/// own, opened and answered within [`REQUEST_TIMEOUT`], its answer ignored:
-/// the release of a contract-4 claim aterm may keep through its re-exec grace
-/// after the connection that made it closed (D28), which `meta unset
-/// supervisor` from any connection the claimant's process proves ends at once
-/// (D23).
-fn release_anew(config: &Config, locator: &Locator, pid: u32) {
+/// own, opened and answered within [`REQUEST_TIMEOUT`]. A successful reply
+/// confirms release of a contract-4 claim aterm may keep through its re-exec
+/// grace after the connection that made it closed (D28).
+fn release_anew(config: &Config, locator: &Locator, pid: u32) -> bool {
     let Ok(socket) = locator.socket() else {
-        return;
+        return false;
     };
     let Ok(mut conn) = Connection::connect(&socket, REQUEST_TIMEOUT) else {
-        return;
+        return false;
     };
     conn.set_timeout(REQUEST_TIMEOUT);
-    let _ = ask(
+    ask(
         &mut conn,
         "release",
         claim::release_verb(config, locator.sid(), pid),
-    );
+    )
+    .is_ok_and(|reply| ok(&reply))
+}
+
+/// A failed claim attempt and what it established about the provisional claim.
+enum ClaimFailure {
+    BeforeEvents(Failure),
+    EventsReleased(Failure),
+    EventsGraced {
+        failure: Failure,
+        permanent: bool,
+        grace_ms: u64,
+    },
+}
+
+impl From<Failure> for ClaimFailure {
+    fn from(failure: Failure) -> Self {
+        Self::BeforeEvents(failure)
+    }
+}
+
+impl ClaimFailure {
+    fn retires(&self, claimed: bool) -> bool {
+        match self {
+            Self::BeforeEvents(Failure::Refused(_)) => !claimed,
+            Self::EventsReleased(Failure::Refused(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The journal failure, custody deadline, and whether to retry only release.
+    fn into_lost(self, graced_until_ms: u64, now_ms: u64) -> (Failure, u64, bool) {
+        match self {
+            Self::BeforeEvents(failure) => {
+                let graced = if failure.gives_back() {
+                    0
+                } else {
+                    graced_until_ms
+                };
+                (failure, graced, false)
+            }
+            Self::EventsReleased(failure) => (failure, 0, false),
+            Self::EventsGraced {
+                failure,
+                permanent,
+                grace_ms,
+            } => (failure, now_ms.saturating_add(grace_ms), permanent),
+        }
+    }
 }
 
 /// The whole claim sequence for the session `locator` names, by `config`'s
@@ -625,8 +694,9 @@ fn release_anew(config: &Config, locator: &Locator, pid: u32) {
 /// answered the handshake and then a step asked to be retried or was not
 /// answered in time; [`Failure::Unserved`] when aterm serves no contract
 /// the harness can claim at; [`Failure::Off`] or [`Failure::Refused`] when
-/// aterm answered and the answer admits no claim, the event subscription's
-/// included. A claim made before a later step failed is released, on a
+/// aterm answered and the answer admits no claim. After a subscription
+/// failure, the result distinguishes a released provisional claim from one
+/// possibly kept through the contract-4 grace. A release goes on a
 /// connection of its own when the claim's connection could not release it.
 /// `graced` is a contract-4 claim of this harness's that aterm may keep in its
 /// re-exec grace (a link lost, or an image adopted): when aterm answers that
@@ -640,7 +710,8 @@ fn claim(
     continuation: Binding,
     opening: Duration,
     graced: bool,
-) -> Result<Claimed, Failure> {
+) -> Result<Claimed, ClaimFailure> {
+    let started = std::time::Instant::now();
     let socket = locator
         .socket()
         .map_err(|error| transport_failure("graph", error))?;
@@ -665,7 +736,7 @@ fn claim(
                     claim::release_verb(config, locator.sid(), pid),
                 );
             }
-            return Err(failure);
+            return Err(failure.into());
         }
     };
     match EventReader::connect(&socket, locator.sid(), opening) {
@@ -690,12 +761,28 @@ fn claim(
             native,
         }),
         Err(error) => {
-            let _ = ask(
+            let failure = events_failure(&error);
+            let released = ask(
                 &mut conn,
                 "release",
                 claim::release_verb(config, locator.sid(), pid),
-            );
-            Err(events_failure(&error))
+            )
+            .is_ok_and(|reply| ok(&reply));
+            drop(conn);
+            // C3 custody ends with the connection. C4 can keep the claim
+            // through a fresh grace, even when this attempt began outside it.
+            if released || grant.contract == Contract::Three || release_anew(config, locator, pid) {
+                Err(ClaimFailure::EventsReleased(failure))
+            } else {
+                // The caller sampled its clock before the exchanges. Include
+                // their elapsed time in the cleanup window, rounded up.
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                Err(ClaimFailure::EventsGraced {
+                    permanent: matches!(failure, Failure::Refused(_)),
+                    failure: Failure::Gone(format!("{} (release unconfirmed)", failure.why())),
+                    grace_ms: REEXEC_GRACE_MS.saturating_add(elapsed_ms).saturating_add(1),
+                })
+            }
         }
     }
 }
@@ -1245,18 +1332,19 @@ enum Asked {
 #[derive(Debug)]
 enum State {
     /// Nothing, for the rest of the session: the harness is outside aterm, or
-    /// the launch's claim sequence was refused. Never retried.
+    /// the claim sequence was refused permanently. Never retried.
     Absent,
     /// An open link on which the claim was proven.
     Held(Box<Claimed>),
     /// No link, and a claim to make through the whole guarded sequence once
     /// `retry_at_ms` has passed: a link that was held and stopped answering,
     /// or a launch whose claim aterm could answer only later, or whose policy
-    /// was switched off.
+    /// was switched off. A permanent subscription refusal can leave only its
+    /// provisional claim's release to retry.
     Lost {
         /// Where the session is found again.
         locator: Locator,
-        /// When (ms) the claim is next attempted.
+        /// When (ms) the claim or pending release is next attempted.
         retry_at_ms: u64,
         /// aterm's answer to the last claim attempt, so a reason is noted
         /// once ([`Link::unclaimed`]); `None` before the first attempt since
@@ -1275,6 +1363,9 @@ enum State {
         /// aterm through its re-exec grace (D28), unreleased; 0 for none. A
         /// refused claim attempt or the link's release gives it back before.
         graced_until_ms: u64,
+        /// A permanent subscription refusal left a C4 claim in grace. Only
+        /// its release is retried, never the refused claim sequence.
+        release_pending: bool,
         /// Native continuation survives unknown observations, including an acknowledged
         /// pending generation with no observed child and proof-only bound children.
         native: Binding,
@@ -1322,6 +1413,16 @@ pub enum Reading {
     Local,
 }
 
+/// aterm's exact acknowledgement of a caller's model record on the stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelAck {
+    /// The acknowledged model record's `seq`.
+    pub seq: u64,
+    /// `None` confirms application. `Applied` reports a duplicate sequence
+    /// without the disposition of its original receipt.
+    pub dropped: Option<Dropped>,
+}
+
 /// What one drain of the event stream found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Drained {
@@ -1338,6 +1439,11 @@ pub struct Drained {
     /// [`stream::AWAITED_MAX`] left unanswered the oldest is refused
     /// `unanswered`.
     pub incoming: Vec<Received>,
+    /// Exact ACKs of caller model records, in arrival order. At most the last
+    /// [`stream::RESEND_MAX`] are kept between drains. A new stream clears the
+    /// old receipts because it may reuse their numbers. Skipped ACKs and the
+    /// `acked=` position at open give no per-record disposition.
+    pub model_acks: Vec<ModelAck>,
     /// The newest `hand` record heard, already answered `took` and kept in
     /// [`Link::status`].
     pub hand: Option<Hand>,
@@ -1452,6 +1558,8 @@ impl Link {
     /// ([`Link::adopt_with`]): any claim aterm could not make keeps that link
     /// lost and claimed, and graced until [`REEXEC_GRACE_MS`] has passed
     /// unless aterm's answer gave the claim back ([`Failure::gives_back`]).
+    /// A permanent subscription refusal with no claim left to release ends
+    /// even an adopted link.
     fn launch_graced(
         config: Config,
         pid: u32,
@@ -1476,29 +1584,25 @@ impl Link {
                 link.state = State::Held(Box::new(claimed));
                 link.stream_if_due(child, CONNECT_TIMEOUT, now_ms);
             }
-            Err(failure) => {
+            Err(failed) => {
+                let retires = failed.retires(adopted);
+                let grace = if adopted {
+                    now_ms.saturating_add(REEXEC_GRACE_MS)
+                } else {
+                    0
+                };
+                let (failure, graced_until_ms, release_pending) = failed.into_lost(grace, now_ms);
                 link.notes
                     .push(format!("aterm unclaimed {}", failure.why()));
-                let again = matches!(
-                    failure,
-                    Failure::Gone(_) | Failure::Later(_) | Failure::Off(_) | Failure::Unserved(_)
-                );
-                // An adopted image's claim attempt was made under the grace:
-                // an answer that gave the earlier image's claim back leaves
-                // none to give back again.
-                let graced = adopted && !failure.gives_back();
-                if again || adopted {
+                if !retires {
                     link.state = State::Lost {
                         locator: locator.clone(),
                         retry_at_ms: now_ms.saturating_add(RECLAIM_EVERY_MS),
                         unclaimed: Some(failure),
                         claimed: adopted,
                         held: None,
-                        graced_until_ms: if graced {
-                            now_ms.saturating_add(REEXEC_GRACE_MS)
-                        } else {
-                            0
-                        },
+                        graced_until_ms,
+                        release_pending,
                         native: Binding::default(),
                     };
                 }
@@ -1522,12 +1626,11 @@ impl Link {
     /// with them, and a contract-4 claim aterm keeps through its re-exec grace
     /// (D28), keyed on the pid and birth an `exec` keeps, so this image's claim
     /// renews it. Either way the duty towards the child did not end: the child
-    /// runs, and nothing else supervises it. So the link [`Link::claims`] from the start, and a
-    /// claim aterm could not make now, for any reason, keeps the link lost
-    /// and is made again every [`RECLAIM_EVERY_MS`] instead of leaving it
-    /// absent: a launch can still pass its vendor through, but an adopted
-    /// child can only be supervised. A refusal is noted as at launch. Outside
-    /// aterm, or with no session to locate, the link is absent as
+    /// runs, and nothing else supervises it. The link [`Link::claims`] from
+    /// the start. A claim aterm could not make now keeps the link lost and is
+    /// made again every [`RECLAIM_EVERY_MS`]. A permanent subscription refusal
+    /// ends the link once the claim is released. A refusal is noted as at launch.
+    /// Outside aterm, or with no session to locate, the link is absent as
     /// [`Link::launch_with`] makes it.
     #[must_use]
     pub fn adopt_with(
@@ -1613,7 +1716,7 @@ impl Link {
         )
     }
 
-    /// Whether the link is lost and waiting for its next claim attempt.
+    /// Whether the link is lost and waiting for its next claim or release attempt.
     #[must_use]
     pub const fn is_lost(&self) -> bool {
         matches!(self.state, State::Lost { .. })
@@ -1685,8 +1788,11 @@ impl Link {
             State::Lost {
                 locator,
                 graced_until_ms,
+                release_pending,
                 ..
-            } if now_ms < graced_until_ms => release_anew(&self.config, &locator, self.pid),
+            } if release_pending || now_ms < graced_until_ms => {
+                release_anew(&self.config, &locator, self.pid);
+            }
             State::Lost { .. } | State::Absent => {}
         }
         self.outbox.clear();
@@ -1718,12 +1824,14 @@ impl Link {
             } else {
                 0
             },
+            release_pending: false,
             native: claimed.native,
         };
     }
 
     /// The link's own clock, run on every pass of the harness's loop: claim a
-    /// lost link again for `child`, reopen an ended event stream, and read the
+    /// lost link again for `child` (or retry a pending release), reopen an
+    /// ended event stream, and read the
     /// policy again when it is due. An ended stream is reopened every
     /// [`RECLAIM_EVERY_MS`], and the policy is read at each attempt (the
     /// stream that would announce a change is down) and once more when it is
@@ -1799,9 +1907,21 @@ impl Link {
                 claimed,
                 held,
                 graced_until_ms,
+                release_pending,
                 native,
             } => {
                 if now_ms < *retry_at_ms {
+                    return;
+                }
+                if *release_pending {
+                    // The host may process the connection close later than
+                    // our clock saw it. Only its reply settles this release.
+                    if release_anew(&self.config, locator, self.pid) {
+                        self.state = State::Absent;
+                        self.settle();
+                    } else {
+                        *retry_at_ms = now_ms.saturating_add(RECLAIM_EVERY_MS);
+                    }
                     return;
                 }
                 if native
@@ -1834,13 +1954,12 @@ impl Link {
                         self.state = State::Held(Box::new(made));
                         self.stream_if_due(child, REQUEST_TIMEOUT, now_ms);
                     }
-                    Err(failure) => {
+                    Err(failed) => {
                         *retry_at_ms = now_ms.saturating_add(RECLAIM_EVERY_MS);
-                        // A claim aterm will not take now was given back with
-                        // the refusal (`claim`): nothing of it stands.
-                        if failure.gives_back() {
-                            *graced_until_ms = 0;
-                        }
+                        let retires = failed.retires(*claimed);
+                        let (failure, grace, pending) = failed.into_lost(*graced_until_ms, now_ms);
+                        *graced_until_ms = grace;
+                        *release_pending = pending;
                         if unclaimed.as_ref().map(Failure::why) != Some(failure.why()) {
                             self.notes
                                 .push(format!("aterm unclaimed {}", failure.why()));
@@ -1856,11 +1975,8 @@ impl Link {
                         ) {
                             *held = None;
                         }
-                        // A launch that never claimed and is now refused for
-                        // good is what the launch would have made it.
-                        let gone = !*claimed && matches!(failure, Failure::Refused(_));
                         *unclaimed = Some(failure);
-                        if gone {
+                        if retires {
                             self.state = State::Absent;
                         }
                     }
@@ -1916,8 +2032,8 @@ impl Link {
     /// The stream is read first ([`Link::stream_fd`] readable, or
     /// [`Link::due_ms`] reached, means it has something), and what it brought
     /// since the last call is returned with the drain: its `restart`, its
-    /// `hand` and `policy`, the records for the caller ([`Drained::incoming`])
-    /// and whether a fresh stream opened. Once the open stream has brought one
+    /// `hand` and `policy`, the records for the caller ([`Drained::incoming`]),
+    /// its exact model acknowledgements and whether a fresh stream opened. Once the open stream has brought one
     /// of aterm's own records, `EVENT restart`, `EVENT harness-policy` and the
     /// subscription's losses are ignored.
     pub fn events(&mut self, child: Child<'_>, now_ms: u64) -> Drained {
@@ -2231,6 +2347,14 @@ impl Link {
         matches!(&self.state, State::Held(claimed) if claimed.stream.is_some())
     }
 
+    /// Whether the open stream has a claim record awaiting acknowledgement.
+    /// A record dropped for the rate stays pending through its replacement.
+    #[must_use]
+    pub fn claim_in_flight(&self) -> bool {
+        matches!(&self.state, State::Held(claimed)
+            if claimed.stream.as_ref().is_some_and(|open| open.claim.is_some()))
+    }
+
     /// The stream's descriptor, for the harness's wait beside
     /// [`Link::event_fd`]. Readable means [`Link::events`] has records to read;
     /// so does [`Link::due_ms`] at 0, for lines a write read while it waited.
@@ -2377,6 +2501,7 @@ impl Link {
             reply.sent,
             opened.resent
         ));
+        self.inbox.model_acks.clear();
         self.inbox.fresh |= opened.fresh;
         self.inbox.renumbered.extend(opened.renumbered);
         self.flush(now_ms);
@@ -2452,11 +2577,15 @@ impl Link {
 
     /// Give up the records kept when no stream will resend them: the link is
     /// absent, the claim was given back, or it stands under contract 3. A link
-    /// lost after a stream keeps them.
+    /// lost after a stream keeps them while it will attempt to reclaim.
     fn settle(&mut self) {
         let keeps = match &self.state {
             State::Held(claimed) => claimed.standing && claimed.grant.contract == Contract::Four,
-            State::Lost { claimed, .. } => *claimed,
+            State::Lost {
+                claimed,
+                release_pending,
+                ..
+            } => *claimed && !*release_pending,
             State::Absent => false,
         };
         if !keeps && self.outbox.live() {
@@ -2705,7 +2834,7 @@ impl Link {
     /// is a fault that loses it. The first drop of each reason on a stream is
     /// noted, `aterm stream-dropped seq=<n> k=<kind> dropped=<word>`.
     fn acked(&mut self, seq: u64, dropped: Option<Dropped>, now_ms: u64) {
-        let Ok(kind) = self.outbox.ack(seq, dropped.as_ref()) else {
+        let Ok(exact) = self.outbox.ack(seq, dropped.as_ref()) else {
             self.stream_lost(&format!("stream ack={seq} unwritten"), now_ms);
             return;
         };
@@ -2739,18 +2868,24 @@ impl Link {
                 }
             }
         }
-        let Some(dropped) = dropped else {
-            return;
-        };
-        let word = dropped.word();
-        let reason = word.split(':').next().unwrap_or_default().to_string();
-        self.note_drop(&reason, || {
-            format!(
-                "aterm stream-dropped seq={seq} k={} dropped={}",
-                kind.map_or("-", record::Kind::word),
-                claim::journal_word(&word)
-            )
-        });
+        if let Some(dropped) = dropped.as_ref() {
+            let word = dropped.word();
+            let reason = word.split(':').next().unwrap_or_default().to_string();
+            self.note_drop(&reason, || {
+                format!(
+                    "aterm stream-dropped seq={seq} k={} dropped={}",
+                    exact.map_or("-", |ack| ack.kind.word()),
+                    claim::journal_word(&word)
+                )
+            });
+        }
+        if exact.is_some_and(|ack| ack.kind == record::Kind::Model && !ack.own) {
+            let receipts = &mut self.inbox.model_acks;
+            if receipts.len() == stream::RESEND_MAX {
+                receipts.remove(0);
+            }
+            receipts.push(ModelAck { seq, dropped });
+        }
     }
 
     /// Note `line` the first time `reason` comes on the open stream.
@@ -2809,18 +2944,19 @@ impl Link {
             claimed.native.known = Some(native);
             claimed.native.pending = true;
         }
-        // Ordinary metadata reannouncement is the existing fresh-child path.
-        // Native reannouncement also renews the same live child, so preserve
-        // its prior host hold until a fresh safe-point/status decision. A bare
-        // metadata ACK says nothing about the hold.
-        if claimed.native.mode == Mode::Absent {
+        // A C4 reannouncement without a child may retire a reaped child. Keep
+        // the previous hold until a fresh safe-point/status decision. C3 native
+        // reannouncement also holds while renewing the same live child.
+        let contract = claimed.grant.contract;
+        if claimed.native.mode == Mode::Absent
+            && (contract != Contract::Four || child.process.is_some())
+        {
             claimed.last_hold = None;
         }
         if !claimed.standing {
             return;
         }
         claimed.recheck_at_ms = 0;
-        let contract = claimed.grant.contract;
         let asked = contract.scopes(self.config.scopes());
         if claimed.stream.is_some() {
             self.claim_record(child, asked, now_ms);

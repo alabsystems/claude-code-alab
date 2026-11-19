@@ -129,6 +129,7 @@ fn options(value: &Options) -> io::Result<()> {
         Ok(cli::Command::Run {
             opts,
             live_update: true,
+            managed: false,
             args,
         }) if opts == *value && args.is_empty() => Ok(()),
         _ => Err(invalid(

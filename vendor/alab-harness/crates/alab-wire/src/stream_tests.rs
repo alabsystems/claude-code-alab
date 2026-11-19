@@ -116,7 +116,13 @@ fn a_stream_opened_again_keeps_every_number_in_the_same_epoch() {
     outbox.push(Body::Beat, 1, true, 0).expect("kept");
     outbox.push(state(), 1, false, 0).expect("kept");
     write(&mut outbox, 0);
-    assert_eq!(outbox.ack(2, None), Ok(Some(Kind::State)));
+    assert_eq!(
+        outbox.ack(2, None),
+        Ok(Some(Acknowledged {
+            kind: Kind::State,
+            own: false,
+        }))
+    );
     // aterm applied the third before the stream closed; its ack never came.
     let opened = outbox.open(&reply("e1", 3, 9), 0);
     assert_eq!((opened.fresh, opened.resent), (false, 2));
@@ -228,7 +234,13 @@ fn an_ack_counts_its_reason_and_releases_every_record_up_to_it() {
         outbox.push(state(), 1, false, 0).expect("kept");
     }
     write(&mut outbox, 0);
-    assert_eq!(outbox.ack(8, None), Ok(Some(Kind::State)));
+    assert_eq!(
+        outbox.ack(8, None),
+        Ok(Some(Acknowledged {
+            kind: Kind::State,
+            own: false,
+        }))
+    );
     assert_eq!(seqs(&outbox.kept()), [9]);
     assert_eq!(outbox.ack(10, None), Err(()), "never written");
     assert_eq!(outbox.ack(u64::MAX, None), Err(()));
