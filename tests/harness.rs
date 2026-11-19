@@ -469,6 +469,10 @@ fn main() {
             aterm_an_update_waits_if_the_job_loses_foreground_at_the_safe_point,
         ),
         (
+            "aterm_an_update_passes_on_hup_during_the_safe_point",
+            aterm_an_update_passes_on_hup_during_the_safe_point,
+        ),
+        (
             "aterm_an_update_waits_for_foreground_after_the_child_exits",
             aterm_an_update_waits_for_foreground_after_the_child_exits,
         ),
@@ -3778,6 +3782,47 @@ fn aterm_an_update_waits_if_the_job_loses_foreground_at_the_safe_point() {
     command_logged(&s, "foreground-restore", "foreground-restored");
     assert_aterm_update_reconsidered(&s, first, BUILD_2, SID, "background");
     end_session(&s, pid);
+}
+
+fn aterm_an_update_passes_on_hup_during_the_safe_point() {
+    let s = Scenario::new("aterm-update-safe-point-hup");
+    let fake = rostered_aterm(&s);
+    fake.set_info(fake_aterm::INFO_CURRENT);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_record(&s, 0);
+    await_journal(
+        &s,
+        Duration::from_secs(60),
+        "aterm reannounced vendor=9.9.1",
+    );
+    let statuses = asked(&fake, "status");
+
+    // Signal only the supervisor, while it is waiting for aterm's verdict
+    // and still owns the old vendor.
+    fake.signal_before_reply("status", pid, libc::SIGHUP);
+    s.set_current(BUILD_2);
+
+    let exit = wait_status(pid, Duration::from_secs(60));
+    let journal = s.journal();
+    assert!(
+        !journal.contains(" end-for-update SIGTERM ") && !got_term(&s),
+        "the updater sent TERM after the HUP{}",
+        s.report()
+    );
+    assert_eq!(exit, Some(Status::Exited(71)), "{}", s.report());
+    assert!(
+        s.log().iter().any(|line| line == "signal HUP")
+            && journal.contains(&format!(" signal passed-on {}\n", libc::SIGHUP)),
+        "{}",
+        s.report()
+    );
+    assert_eq!(asked(&fake, "status"), statuses + 1, "{:?}", fake.verbs());
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
+    let begin = format!("{} child-start=2", claim_text(pid, "9.9.2"));
+    assert_eq!(asked(&fake, &begin), 0, "{:?}", fake.verbs());
+    assert_eq!(asked(&fake, &release_text(pid)), 1, "{:?}", fake.verbs());
+    assert!(fake.holder().is_none(), "{}", s.report());
 }
 
 fn connect_foreground_peer(s: &Scenario, fake: &FakeAterm) -> UnixStream {

@@ -130,23 +130,34 @@ fn wait_with(pid: libc::pid_t, options: libc::c_int) -> Option<ChildEvent> {
 /// signal sent to such a child is accepted by the kernel and reaches nobody.
 #[must_use]
 pub fn child_has_ended(pid: libc::pid_t) -> bool {
+    child_event_pending(pid, libc::WEXITED)
+}
+
+/// Whether this child has stopped or ended, leaving its event pending for
+/// [`wait_child`]. A signal from another child does not establish either.
+#[must_use]
+pub fn child_has_stopped_or_ended(pid: libc::pid_t) -> bool {
+    child_event_pending(pid, libc::WSTOPPED | libc::WEXITED)
+}
+
+fn child_event_pending(pid: libc::pid_t, events: libc::c_int) -> bool {
     let Ok(id) = libc::id_t::try_from(pid) else {
         return false;
     };
     loop {
         let mut info = transfer::blank_siginfo();
         // SAFETY: `info` is zeroed, writable siginfo_t storage. WNOWAIT leaves
-        // the child's end pending; WNOHANG never waits for a live child.
+        // the child's event pending; WNOHANG never waits for an event.
         let rc = unsafe {
             libc::waitid(
                 libc::P_PID,
                 id,
                 &raw mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                events | libc::WNOHANG | libc::WNOWAIT,
             )
         };
         if rc == 0 {
-            // `info` is zeroed, and filled in when an end was found.
+            // `info` is zeroed, and filled in when an event was found.
             return siginfo_pid(&info) == pid;
         }
         if errno() != libc::EINTR {

@@ -813,6 +813,7 @@ impl Supervisor {
         let poll = self.setup.opts.poll_ms;
         let mut next_look = 0u64;
         let mut early_tstp = early_tstp;
+        let mut pending_signals = Vec::new();
         loop {
             let now = now_ms();
             // A crash being answered has its own clock: the wait ends when its
@@ -822,12 +823,12 @@ impl Supervisor {
                 .map_or(next_look, |wake| wake.min(next_look))
                 .min(self.link.due_ms().unwrap_or(u64::MAX))
                 .saturating_sub(now)
-                .min(poll);
+                .min(if pending_signals.is_empty() { poll } else { 0 });
             // The first pass waits for nothing (`next_look` is 0).
             let mut tstp = std::mem::take(&mut early_tstp);
             // With no event stream this is `pipe.wait(timeout)`.
             let (signals, events) = pipe.wait_with(timeout, self.link.fds());
-            for sig in signals {
+            for sig in pending_signals.drain(..).chain(signals) {
                 match sig {
                     libc::SIGHUP | libc::SIGTERM => self.pass_on(sig),
                     // With no child, INT and QUIT are nobody's but the harness's.
@@ -889,7 +890,12 @@ impl Supervisor {
                 self.restart_retry();
             }
             if (due || woken) && !self.image.blocks_vendor_move() {
-                self.look();
+                self.look(|| {
+                    pending_signals = pipe.wait(0);
+                    // The process-table helper also produces SIGCHLD. The
+                    // update checks the vendor's own wait status separately.
+                    pending_signals.iter().any(|&sig| sig != libc::SIGCHLD)
+                });
             }
         }
     }
@@ -1889,7 +1895,7 @@ impl Supervisor {
     /// lost, and the same look decides on the three local checks instead.
     /// The pinned plan, idle conversation and selected build must still
     /// stand after that exchange and before SIGTERM.
-    fn look(&mut self) {
+    fn look(&mut self, signals_waiting: impl FnOnce() -> bool) {
         if let Ending::ForUpdate { sent, plan } = &self.ending
             && sent.elapsed() > Duration::from_millis(self.setup.opts.term_grace_ms)
         {
@@ -2073,8 +2079,16 @@ impl Supervisor {
             || (check_local_input
                 && (!sys::stdin_unread().is_ok_and(|queued| queued == 0)
                     || sys::stdin_input_ms() != input))
-            || sys::child_has_ended(self.child.pid)
         {
+            self.note_wait("wait changed-while-deciding");
+            return;
+        }
+        // Let the loop act on the queued signals with this vendor still in
+        // place. Leave the vendor's wait events for that loop to reap.
+        if signals_waiting() {
+            return;
+        }
+        if sys::child_has_stopped_or_ended(self.child.pid) {
             self.note_wait("wait changed-while-deciding");
             return;
         }
@@ -2903,7 +2917,7 @@ mod tests {
         }
         assert_eq!(sup.crash_wake_ms(), Some(2_000));
         // The look moves nothing and ends nothing.
-        sup.look();
+        sup.look(|| false);
         assert!(sup.no_child());
         assert_eq!(events(&state), [] as [&str; 0]);
         let _ = std::fs::remove_dir_all(&state);
