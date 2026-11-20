@@ -889,9 +889,8 @@ fn task_row(
 
 /// An `agy` subagent row (`  ● Agent(…)  <activity> [· <elapsed>]`).
 ///
-/// `name` spans the unwrapped agent name columns at `body` so the glass splice
-/// (which unwraps `Agent(self: Role)` in place at `body`) and `claude_panel`
-/// agree on the exact columns of the agent's name.
+/// `name` spans the unwrapped agent name columns at `body`, the columns the glass splice
+/// (which unwraps `Agent(self: Role)` in place at `body`) writes the agent's name in.
 fn agy_agent_row(
     row: &str,
     body: usize,

@@ -150,6 +150,12 @@ pub(super) fn entry() {
             let value =
                 |flag: &str| args.windows(2).find(|pair| pair[0] == flag).unwrap()[1].clone();
             let status = std::env::var("ALAB_TEST_FOLDER_GATE").unwrap_or("allow".into());
+            if status == "unserved" {
+                // An aterm from before the verb: `aterm harness` refuses the words it does not
+                // know with exit 2 and nothing on its standard output.
+                eprintln!("aterm harness: unknown flag --cwd-hex; run `aterm harness --help`");
+                std::process::exit(2);
+            }
             let (rule, reason) = if status == "allow" {
                 ("\"trusted-folder\"", "null")
             } else {
@@ -514,7 +520,70 @@ pub(super) fn cold_native_refusals_never_become_recorded_or_run_in_nonterminal_l
         let events = std::fs::read_to_string(s.root.join("events")).unwrap();
         assert!(!events.contains("native-attestation"), "{events}");
         assert!(!s.journal().contains("folder-trust recorded"));
+        // A host that answers is obeyed, and its refusal is journaled as one.
+        assert_eq!(
+            s.journal().contains("folder-trust refused"),
+            terminal,
+            "{gate}{}",
+            s.report()
+        );
     }
+}
+
+/// A host that refuses the gate's question as words it does not know (an aterm from before
+/// `harness launch-trust gate`: exit 2, nothing on stdout) is no gate: the launch that records
+/// the folder everywhere else in this file asks it once, attests nothing, journals nothing
+/// about trust, and still reaches the usage tap and the vendor, as a launch whose host was
+/// asked nothing. CONTROL: the same launch under a host that answers `refused` is obeyed and
+/// journals the refusal, and under one that answers `allow` records the folder.
+pub(super) fn a_host_that_does_not_know_the_gate_is_no_gate_and_one_that_answers_is_obeyed() {
+    let kinds = |s: &Scenario| {
+        std::fs::read_to_string(s.root.join("events"))
+            .unwrap()
+            .lines()
+            .map(|line| line.split_once('\t').unwrap().0.to_owned())
+            .collect::<Vec<_>>()
+    };
+    let (s, host, vendor) = setup("cold-trust-host-serves-no-gate");
+    let mut cmd = command(&s, &host, &vendor, "record");
+    cmd.env("ALAB_TEST_FOLDER_GATE", "unserved");
+    run(&s, cmd, true);
+    assert_eq!(
+        kinds(&s),
+        ["gate", "tap", "token", "final-vendor"],
+        "{}",
+        s.report()
+    );
+    assert!(!s.journal().contains("folder-trust"), "{}", s.report());
+    let (s, host, vendor) = setup("cold-trust-host-refuses");
+    let mut cmd = command(&s, &host, &vendor, "record");
+    cmd.env("ALAB_TEST_FOLDER_GATE", "refused");
+    run(&s, cmd, true);
+    assert_eq!(
+        kinds(&s),
+        ["gate", "tap", "token", "final-vendor"],
+        "{}",
+        s.report()
+    );
+    assert!(
+        s.journal()
+            .contains("folder-trust refused policy-refused-or-unread"),
+        "{}",
+        s.report()
+    );
+    let (s, host, vendor) = setup("cold-trust-host-allows");
+    run(&s, command(&s, &host, &vendor, "record"), true);
+    assert_eq!(
+        kinds(&s)[..2],
+        ["gate", "native-attestation"],
+        "{}",
+        s.report()
+    );
+    assert!(
+        s.journal().contains("folder-trust recorded"),
+        "{}",
+        s.report()
+    );
 }
 
 pub(super) fn cold_native_linger_and_inherited_writer_keep_the_owned_cohort_until_retired() {

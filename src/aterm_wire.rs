@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 pub(crate) use alab_wire::wire::session_id;
 pub use alab_wire::wire::{Fields, percent_decode};
 
-use crate::aterm::{Restart, Scope};
+use crate::aterm::{Restart, Scope, Unacted};
 
 const MAX_TOKEN_BYTES: usize = 256;
 const MAX_GRAPH_BYTES: usize = 16 * 1024;
@@ -1053,6 +1053,43 @@ pub fn key_verb(sid: &str, fence: &TypedFence<'_>, key: &str) -> Option<String> 
     ))
 }
 
+/// `@<sid> key <fence> if-human=<n> if-gen=<gen> if=<guard> [act=<word>] <name>`:
+/// one key pressed on a box or a question dialog, under `fence`, only while the
+/// screen is still at `press.generation` and a visible row still matches
+/// `press.guard`, as aterm's own engine presses one
+/// (`aterm/crates/aterm-agent/src/supervise/press.rs`, `key_args`), with what
+/// it means for the box it dismisses (`act=approve|answer`, `KEY_USAGE` in
+/// `control_input.rs`). aterm answers `OK seq=<n>`, `OK skipped` (no row
+/// matched), `OK skipped reason=changed` or `reason=person`.
+///
+/// `None` when [`key_verb`] would spell no key, the generation is not one
+/// ([`crate::typing::screen_generation`]), or the guard is not one nonempty
+/// word of at most [`alab_policy::guard::MAX_GUARD_BYTES`].
+#[must_use]
+pub fn press_verb(
+    sid: &str,
+    fence: &TypedFence<'_>,
+    press: &crate::typing::Press<'_>,
+) -> Option<String> {
+    let guard = press.guard;
+    let guard_ok = !guard.is_empty()
+        && guard.len() <= alab_policy::guard::MAX_GUARD_BYTES
+        && !guard.chars().any(|c| c.is_whitespace() || c.is_control());
+    if !guard_ok || !crate::typing::screen_generation(press.generation) {
+        return None;
+    }
+    let plain = key_verb(sid, fence, press.key)?;
+    let (head, key) = plain.rsplit_once(' ')?;
+    let act = press
+        .act
+        .map(|act| format!(" {}", act.option()))
+        .unwrap_or_default();
+    Some(format!(
+        "{head} if-gen={} if={guard}{act} {key}",
+        press.generation
+    ))
+}
+
 /// `@<sid> turn <fence> submit=guarded:<guard> if-human=<n> idle=<ms> timeout=<ms> -- <text>`:
 /// `text` typed and submitted with Enter, the Enter pressed only while the
 /// cursor's row matches `guard` and no person has made a gesture since
@@ -1099,9 +1136,17 @@ pub struct EventUpdate {
     /// claim holder to restart its child. It is a request, never permission: the
     /// holder still reads fresh policy and status before it acts.
     pub restart: Option<Restart>,
+    /// The cause of the last restart event of this drain that named its cause
+    /// but could not be acted on, and which of its words could not be read
+    /// ([`Unacted::Words`]): passed over, never a fault of the stream.
+    pub unacted: Option<(String, &'static str)>,
     /// An `agent`, `turn`, `human` or `status` event arrived: what a safe-point read
     /// judges may have moved, so the next look need not wait for its poll.
     pub activity: bool,
+    /// An `EVENT <local> meta field=autopilot …` arrived: the session's own
+    /// Autopilot word was set or unset, so the mode its turn ends run under
+    /// (`status autopilot=`) must be read again.
+    pub autopilot: bool,
 }
 
 impl EventUpdate {
@@ -1188,13 +1233,19 @@ impl EventReader {
                         return Err(invalid("policy event names its generation twice"));
                     }
                 }
-                "restart" => {
-                    update.restart = Some(
-                        Restart::parse(words)
-                            .ok_or_else(|| invalid("restart event has no single cause"))?,
-                    );
-                }
+                "restart" => match Restart::parse(words) {
+                    Ok(restart) => update.restart = Some(restart),
+                    Err(Unacted::Words { cause, why }) => update.unacted = Some((cause, why)),
+                    Err(Unacted::Cause) => {
+                        return Err(invalid("restart event names no single cause"));
+                    }
+                },
                 "agent" | "turn" | "human" | "status" => update.activity = true,
+                "meta" => {
+                    if words.any(|word| word == "field=autopilot") {
+                        update.autopilot = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1527,6 +1578,10 @@ fn validate_custody_socket(raw: RawFd) -> io::Result<()> {
 #[cfg(test)]
 #[path = "aterm_wire_tab_ids_tests.rs"]
 mod tab_id_tests;
+
+#[cfg(test)]
+#[path = "aterm_wire_restart_tests.rs"]
+mod restart_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2145,6 +2200,29 @@ mod tests {
         let (mut events, _peer) = subscribed(b"EVENT 7 meta field=title value=-\nEVENT 7 render\n");
         let update = events.drain();
         assert!(update.restart.is_none() && !update.activity && !update.requires_refresh());
+        // Of the meta events, only the Autopilot word's is flagged, and it is no
+        // activity: the mode is read again, the look's own facts are not.
+        assert!(!update.autopilot);
+        for line in [
+            b"EVENT 7 meta field=autopilot value=land\n".as_slice(),
+            b"EVENT 7 meta field=autopilot value=-\n".as_slice(),
+        ] {
+            let (mut events, _peer) = subscribed(line);
+            let update = events.drain();
+            assert!(update.autopilot && !update.activity && !update.requires_refresh());
+        }
+        for line in [
+            b"EVENT 7 meta field=autopilot_by value=human\n".as_slice(),
+            b"EVENT 7 meta field=land_at value=-\n".as_slice(),
+            b"EVENT 7 autopilot field=autopilot\n".as_slice(),
+        ] {
+            let (mut events, _peer) = subscribed(line);
+            assert!(
+                !events.drain().autopilot,
+                "{}",
+                String::from_utf8_lossy(line)
+            );
+        }
 
         for line in [
             b"EVENT 7 agent\n".as_slice(),
@@ -2180,7 +2258,9 @@ mod tests {
         assert_eq!(
             update.restart,
             Some(Restart {
-                cause: "asked".to_string()
+                cause: "asked".to_string(),
+                model: None,
+                account: None,
             })
         );
         assert!(update.activity && update.policy_changed && !update.ended);

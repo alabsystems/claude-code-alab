@@ -14,6 +14,15 @@ use std::time::{Duration, Instant};
 
 /// The generic launcher supplies its own aterm executable, never a PATH lookup.
 pub const HOST_VAR: &str = "ATERM_HARNESS_HOST";
+/// The variable the usage query sets for the host: `1` where the launch's own standard
+/// output is a terminal, `0` where it is not. aterm's launcher block set the same variable
+/// for the same verb, and aterm settles no folder trust for a launch that says `0`.
+pub const STDOUT_TTY_VAR: &str = "ATERM_LAUNCH_STDOUT_TTY";
+/// How long the usage query may take. The host settles folder trust inside it, and aterm
+/// bounds that by two one-second reads of its window and a five-second deadline for the
+/// vendor to record the folder; the three seconds past those seven are for the host's own
+/// start and for the query itself. The launcher block this replaces waited without a bound.
+pub const TAP_BOUND: Duration = Duration::from_secs(10);
 const BYPASS: &str = "--dangerously-skip-permissions";
 const UPDATE_WORDS: &[&str] = &["update", "upgrade", "install"];
 const LAUNCH_FLAGS: &[&str] = &["--yolo", "--no-harness", "--no-alab-harness"];
@@ -288,30 +297,45 @@ fn update_action(args: &[OsString]) -> Result<bool, String> {
 }
 
 /// Ask the host for the usage settings once at launch, after permission defaults.
-/// Explicit launch settings remain after this argument as in the former shim.
-/// A settled failure, malformed UTF-8, excess output or the two-second query deadline
+/// Explicit launch settings remain after this argument as in the former shim. The host is
+/// told whether the launch's own standard output is a terminal ([`STDOUT_TTY_VAR`]), as the
+/// launcher block told it; the query's own output is a pipe, which says nothing of that.
+/// A settled failure, malformed UTF-8, excess output or the query deadline ([`TAP_BOUND`])
 /// leaves the arguments intact. Cancellation has a separate two-second settlement
 /// grace; it never extends query admission or retries a lost native wait receipt.
+/// Whether the host's `--settings <value>` now leads `args`: a launch through `run --`
+/// asks the host again, so the resume words a `session` record states leave the two out
+/// ([`crate::supervise::Setup::tapped`]).
 /// # Errors
 /// Native child or signal-mask ownership remains unsettled. The caller must retain
 /// the returned resources through its actual executable failure boundary.
-pub fn usage_tap(args: &mut Vec<OsString>) -> Result<(), crate::sys::ProbeSpawnRefusal> {
+pub fn usage_tap(
+    args: &mut Vec<OsString>,
+    stdout_terminal: bool,
+) -> Result<bool, crate::sys::ProbeSpawnRefusal> {
     if !enabled() {
-        return Ok(());
+        return Ok(false);
     }
-    let Some(host) = host() else { return Ok(()) };
+    let Some(host) = host() else {
+        return Ok(false);
+    };
     let words: Vec<_> = ["harness", "tap", "--launch", "--"]
         .into_iter()
         .map(OsString::from)
         .chain(args.iter().cloned())
         .collect();
-    if let Some(value) = bounded_output(&host, &words, Duration::from_secs(2))? {
+    let said = [(
+        OsString::from(STDOUT_TTY_VAR),
+        OsString::from(if stdout_terminal { "1" } else { "0" }),
+    )];
+    if let Some(value) = bounded_output_limit(&host, &words, &said, TAP_BOUND, 64 * 1024)? {
         let value = value.trim_end_matches('\n');
         if !value.is_empty() && !value.contains('\0') {
             args.splice(..0, [OsString::from("--settings"), OsString::from(value)]);
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn settle_tap(mut child: crate::sys::ProbeChild) -> Result<(), crate::sys::ProbeSpawnRefusal> {
@@ -350,14 +374,11 @@ fn settle_tap(mut child: crate::sys::ProbeChild) -> Result<(), crate::sys::Probe
     })
 }
 
-fn bounded_output(
-    executable: &Path,
-    args: &[OsString],
-    timeout: Duration,
-) -> Result<Option<String>, crate::sys::ProbeSpawnRefusal> {
-    bounded_output_limit(executable, args, &[], timeout, 64 * 1024)
-}
-
+/// The standard output of `executable` run with `args` under `changes`, where it exited 0 with
+/// UTF-8 output of at most `maximum` bytes (shared with its standard error) within `timeout`
+/// ([`bounded_run`]); `None` otherwise.
+/// # Errors
+/// As [`bounded_run`].
 pub(crate) fn bounded_output_limit(
     executable: &Path,
     args: &[OsString],
@@ -365,6 +386,34 @@ pub(crate) fn bounded_output_limit(
     timeout: Duration,
     maximum: usize,
 ) -> Result<Option<String>, crate::sys::ProbeSpawnRefusal> {
+    Ok(bounded_run(executable, args, changes, timeout, maximum)?
+        .filter(|ended| ended.status.success())
+        .and_then(|ended| String::from_utf8(ended.output).ok()))
+}
+
+/// How a [`bounded_run`] helper ended.
+pub(crate) struct Ended {
+    /// Its exit status.
+    pub(crate) status: std::process::ExitStatus,
+    /// Its standard output: all of it where it exited 0, else what was read by its exit.
+    pub(crate) output: Vec<u8>,
+}
+
+/// Run `executable` with `args` under `changes` as an owned probe and read how it ended. A
+/// success is read once its exit and both pipes' end are seen within `timeout`; any other exit
+/// is read at once, with the output read by then and one more nonblocking read. `None` where
+/// it could not be started, its output and standard error passed `maximum` bytes together, a
+/// read or wait failed, or `timeout` passed first. The helper is reaped either way.
+/// # Errors
+/// Native child or signal-mask ownership remains unsettled. The caller must retain
+/// the returned resources through its actual executable failure boundary.
+pub(crate) fn bounded_run(
+    executable: &Path,
+    args: &[OsString],
+    changes: &[(OsString, OsString)],
+    timeout: Duration,
+    maximum: usize,
+) -> Result<Option<Ended>, crate::sys::ProbeSpawnRefusal> {
     let mut child = match crate::sys::ProbeChild::spawn(executable, args, changes) {
         Ok(child) => child,
         Err(mut refusal) => {
@@ -398,14 +447,15 @@ pub(crate) fn bounded_output_limit(
                 && let Some(status) = child.try_wait().ok()?
             {
                 if !status.success() {
-                    return None;
+                    child.drain_total(&mut output, &mut errors, maximum).ok()?;
+                    return Some(Ended { status, output });
                 }
                 exited = Some(status);
             }
-            if exited.is_some() && child.output_finished() {
-                return (Instant::now() < deadline)
-                    .then(|| String::from_utf8(output).ok())
-                    .flatten();
+            if let Some(status) = exited
+                && child.output_finished()
+            {
+                return (Instant::now() < deadline).then_some(Ended { status, output });
             }
             let remaining = deadline.checked_duration_since(Instant::now())?;
             let mut polls: Vec<_> = child
@@ -440,16 +490,77 @@ pub(crate) fn bounded_output_limit(
 /// exec that preserves the child's pid. No token is returned to the harness.
 /// Bypass launches call this with `policy=false` and contact no host service.
 pub fn vendor_command(exe: &Path, args: &[OsString], policy: bool) -> Command {
-    let host = policy.then(host).flatten().filter(|_| enabled());
-    vendor_command_for(exe, args, host.as_deref())
+    let host = policy.then(token_helper).flatten();
+    routed(exe, args, host.as_deref(), None)
 }
 
-fn vendor_command_for(exe: &Path, args: &[OsString], host: Option<&Path>) -> Command {
+/// The exit status of aterm's token helper (`harness accounts token-run`)
+/// when it started nothing (aterm's `accounts_token_run::NOT_STARTED`): the
+/// account it was named could not be served on this launch. The number is
+/// part of the contract between the two.
+pub const NOT_STARTED: i32 = 75;
+
+/// aterm's token helper, where this launch can reach one: the host the
+/// launcher named ([`host`]), inside an aterm tab that does not leave the
+/// harness out. `None` outside aterm, and for a launch whose host is absent
+/// or no executable file: a start is then made on the vendor directly, an
+/// account aterm names cannot be started at all
+/// (`Supervisor::restart_asked` in [`crate::supervise`]), and the claim does
+/// not ask for the account moves.
+#[must_use]
+pub fn token_helper() -> Option<PathBuf> {
+    host().filter(|_| enabled())
+}
+
+/// [`vendor_command`] with policy, on the account `account` names by its key
+/// where aterm moved the session onto one ([`crate::aterm::Account`]): the
+/// host's token helper is named that key in place of `--auto`, so it serves
+/// that account's own token or none, and never picks another. The caller has
+/// put the account's login directory in the child's environment and taken
+/// every credential variable out of it ([`crate::account::environment`]): the
+/// helper starts nothing ([`NOT_STARTED`]) for a key the login directory
+/// does not resolve to.
+///
+/// # Errors
+/// An account is named and no helper is reachable now ([`token_helper`]):
+/// the vendor is never started directly on an account's login directory,
+/// where nobody could refuse a directory that is not the account's. The
+/// helper is looked up at each start, so one that was there when the move
+/// was admitted and is gone at the start starts nothing. A start that names
+/// no account never fails here: with no helper it runs the vendor as it is.
+pub fn vendor_command_as(
+    exe: &Path,
+    args: &[OsString],
+    account: Option<&str>,
+) -> io::Result<Command> {
+    vendor_command_for(exe, args, token_helper().as_deref(), account)
+}
+
+fn vendor_command_for(
+    exe: &Path,
+    args: &[OsString],
+    host: Option<&Path>,
+    account: Option<&str>,
+) -> io::Result<Command> {
+    if account.is_some() && host.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no token helper to start the vendor on the account aterm named",
+        ));
+    }
+    Ok(routed(exe, args, host, account))
+}
+
+/// The vendor's command through `host`'s token helper, named `account` or
+/// `--auto`, or the vendor itself with no host.
+fn routed(exe: &Path, args: &[OsString], host: Option<&Path>, account: Option<&str>) -> Command {
     let mut command = match host {
         Some(host) => {
             let mut command = Command::new(host);
             command
-                .args(["harness", "accounts", "token-run", "--auto", "--"])
+                .args(["harness", "accounts", "token-run"])
+                .arg(account.unwrap_or("--auto"))
+                .arg("--")
                 .arg(exe);
             command
         }

@@ -1178,12 +1178,28 @@ fn subject_of(kind: PromptKind, title: &str, body: &[String]) -> String {
         Some((open, close)) => &body[open + 1..close],
         None => body,
     };
-    own.iter()
+    let mut rows = own
+        .iter()
         .map(|r| crate::text::trim(r))
-        .map(|t| t.strip_prefix('│').map_or(t, str::trim))
+        .map(|t| t.strip_prefix('│').map_or(t, str::trim));
+    let subject = rows
+        .by_ref()
         .find(|t| !t.is_empty() && !t.starts_with("Tip:"))
         .unwrap_or_default()
-        .to_string()
+        .to_string();
+    let unbroken = |t: &str| !t.is_empty() && !t.contains(char::is_whitespace);
+    if kind != PromptKind::Browser || !unbroken(&subject) {
+        return subject;
+    }
+    // The reader's rule for a Claude in Chrome box, whose subject is its page's link, one
+    // unbroken word: the rows straight under the link that hold no space are read as its tail,
+    // up to the first blank row or row with a space (prose, an option, a hint). It is a rule,
+    // not a measurement: no capture of a box whose link wrapped exists yet, so how a build
+    // draws that tail is unobserved. A tail drawn any other way (a row that also holds a space)
+    // ends the link there, and a rule that judges the link (the claim worker's page rule) then
+    // sees only what came before it, as it did when the first row alone was read.
+    rows.take_while(|t| unbroken(t))
+        .fold(subject, |link, tail| link + tail)
 }
 
 fn is_question(footer: Option<&str>, options: &[Opt]) -> bool {

@@ -9,8 +9,10 @@
 //! Unix socket path, and the token beside it. It answers the five requests a
 //! client makes (`harness policy`, `native-act info`, `meta set
 //! supervisor`, `meta unset supervisor`, `status`) from state a scenario changes
-//! as it goes, and streams `subscribe @<sid> events` with aterm's numeric tags
-//! and the ACK aterm was measured to send on 2026-11-13 ([`subscribe_ack`]).
+//! as it goes, any other addressed request a scenario gives a counted reply
+//! ([`FakeAterm::set_counted_reply`]) with that reply, and streams
+//! `subscribe @<sid> events` with aterm's numeric tags and the ACK aterm was
+//! measured to send on 2026-11-13 ([`subscribe_ack`]).
 //!
 //! It proves nothing itself. A claim is stored when the settable claim reply is
 //! `OK`, its words read as aterm reads them (a rostered holder's scope words
@@ -579,6 +581,9 @@ struct State {
     registered: bool,
     /// Every addressed request with the connection it came on, in arrival order.
     requests: Vec<(u64, String)>,
+    /// The whole reply, a header and the lines it counts, to each verb the fake
+    /// does not otherwise serve ([`FakeAterm::set_counted_reply`]).
+    counted_replies: Vec<(String, String)>,
     /// The session stream.
     streams: Streams,
 }
@@ -1156,7 +1161,13 @@ impl State {
             }
             "OK".to_string()
         } else {
-            "ERR unknown verb".to_string()
+            self.counted_replies
+                .iter()
+                .find(|(counted, _)| counted == verb)
+                .map_or_else(
+                    || "ERR unknown verb".to_string(),
+                    |(_, reply)| reply.clone(),
+                )
         }
     }
 }
@@ -1355,6 +1366,7 @@ impl FakeAterm {
             unstored: Vec::new(),
             status_reply: None,
             requests: Vec::new(),
+            counted_replies: Vec::new(),
             streams: Streams::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1837,6 +1849,21 @@ impl FakeAterm {
             .claim
             .as_ref()
             .map(|claim| claim.connection)
+    }
+
+    /// Answer the addressed request `verb` (without its `@<sid> `), one the fake
+    /// does not otherwise serve, with the line `header` and then each line of
+    /// `body`, in place of `ERR unknown verb`: a counted reply, as aterm answers
+    /// `turn … harness-duty=turn-end` and `text --json`. Neither is checked, so a
+    /// header that counts more or fewer lines than `body` holds is sent as given.
+    pub fn set_counted_reply(&self, verb: &str, header: &str, body: &[&str]) {
+        let reply = std::iter::once(header)
+            .chain(body.iter().copied())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut state = lock(&self.state);
+        state.counted_replies.retain(|(counted, _)| counted != verb);
+        state.counted_replies.push((verb.to_string(), reply));
     }
 
     // ───────────────────────────── the session stream ─────────────────────────────

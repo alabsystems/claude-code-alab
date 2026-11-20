@@ -109,6 +109,53 @@ pub fn record_idle(status: Option<(&str, u64)>, now_ms: u64, quiet_ms: u64) -> R
     Ok(())
 }
 
+/// How long a record must have read `idle` before a turn's end is taken for
+/// one ([`record_turn_end`]): one look after the change at the harness's
+/// default poll, and one more.
+pub const TURN_END_SETTLE_MS: u64 = 500;
+
+/// How long after a turn's end the record may still be taken for one
+/// ([`record_turn_end`]). This harness's turn-end duty types nothing into
+/// this window while a return is due, and types past it
+/// (`Supervisor::limit_yields` in [`crate::supervise`]), so a move made then
+/// is made in the continuation's place, not over it. The bound is kept well
+/// inside the 2 s aterm waited at a turn end before its own Cruise or Land
+/// continuation (`IDLE_MS` in aterm's
+/// `crates/aterm-agent/src/harness/run.rs`).
+pub const TURN_END_WITHIN_MS: u64 = 1_500;
+
+/// The record half of a safe point made at a turn's end, under a proven
+/// claim that is asked last: the record reads `idle`, and either it has for
+/// the quiet period (`quiet_ms`, [`record_idle`]), or it changed to `idle`
+/// between [`TURN_END_SETTLE_MS`] and [`TURN_END_WITHIN_MS`] ago. Between the
+/// two, a continuation may be about to be typed, or may have begun to be; the
+/// move waits for the quiet period or the next turn's end.
+///
+/// Under Cruise or Land the record is never idle for a whole quiet period:
+/// this harness's turn-end duty continues every turn at once (past
+/// [`TURN_END_WITHIN_MS`] while a return is due). This is the moment such a
+/// session has. Everything else a quiet moment needs (the
+/// agent idle, an empty composer, the person's grace, no input pending) is
+/// still aterm's to say, in the last read before the signal.
+///
+/// # Errors
+/// [`Wait::NoRecord`], [`Wait::Busy`] or [`Wait::Settling`].
+pub fn record_turn_end(
+    status: Option<(&str, u64)>,
+    now_ms: u64,
+    quiet_ms: u64,
+) -> Result<(), Wait> {
+    record_idle(status, now_ms, quiet_ms).or_else(|wait| {
+        // A status clock ahead of this one has ended nothing yet.
+        let ended = status.map_or(0, |(_, at)| now_ms.saturating_sub(at));
+        if wait == Wait::Settling && (TURN_END_SETTLE_MS..=TURN_END_WITHIN_MS).contains(&ended) {
+            Ok(())
+        } else {
+            Err(wait)
+        }
+    })
+}
+
 /// The start of a non-idle run, as first seen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RunStart {
@@ -307,6 +354,10 @@ impl Tracker {
         self.clean_at = None;
     }
 }
+
+#[cfg(test)]
+#[path = "quiet_turn_end_tests.rs"]
+mod turn_end_tests;
 
 #[cfg(test)]
 mod tests {

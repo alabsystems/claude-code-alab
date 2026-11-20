@@ -20,13 +20,16 @@
 //! duty the standing contract-3 claim takes, and the connection that made the
 //! claim; `ERR denied supervisor input authority` otherwise, and for a write
 //! without the fence from the claim's own connection), then the person's count
-//! (`if-human=`; aterm's skip reply). What it typed is recorded
-//! ([`FakeAterm::typed`]) and written into its screen at the cursor, and a
-//! turn's `submit=guarded:<re>` is judged on the cursor's row after the text,
-//! by a matcher for the pattern syntax `alab_policy::guard` writes; any other
-//! syntax is `ERR badregex`. [`FakeAterm::before_next_write`] lands one change
-//! between a client's read and its write: a person's key, the claim made again,
-//! or another screen.
+//! (`if-human=`; aterm's skip reply), the screen's generation (`if-gen=`, which
+//! every write that types moves; `OK skipped reason=changed`) and a row guard
+//! (`if=`, on any visible row; `OK skipped`). What it typed is recorded
+//! ([`FakeAterm::typed`], with a key's `act=`) and written into its screen at
+//! the cursor, and a turn's `submit=guarded:<re>` is judged on the cursor's row
+//! after the text; both guards by a matcher for the pattern syntax
+//! `alab_policy::guard` writes; any other syntax is `ERR badregex`.
+//! [`FakeAterm::before_next_write`] lands one change between a client's read
+//! and its write: a person's key, the claim made again, or another screen;
+//! [`FakeAterm::after_key`] shows another screen once a key is pressed.
 //!
 //! It proves nothing itself. A claim is stored when the settable claim reply is
 //! `OK` and no other holder stands, and `status` shows it proven while the
@@ -67,11 +70,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use alab_policy::guard::KeyAct;
 use claude_code_alab::aterm::{
     self, Hold, Human, Policy, ReplyError, SafePoint, Scope, Status, judge_safe_point,
 };
 use claude_code_alab::aterm_wire::{Connection, EventReader, EventUpdate, Locator};
-use claude_code_alab::typing::{Reply, Typed, Typist, Write};
+use claude_code_alab::typing::{Press, Reply, Typed, Typist, Write};
 
 /// The token every connection must present.
 const TOKEN: &str = "fake-aterm-token";
@@ -151,6 +155,9 @@ const TURN_OPTIONS: [&str; 16] = [
     "if-human",
     "cause",
 ];
+
+/// A screen: its rows, as `text` prints them, and its cursor.
+pub type Shown = (Vec<String>, (usize, usize));
 
 /// The rows of an idle Claude Code whose composer is empty, as `text` prints
 /// them (aterm-phase's `claude-2.1.302-idle-compacted` fixture, cut), and the
@@ -282,12 +289,21 @@ struct State {
     turn_id: u64,
     screen: Vec<String>,
     cursor: (usize, usize),
-    /// What reached the session: `send <text>`, `key <name>`, `turn <text>`,
+    /// What reached the session: `send <text>`, `key <name>` (`key act=<word>
+    /// <name>` for a key that said what it means for a box), `turn <text>`,
     /// and the submit key a turn pressed.
     typed: Vec<String>,
     /// Changes landed when the next typed write arrives.
     next_write: Vec<NextWrite>,
+    /// Screens shown once a key of that name is pressed, the first match
+    /// taken ([`FakeAterm::after_key`]).
+    after_key: Vec<(String, Shown)>,
 }
+
+/// aterm's refusal of a scoped claim that carries a word its contract does not
+/// read (`contract.rs`, `read_in`).
+pub const CHILD_START_REFUSED: &str = "ERR usage: a scoped claim takes contract= scope= version= \
+    vendor= login= (and child= under contract 4)";
 
 /// The leading words of a typed write, as aterm takes them.
 #[derive(Debug, Default)]
@@ -296,7 +312,27 @@ struct Leading {
     revision: Option<u64>,
     duty: Option<Scope>,
     human: Option<u64>,
+    /// `if-gen=`: the screen generation the write was decided on.
+    generation: Option<String>,
+    /// `if=`: a pattern some visible row must match.
+    guard: Option<String>,
+    /// `act=`: what the input means for the box it dismisses.
+    act: Option<String>,
     refusal: Option<String>,
+}
+
+/// aterm's refusal of an `act=` word it does not know, or one given twice.
+const ACT_USAGE: &str =
+    "ERR usage: act=approve|deny|answer says what the input means for the box it dismisses, once";
+
+/// Whether `value` is a screen generation as aterm parses one
+/// (`control.rs`, `ScreenGen::parse`): two runs of digits joined by a dot.
+fn screen_gen(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(epoch, seq)| {
+        [epoch, seq]
+            .iter()
+            .all(|run| !run.is_empty() && run.bytes().all(|byte| byte.is_ascii_digit()))
+    })
 }
 
 /// Canonical-or-not decimal, as aterm reads `if-supervisor-revision=` and
@@ -308,9 +344,10 @@ fn digits(value: &str) -> Option<u64> {
 }
 
 /// Take a typed write's leading words off `rest` as aterm's
-/// `take_leading_options` does: the fence's three words, `if-human=` where the
-/// verb is guarded (`send`, `key`; a turn reads it as an option), up to the
-/// first other word or a `--`, which is taken.
+/// `take_leading_options` does: the fence's three words, and where the verb is
+/// guarded (`send`, `key`; a turn reads `if-human=` as an option) `if-human=`,
+/// `if-gen=`, `if=` and `act=`, up to the first other word or a `--`, which is
+/// taken.
 fn leading(rest: &str, guarded: bool) -> (Leading, &str) {
     let mut out = Leading::default();
     let mut cur = rest.trim_start();
@@ -355,6 +392,32 @@ fn leading(rest: &str, guarded: bool) -> (Leading, &str) {
                             .to_string(),
                     );
                 }
+            }
+        } else if guarded && let Some(value) = head.strip_prefix("if-gen=") {
+            if !screen_gen(value) {
+                out.refusal = Some(
+                    "ERR usage: if-gen=<epoch>.<seq> needs the screen generation a read \
+                     returned (status gen=)"
+                        .to_string(),
+                );
+            } else if out.generation.replace(value.to_string()).is_some() {
+                out.refusal = Some("ERR usage: if-gen= given twice".to_string());
+            }
+        } else if guarded && let Some(pattern) = head.strip_prefix("if=") {
+            if pattern.is_empty() {
+                out.refusal = Some(
+                    "ERR usage: if=<re> needs a pattern — ONE token, e.g. \
+                     if=Do.you.want.to.proceed"
+                        .to_string(),
+                );
+            } else if out.guard.replace(pattern.to_string()).is_some() {
+                out.refusal = Some("ERR usage: if= given twice".to_string());
+            }
+        } else if guarded && let Some(value) = head.strip_prefix("act=") {
+            if !["approve", "deny", "answer"].contains(&value)
+                || out.act.replace(value.to_string()).is_some()
+            {
+                out.refusal = Some(ACT_USAGE.to_string());
             }
         } else {
             break;
@@ -472,18 +535,26 @@ impl State {
         };
         let child = named("child=");
         let child_generation = named("child-start=").and_then(|value| value.parse::<u64>().ok());
+        let contract = named("contract=");
+        // aterm reads a contract-4 claim's words as `contract= scope=
+        // version= vendor= login= child=` and refuses it whole over any
+        // other (`contract.rs`, `read_in`).
+        if contract.as_deref() == Some("4") && named("child-start=").is_some() {
+            return CHILD_START_REFUSED.to_string();
+        }
         if child.is_none()
             && child_generation.is_some()
             && let Some(reply) = &self.start_reply
         {
             return reply.clone();
         }
+        let scope = named("scope=")
+            .unwrap_or_else(|| "relaunch,upgrade,turn-end,approvals,questions,walls".into());
         self.claim = Some(Claim {
             holder: holder.to_string(),
             connection: id,
-            contract: named("contract="),
-            scope: named("scope=")
-                .unwrap_or_else(|| "relaunch,upgrade,turn-end,approvals,questions,walls".into()),
+            contract,
+            scope,
             version: named("version="),
             vendor: named("vendor="),
             child,
@@ -514,11 +585,12 @@ impl State {
         }
     }
 
-    /// Whether the standing claim is a contract-3 one: aterm's `live_scoped`.
+    /// Whether the standing claim is a scoped one, under contract 3 or 4:
+    /// aterm's `live_scoped`.
     fn scoped(&self) -> bool {
         self.claim
             .as_ref()
-            .is_some_and(|claim| claim.contract.as_deref() == Some("3"))
+            .is_some_and(|claim| matches!(claim.contract.as_deref(), Some("3" | "4")))
     }
 
     /// Judge a typed write's authority from connection `id` as aterm does:
@@ -533,7 +605,7 @@ impl State {
                 let stands = duty.types()
                     && revision == self.revision
                     && claim.is_some_and(|claim| {
-                        claim.contract.as_deref() == Some("3")
+                        matches!(claim.contract.as_deref(), Some("3" | "4"))
                             && claim.holder == *holder
                             && claim.scope.split(',').any(|word| word == duty.word())
                             && claim.connection == id
@@ -598,14 +670,41 @@ impl State {
         if let Err(refusal) = self.authorize(id, &fence) {
             return refusal;
         }
+        // aterm's order (`input_if_fenced_observed`): the person, the screen's
+        // generation, then the guard on any visible row.
         if fence.human.is_some_and(|n| n != self.human_seq) {
             return format!("OK skipped reason=person seq={}", self.content_seq);
         }
-        self.typed.push(format!("{verb} {body}"));
+        if fence
+            .generation
+            .as_ref()
+            .is_some_and(|generation| *generation != format!("1.{}", self.content_seq))
+        {
+            return format!("OK skipped reason=changed seq={}", self.content_seq);
+        }
+        if let Some(pattern) = &fence.guard {
+            let Some(matcher) = Guard::compile(pattern) else {
+                return "ERR badregex".to_string();
+            };
+            if !self.screen.iter().any(|row| matcher.matches(row)) {
+                return format!("OK skipped seq={}", self.content_seq);
+            }
+        }
+        let act = fence
+            .act
+            .as_ref()
+            .map(|act| format!("act={act} "))
+            .unwrap_or_default();
+        self.typed.push(format!("{verb} {act}{body}"));
         if verb == "send" {
             self.echo(body);
         } else {
             self.content_seq += 1;
+            if let Some(at) = self.after_key.iter().position(|(key, _)| key == body) {
+                let (_, (rows, cursor)) = self.after_key.remove(at);
+                self.screen = rows;
+                self.cursor = cursor;
+            }
         }
         format!("OK seq={}", self.content_seq)
     }
@@ -865,6 +964,7 @@ impl FakeAterm {
             cursor: composer_screen().1,
             typed: Vec::new(),
             next_write: Vec::new(),
+            after_key: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (accept_state, accept_stop, accept_sid) =
@@ -1190,7 +1290,15 @@ impl FakeAterm {
         lock(&self.state).next_write.push(change);
     }
 
-    /// What reached the session, in order: `send <text>`, `key <name>`,
+    /// Show `screen` once a key named `key` is pressed, as the program redraws
+    /// when it takes the key: a box it answers goes, a focus it moves moves.
+    /// Each is shown once, in the order given for a name.
+    pub fn after_key(&self, key: &str, screen: (Vec<String>, (usize, usize))) {
+        lock(&self.state).after_key.push((key.to_string(), screen));
+    }
+
+    /// What reached the session, in order: `send <text>`, `key <name>`
+    /// (`key act=<word> <name>` for a key that said what it means for a box),
     /// `turn <text>`, and the submit key each turn pressed.
     pub fn typed(&self) -> Vec<String> {
         lock(&self.state).typed.clone()
@@ -1218,11 +1326,12 @@ enum Count {
     Exactly(usize),
 }
 
-/// A `submit=guarded:<re>` pattern in the syntax `alab_policy::guard` writes
-/// (`^`, `$`, `.`, `\s`, `\xHH`, `\x{H…}`, an escaped metacharacter, a class
-/// of characters and `\s`, `*` and `{n}`), matched as a regex is against the
-/// cursor's row. Anything else does not compile, as a pattern aterm's matcher
-/// would read otherwise than this one must not be guessed at.
+/// A `submit=guarded:<re>` or `if=<re>` pattern in the syntax
+/// `alab_policy::guard` writes (`^`, `$`, `.`, `\s`, `\xHH`, `\x{H…}`, an
+/// escaped metacharacter, a class of characters and `\s`, `*` and `{n}`),
+/// matched as a regex is against a row. Anything else does not compile, as a
+/// pattern aterm's matcher would read otherwise than this one must not be
+/// guessed at.
 #[derive(Debug)]
 struct Guard {
     start: bool,
@@ -1355,8 +1464,7 @@ impl Drop for FakeAterm {
 
 /// Stream the events pushed after this subscription began, until the client
 /// goes, the fake stops, or a restart drops the connection.
-fn stream_events(mut out: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
-    let mut sent = lock(state).events.len();
+fn stream_events(mut out: UnixStream, state: &Mutex<State>, stop: &AtomicBool, mut sent: usize) {
     // The read below is the pause between looks and the detector of a closed peer.
     if out
         .set_read_timeout(Some(Duration::from_millis(5)))
@@ -1423,7 +1531,12 @@ fn serve(stream: UnixStream, id: u64, state: &Mutex<State>, stop: &AtomicBool, s
                 let _ = out.write_all(format!("{reply}\n").as_bytes());
                 break;
             }
-            lock(state).subscriptions += 1;
+            // The client may publish its first event as soon as it reads the acknowledgment.
+            let start = {
+                let mut state = lock(state);
+                state.subscriptions += 1;
+                state.events.len()
+            };
             if out
                 .write_all(
                     format!("OK subscribe 1\nsub 1 {sid} role=- attention=- user_title=-\n")
@@ -1431,7 +1544,7 @@ fn serve(stream: UnixStream, id: u64, state: &Mutex<State>, stop: &AtomicBool, s
                 )
                 .is_ok()
             {
-                stream_events(out, state, stop);
+                stream_events(out, state, stop, start);
             }
             break;
         }
@@ -1709,7 +1822,7 @@ pub fn a_claim_on_the_fake_aterm_reads_back_proven_in_status() {
     assert_eq!(held.human, Human::Never);
     let on = policy(&fake, &mut connection);
     assert_eq!(
-        judge_safe_point(&on, &held, &holder, Duration::ZERO),
+        judge_safe_point(&on, &held, &holder, Duration::ZERO, Scope::Upgrade),
         SafePoint::Safe
     );
 
@@ -1717,7 +1830,7 @@ pub fn a_claim_on_the_fake_aterm_reads_back_proven_in_status() {
     fake.set_status("composer", Some("draft"));
     let drafting = status(&fake, &mut connection);
     assert_eq!(
-        judge_safe_point(&on, &drafting, &holder, Duration::ZERO),
+        judge_safe_point(&on, &drafting, &holder, Duration::ZERO, Scope::Upgrade),
         SafePoint::Hold(Hold {
             field: "composer",
             value: "draft".to_string(),
@@ -1730,6 +1843,7 @@ pub fn a_claim_on_the_fake_aterm_reads_back_proven_in_status() {
         &status(&fake, &mut connection),
         &holder,
         Duration::ZERO,
+        Scope::Upgrade,
     ) else {
         panic!("a status without composer= holds");
     };
@@ -1741,7 +1855,9 @@ pub fn a_claim_on_the_fake_aterm_reads_back_proven_in_status() {
     let unproven = status(&fake, &mut connection);
     assert!(!unproven.held_by(&holder));
     assert_eq!(unproven.supervisor.as_deref(), Some(holder.as_str()));
-    let SafePoint::Hold(hold) = judge_safe_point(&on, &unproven, &holder, Duration::ZERO) else {
+    let SafePoint::Hold(hold) =
+        judge_safe_point(&on, &unproven, &holder, Duration::ZERO, Scope::Upgrade)
+    else {
         panic!("an unproven claim holds");
     };
     assert_eq!(hold.to_string(), "wait aterm supervisor_proven=0");
@@ -1867,14 +1983,15 @@ pub fn events_from_the_fake_aterm_reach_this_crates_reader() {
     let fake = FakeAterm::new(&root("events"));
     let socket = fake.locator().socket().expect("socket");
     // An event from before the subscription is not replayed.
-    fake.event("human");
+    fake.send_restart("before-subscribe");
     let mut events = EventReader::connect(&socket, &fake.sid, TIMEOUT).expect("subscribe");
-    eventually("the subscription is counted", || fake.subscriptions() == 1);
-    assert!(!events.drain().requires_refresh());
-
     fake.event("status");
-    let update = await_update("a status event", &mut events, |update| update.activity);
+    let update = await_update("a status event", &mut events, |update| {
+        update.activity || update.restart.is_some()
+    });
+    assert!(update.activity);
     assert!(!update.policy_changed && update.restart.is_none() && update.fault.is_none());
+    assert_eq!(fake.subscriptions(), 1);
 
     fake.set_policy(POLICY_ON);
     let update = await_update("a policy event", &mut events, |update| {
@@ -2394,5 +2511,105 @@ pub fn aterm_typed_text_is_guarded_on_the_composer_row() {
     assert_eq!(hold.to_string(), "wait aterm composer=draft");
     assert_eq!(verbs_since(&fake, from), ["status"]);
     assert_eq!(fake.typed(), ["turn carry on", "enter", "turn carry on"]);
+    assert!(!connection.is_poisoned());
+}
+
+/// A key on a box names the read it was decided on, as the box duties press
+/// it: aterm presses it while the screen is that read's and a row matches its
+/// guard, and records what it means for the box; a screen that moved since,
+/// or a guard no row matches, presses nothing. A key that only moves a focus
+/// says nothing of the box. A key the fake was told the program takes shows
+/// its next screen.
+pub fn aterm_a_key_on_a_box_is_fenced_on_its_read() {
+    let fake = FakeAterm::new(&root("typed-press"));
+    let (pid, _) = me();
+    let mut connection = connect(&fake);
+    let on = typing_claim(
+        &fake,
+        &mut connection,
+        &[Scope::Relaunch, Scope::Upgrade, Scope::Approvals],
+    );
+    let revision = fake.revision();
+    let typist = Typist::new(&fake.sid, pid).expect("typist");
+    fake.set_screen(box_screen());
+    fake.after_key("1", composer_screen());
+    let screen = typist
+        .read(&mut connection)
+        .expect("text")
+        .expect("an OK text")
+        .expect("a screen");
+    assert_eq!(screen.generation.as_deref(), Some("1.100"));
+    let guard = r"^\x20{1}Do\x20you\x20want\x20to\x20proceed\?\s*$";
+    let press = |key, generation, guard, act| Press {
+        key,
+        generation,
+        guard,
+        act,
+        human_seq: 0,
+        grace: Duration::from_millis(2_500),
+    };
+    let yes = press("1", "1.100", guard, Some(KeyAct::Approve));
+    let from = fake.verbs().len();
+    assert_eq!(
+        typist
+            .press(&mut connection, &on, Scope::Approvals, &yes)
+            .expect("press"),
+        Typed::Answered(Reply::Written { seq: Some(101) })
+    );
+    assert_eq!(
+        verbs_since(&fake, from),
+        [
+            "status".to_string(),
+            format!(
+                "key {} if-gen=1.100 if={guard} act=approve 1",
+                fence_words(revision, Scope::Approvals, 0)
+            ),
+        ]
+    );
+    assert_eq!(fake.typed(), ["key act=approve 1"]);
+    assert_eq!(fake.screen(), composer_screen().0);
+
+    // The same key on the read it was decided on, after the screen moved:
+    // nothing.
+    assert_eq!(
+        typist
+            .press(&mut connection, &on, Scope::Approvals, &yes)
+            .expect("stale"),
+        Typed::Answered(Reply::Skipped("changed".to_string()))
+    );
+    // A fresh generation, and a guard no row of the screen matches: nothing.
+    fake.set_screen(box_screen());
+    let elsewhere = press("1", "1.101", r"^\x20Allow\?\s*$", Some(KeyAct::Approve));
+    assert_eq!(
+        typist
+            .press(&mut connection, &on, Scope::Approvals, &elsewhere)
+            .expect("unguarded"),
+        Typed::Answered(Reply::Skipped("guard".to_string()))
+    );
+    assert_eq!(fake.typed(), ["key act=approve 1"]);
+
+    // A focus key carries no act; the guard matches the box's row.
+    let down = press("down", "1.101", guard, None);
+    assert_eq!(
+        typist
+            .press(&mut connection, &on, Scope::Approvals, &down)
+            .expect("down"),
+        Typed::Answered(Reply::Written { seq: Some(102) })
+    );
+    assert_eq!(fake.typed(), ["key act=approve 1", "key down"]);
+
+    // A duty the claim does not take is held before anything is sent.
+    let from = fake.verbs().len();
+    let Typed::Held(hold) = typist
+        .press(&mut connection, &on, Scope::Questions, &down)
+        .expect("questions")
+    else {
+        panic!("a duty the claim does not take is held");
+    };
+    assert_eq!(
+        hold.to_string(),
+        "wait aterm supervisor_scope=relaunch,upgrade,approvals"
+    );
+    assert_eq!(verbs_since(&fake, from), ["status"]);
     assert!(!connection.is_poisoned());
 }

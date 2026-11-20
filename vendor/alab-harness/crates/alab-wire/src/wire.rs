@@ -37,6 +37,9 @@ use crate::config::EnvNames;
 const MAX_TOKEN_BYTES: usize = 256;
 const MAX_GRAPH_BYTES: usize = 16 * 1024;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// The most body lines a counted reply may be read with
+/// ([`Connection::request_counted_until`]).
+pub const MAX_COUNTED_LINES: usize = 1024;
 const EVENT_DRAIN_BYTES: usize = 256 * 1024;
 const EVENT_DRAIN_READS: usize = 1024;
 
@@ -57,6 +60,23 @@ fn deadline_at(timeout: Duration, now: Instant) -> io::Result<Instant> {
     }
     now.checked_add(timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "control deadline overflows"))
+}
+
+/// Whether a counted reply may be read with `max_lines`: 1 to [`MAX_COUNTED_LINES`].
+pub(crate) fn counted_bound(max_lines: usize) -> io::Result<()> {
+    if max_lines == 0 || max_lines > MAX_COUNTED_LINES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a counted reply needs a positive bounded line count",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `timeout` can bound an exchange: positive, and no further from now
+/// than a deadline can be.
+pub(crate) fn exchange_bound(timeout: Duration) -> io::Result<()> {
+    deadline(timeout).map(drop)
 }
 
 fn remaining(until: Instant) -> io::Result<Duration> {
@@ -528,7 +548,8 @@ impl Connection {
     /// of the one it was opened with. A caller that opens with a generous bound
     /// and then asks from a loop that must not stall narrows it here; an exchange
     /// that outlives the bound poisons the connection like any other failure.
-    /// [`Connection::request_line_until`] uses its caller's absolute deadline instead.
+    /// [`Connection::request_line_until`] and [`Connection::request_counted_until`]
+    /// use their caller's absolute deadline instead.
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
@@ -702,6 +723,91 @@ impl Connection {
         self.prepare(request)?;
         let result = self.exchange_line(request, until);
         self.finish(result, until)
+    }
+
+    /// Send one raw protocol line whose `OK` reply counts the lines after it,
+    /// and read the header and exactly those lines by `until`: `OK <n>`, as
+    /// `text --json` answers, or `OK <n> <words…>`, as `turn` answers
+    /// (`OK <n> turn submitted=… seq=…`, then the `<n>` rows it settled on).
+    /// An `ERR` header is a reply with no body. The header and the body lines
+    /// are returned.
+    ///
+    /// `until` covers the write, the header and every body line, as
+    /// [`Connection::request_line_until`]'s covers its one line, and the body's
+    /// lines share one line's byte bound. The whole body is read before this
+    /// returns, so a later request never takes a line of it as its reply.
+    ///
+    /// # Errors
+    /// A `max_lines` of 0 or over [`MAX_COUNTED_LINES`], or invalid local
+    /// input, is refused unsent ([`io::ErrorKind::InvalidInput`]). A header
+    /// with no canonical count or a count over `max_lines`, a body line that is
+    /// not UTF-8, a body over its byte bound, cut short or followed by bytes it
+    /// did not count, an `ERR` header followed by such bytes, or no time left
+    /// ([`io::ErrorKind::TimedOut`]) fails the exchange, and any failed
+    /// exchange poisons the connection; the server may already have committed
+    /// the request, even when no reply arrived.
+    pub fn request_counted_until(
+        &mut self,
+        request: &str,
+        max_lines: usize,
+        until: Instant,
+    ) -> io::Result<(String, Vec<String>)> {
+        counted_bound(max_lines)?;
+        self.prepare(request)?;
+        let result = self.exchange_counted(request, max_lines, until);
+        self.finish(result, until)
+    }
+
+    /// [`Connection::request_counted_until`] within `timeout` of now, in place
+    /// of this connection's own ([`Connection::set_timeout`]): a `turn` answers
+    /// only once the screen settles after its submit, which a loop's bound on
+    /// one reply line does not cover.
+    pub(crate) fn request_counted_within(
+        &mut self,
+        request: &str,
+        max_lines: usize,
+        timeout: Duration,
+    ) -> io::Result<(String, Vec<String>)> {
+        counted_bound(max_lines)?;
+        self.prepare(request)?;
+        let until = deadline_at(timeout, (self.clock)())?;
+        let result = self.exchange_counted(request, max_lines, until);
+        self.finish(result, until)
+    }
+
+    /// The one reader of a counted reply (claude-code-alab's `counted`, worded).
+    fn exchange_counted(
+        &mut self,
+        request: &str,
+        max_lines: usize,
+        until: Instant,
+    ) -> io::Result<(String, Vec<String>)> {
+        let header = self.exchange_line(request, until)?;
+        let count = if header == "ERR" || header.starts_with("ERR ") {
+            0
+        } else {
+            header
+                .strip_prefix("OK ")
+                .map(|rest| rest.split_once(' ').map_or(rest, |(count, _)| count))
+                .and_then(|count| canonical_u64(count).ok())
+                .and_then(|count| usize::try_from(count).ok())
+                .filter(|count| *count <= max_lines)
+                .ok_or_else(|| invalid("reply has no supported canonical body count"))?
+        };
+        let mut body = Vec::with_capacity(count);
+        let mut bytes = 0_usize;
+        for _ in 0..count {
+            let line = self.line_until(until)?;
+            bytes = bytes
+                .checked_add(line.len() + 1)
+                .filter(|bytes| *bytes <= MAX_LINE_BYTES)
+                .ok_or_else(|| invalid("counted reply exceeds its aggregate byte bound"))?;
+            body.push(line);
+        }
+        if !self.pending.is_empty() {
+            return Err(invalid("reply exceeds its declared body count"));
+        }
+        Ok((header, body))
     }
 
     fn exchange_line(&mut self, request: &str, until: Instant) -> io::Result<String> {
@@ -1880,6 +1986,201 @@ mod tests {
             io::ErrorKind::NotConnected
         );
         drop(connection);
+        server.join().unwrap();
+    }
+
+    // Ported from claude-code-alab's `aterm_wire.rs` (`request_body` and
+    // `request_counted`), whose reader `request_counted_until` is.
+
+    #[test]
+    fn counted_observations_consume_the_body_before_the_next_request() {
+        let (mut connection, mut peer) = pair();
+        let server = thread::spawn(move || {
+            assert_eq!(read_request(&mut peer), "text --json process-context\n");
+            for part in ["OK ", "1\n", "{\"rows\":[\"a\",\"b\"]}", "\n"] {
+                peer.write_all(part.as_bytes()).unwrap();
+            }
+            assert_eq!(read_request(&mut peer), "status\n");
+            peer.write_all(b"OK schema=1\n").unwrap();
+        });
+        assert_eq!(
+            connection
+                .request_counted_until("text --json process-context", 1, deadline(END).unwrap())
+                .unwrap(),
+            (
+                "OK 1".to_string(),
+                vec!["{\"rows\":[\"a\",\"b\"]}".to_string()]
+            )
+        );
+        assert_eq!(connection.request_line("status").unwrap(), "OK schema=1");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn counted_observations_keep_one_deadline_for_header_and_all_body_lines() {
+        let (mut connection, mut peer) = pair();
+        // The whole reply waits before the request goes, so the first read takes it all.
+        peer.write_all(b"OK 4\none\ntwo\nthree\nfour\n").unwrap();
+        reset_clock();
+        connection.clock = advancing_clock;
+        // Each look at the clock is 8 s on, and the exchange looks around the
+        // write, before the read, and before each line: the 60 s deadline
+        // holds for the header and two body lines and runs out at the third,
+        // which a deadline of each line's own would read.
+        let until = deadline_at(END, advancing_clock()).unwrap();
+        assert_eq!(
+            connection
+                .request_counted_until("text --json", 4, until)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(connection.is_poisoned() && connection.timed_out());
+        assert_eq!(
+            connection.pending, b"three\nfour\n",
+            "the body is read no further than the deadline"
+        );
+        assert_eq!(read_request(&mut peer), "text --json\n");
+    }
+
+    #[test]
+    fn a_counted_reply_keeps_its_header_and_an_err_has_no_body() {
+        let (mut connection, mut peer) = pair();
+        let server = thread::spawn(move || {
+            assert_eq!(read_request(&mut peer), "turn -- hi\n");
+            peer.write_all(b"OK 2 turn submitted=1 status=settled seq=9 id=3\n\xe2\x9d\xaf hi\n\n")
+                .unwrap();
+            assert_eq!(read_request(&mut peer), "turn -- hi\n");
+            peer.write_all(b"ERR key delivery failed\n").unwrap();
+            assert_eq!(read_request(&mut peer), "turn -- hi\n");
+            peer.write_all(b"OK 0 turn skipped reason=person submitted=0 seq=9 id=4\n")
+                .unwrap();
+            assert_eq!(read_request(&mut peer), "status\n");
+            peer.write_all(b"OK schema=1\n").unwrap();
+        });
+        let mut turn = || {
+            connection
+                .request_counted_until("turn -- hi", 4, deadline(END).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            turn(),
+            (
+                "OK 2 turn submitted=1 status=settled seq=9 id=3".to_string(),
+                vec!["\u{276f} hi".to_string(), String::new()]
+            )
+        );
+        assert_eq!(turn(), ("ERR key delivery failed".to_string(), Vec::new()));
+        assert_eq!(
+            turn(),
+            (
+                "OK 0 turn skipped reason=person submitted=0 seq=9 id=4".to_string(),
+                Vec::new()
+            )
+        );
+        assert!(!connection.is_poisoned());
+        assert_eq!(connection.request_line("status").unwrap(), "OK schema=1");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_counted_reply_without_its_count_over_its_bound_or_incomplete_poisons_the_connection() {
+        for reply in [
+            b"OK\n".as_slice(),
+            b"OK turn submitted=1\n".as_slice(),
+            b"OK 01 turn\nx\n".as_slice(),
+            b"OK -1\n".as_slice(),
+            b"OK 1\tturn\nx\n".as_slice(),
+            // A reply announcing more lines than the caller bounds is refused unread.
+            b"OK 5 turn\na\nb\nc\nd\ne\n".as_slice(),
+            b"OK 99999999999999999999999\n".as_slice(),
+            b"OK 2\n{}\n".as_slice(),
+            b"OK 1\nunfinished".as_slice(),
+            b"OK 1\n\xff\n".as_slice(),
+            b"OK 1 turn\nx\ny\n".as_slice(),
+            b"ERR busy\nunsolicited\n".as_slice(),
+            b"turn submitted=1\n".as_slice(),
+        ] {
+            let (mut connection, mut peer) = pair();
+            peer.write_all(reply).unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+            assert!(
+                connection
+                    .request_counted_until("turn -- hi", 4, deadline(END).unwrap())
+                    .is_err(),
+                "{reply:?}"
+            );
+            assert!(connection.is_poisoned(), "{reply:?}");
+            assert!(!connection.timed_out(), "{reply:?}");
+            assert_eq!(read_request(&mut peer), "turn -- hi\n");
+            assert_eq!(
+                connection.request_line("status").unwrap_err().kind(),
+                io::ErrorKind::NotConnected,
+                "{reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_counted_body_shares_one_lines_byte_bound() {
+        let (mut connection, mut peer) = pair();
+        let server = thread::spawn(move || {
+            assert_eq!(read_request(&mut peer), "text --json\n");
+            // Each line fits a line's bound; the two together do not.
+            let half = "x".repeat(MAX_LINE_BYTES / 2);
+            let _ = peer.write_all(format!("OK 2\n{half}\n{half}\n").as_bytes());
+        });
+        assert_eq!(
+            connection
+                .request_counted_until("text --json", 2, deadline(END).unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(connection.is_poisoned());
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_counted_bound_of_none_or_over_the_ceiling_is_refused_unsent() {
+        let (mut connection, mut peer) = pair();
+        for max_lines in [0, MAX_COUNTED_LINES + 1] {
+            assert_eq!(
+                connection
+                    .request_counted_until("text --json", max_lines, deadline(END).unwrap())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(!connection.is_poisoned());
+        }
+        assert_eq!(
+            connection
+                .request_counted_until("text\n--json", 1, deadline(END).unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!connection.is_poisoned());
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "nothing was sent"
+        );
+        peer.set_nonblocking(false).unwrap();
+        let server = thread::spawn(move || {
+            assert_eq!(read_request(&mut peer), "text --json\n");
+            peer.write_all(b"OK 1\n{}\n").unwrap();
+        });
+        assert_eq!(
+            connection
+                .request_counted_until("text --json", MAX_COUNTED_LINES, deadline(END).unwrap())
+                .unwrap()
+                .1,
+            ["{}"]
+        );
         server.join().unwrap();
     }
 }

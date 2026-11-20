@@ -6,20 +6,25 @@
 //! The supervisor's adapter (`src/supervise_link.rs`) delegates lifecycle claims,
 //! recovery and native child generations to [`alab_wire::link::Link`]. This module
 //! retains request texts, reply parsers and safe-point interpretation for the
-//! typed-client protocol fixtures. It performs no I/O; [`crate::aterm_wire`]
-//! supplies their bounded transport. Runtime lifecycle judgement uses the shared core.
+//! typed-client protocol fixtures and for the duties' deciders ([`Duties`],
+//! [`Texts`], [`Pace`], [`BoxPolicy`], [`WallPolicy`]), and the judge of the
+//! moment a session is moved off Fable's limit ([`judge_wall_point`]). It
+//! performs no I/O; [`crate::aterm_wire`] supplies their bounded transport.
+//! Runtime lifecycle judgement uses the shared core.
 //!
 //! The rule a client of this boundary keeps:
 //!
 //! * **Never a trial claim.** aterm stores a contract-3 claim from a holder that
 //!   is not on its roster as an ordinary foreign claim, and a stored foreign
-//!   claim takes every duty from aterm's built-in engine
-//!   (`aterm/crates/aterm-agent/src/harness/contract.rs`, `Words::Foreign`). So
-//!   the harness claims only after a read-only `native-act info` reply names its
-//!   row ([`rostered`]).
-//! * **Claim only under contract v3.** The claim is [`claim_verb`]'s text, sent
-//!   only after `harness policy` advertises contract 3 and reads `effective=on`
-//!   ([`Policy`]).
+//!   claim takes every duty (`aterm/crates/aterm-agent/src/harness/contract.rs`,
+//!   `Words::Foreign`), held by nobody who performs them. So the harness claims
+//!   only after a read-only `native-act info` reply names its row
+//!   ([`rostered`]).
+//! * **Claim only under a contract the host serves.** The claim is
+//!   [`claim_verb`]'s text, sent only after `harness policy` advertises
+//!   contract 3 and reads `effective=on` ([`Policy`]); where the policy also
+//!   serves contract 4 the claim is made under it and takes the account moves
+//!   too ([`claim_scopes`], [`Scope::Accounts`]).
 //! * **A claim stands only when `status` proves it.** aterm proves a claim by
 //!   kernel peer pid, the claimant leading the terminal's foreground process
 //!   group, and its image sitting in a harness package. The harness reads that
@@ -32,11 +37,14 @@
 //!   the typing duty it performs, with the person's count it was judged at
 //!   (`if-supervisor=`, `if-supervisor-revision=`, `harness-duty=`,
 //!   `if-human=`; [`crate::typing`]), so a write after the claim moved can
-//!   never land. Nothing here types, and the claim takes no typing duty yet.
+//!   never land. Nothing here types; the claim's typing duties, `turn-end`,
+//!   `approvals`, `questions` and `walls`, type through that client
+//!   ([`Duties::BUILT`]).
 
 use std::fmt;
 use std::time::Duration;
 
+pub use alab_policy::config::Autopilot;
 pub(crate) use alab_wire::claim::journal_word;
 pub use alab_wire::claim::{info_verb, policy_verb, status_verb};
 
@@ -44,6 +52,12 @@ use crate::aterm_wire::{Fields, percent_decode, session_id};
 
 /// The aterm control contract this harness requires before it claims anything.
 pub const REQUIRED_CONTRACT: u32 = 3;
+
+/// The contract a claim that takes [`Scope::Accounts`] is made under: aterm
+/// knows the word only there (`contract.rs`, `Scope::since`, `read_v4`), and
+/// a contract-3 claim naming it is refused whole. A claim names it only where
+/// the policy serves this contract too ([`claim_scopes`]).
+pub const ACCOUNTS_CONTRACT: u32 = 4;
 
 /// The required contract when an `OK` policy reply advertises it in its contract set
 /// (`OK gen=… effective=… contract=2,3 …`). An absent, malformed or duplicate field,
@@ -80,11 +94,14 @@ const VENDOR_MAX: usize = 64;
 /// The longest value a journal line repeats from a reply.
 const JOURNAL_WORD_MAX: usize = 64;
 
-/// One duty a contract-3 claim takes from aterm's built-in engine, every one
-/// aterm names, in its canonical order (`contract.rs`, `Scope`). A claim names
-/// only the duties a build performs (`config()` in `src/supervise_link.rs`); the
-/// four typing duties are named here so that a typed write can say which one it
-/// performs ([`crate::typing`]).
+/// One duty a claim takes, in aterm's canonical order (`contract.rs`,
+/// `Scope`): the six a contract-3 claim names
+/// ([`Scope::ALL`]), and [`Scope::Accounts`], which only a contract-4 claim
+/// names ([`ACCOUNTS_CONTRACT`]). A claim names only duties a build performs
+/// ([`Duties`], and [`claim_scopes`] for `accounts`); every typing duty is
+/// named here so that a typed write can say which one it performs
+/// ([`crate::typing`]). aterm's `state` word is not: this harness reports no
+/// state stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// Relaunching the child on the same conversation after a crash.
@@ -99,10 +116,17 @@ pub enum Scope {
     Questions,
     /// Usage, context, login and API-retry walls.
     Walls,
+    /// Moving the child onto another of the person's accounts when aterm asks
+    /// (`restart cause=account to=<key> home=<dir>`). aterm alone chooses the
+    /// account and when; this harness asks for none. A contract-4 word that
+    /// types nothing; it is never one of [`Duties`].
+    Accounts,
 }
 
 impl Scope {
-    /// Every duty, in aterm's order (`contract.rs`, `Scope::ALL`).
+    /// Every duty a contract-3 claim may name, in aterm's order
+    /// (`contract.rs`, `Scope::ALL` up to `walls`): every one but
+    /// [`Scope::Accounts`].
     pub const ALL: [Self; 6] = [
         Self::Relaunch,
         Self::Upgrade,
@@ -122,13 +146,18 @@ impl Scope {
             Self::Approvals => "approvals",
             Self::Questions => "questions",
             Self::Walls => "walls",
+            Self::Accounts => "accounts",
         }
     }
 
-    /// The duty a wire word names exactly (`contract.rs`, `Scope::from_word`).
+    /// The duty a wire word names exactly (`contract.rs`, `Scope::from_word`),
+    /// [`Scope::Accounts`] included.
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|scope| scope.word() == word)
+        Self::ALL
+            .into_iter()
+            .chain([Self::Accounts])
+            .find(|scope| scope.word() == word)
     }
 
     /// Whether a typed write may name this duty. aterm admits typed supervisor
@@ -142,6 +171,143 @@ impl Scope {
             self,
             Self::TurnEnd | Self::Approvals | Self::Questions | Self::Walls
         )
+    }
+
+    /// This duty's bit in a [`Duties`] set.
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// The duties this harness claims, a set of those it performs
+/// ([`Duties::BUILT`]) that always holds the two that type nothing
+/// ([`Duties::ALWAYS`]). Each typing duty is switched on or off by itself
+/// (`--alab-duties=`, [`crate::cli::Options::duties`]): one left out is
+/// performed by nothing in the session, since aterm keeps no Claude Code
+/// duty of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Duties(u8);
+
+impl Duties {
+    /// Every duty this build performs, the claim a launch makes unless told
+    /// otherwise: bringing a crashed child back (`relaunch`), moving it onto
+    /// another vendor build (`upgrade`), Autopilot at its turn ends
+    /// (`turn-end`, [`crate::duty`]), its permission boxes (`approvals`) and
+    /// question dialogs (`questions`, both [`crate::boxes`]), and the walls its
+    /// turns end on (`walls`, [`crate::walls`]): every duty aterm names.
+    pub const BUILT: Self = Self(
+        Scope::Relaunch.bit()
+            | Scope::Upgrade.bit()
+            | Scope::TurnEnd.bit()
+            | Scope::Approvals.bit()
+            | Scope::Questions.bit()
+            | Scope::Walls.bit(),
+    );
+
+    /// The duties every set holds, whatever `--alab-duties=` names: bringing a
+    /// crashed child back (`relaunch`, under which the move off Fable's limit
+    /// and back is made too, [`judge_wall_point`]) and moving it onto another
+    /// vendor build (`upgrade`). Neither types, so every claim names both,
+    /// whatever word it is made under ([`Duties::under`]); one left out would
+    /// be nobody's. A claim stands only where aterm's policy is in effect,
+    /// which is under Cruise and Land: under Off the policy reads
+    /// `effective=off why=autopilot-off` and nothing is claimed, so no crash
+    /// is brought back (the session ends with its child, as outside aterm),
+    /// while the vendor update and the move off Fable's limit go on unclaimed,
+    /// on the harness's own readings.
+    pub const ALWAYS: Self = Self(Scope::Relaunch.bit() | Scope::Upgrade.bit());
+
+    /// The set `bits` names ([`Duties::bits`]), with [`Duties::ALWAYS`]
+    /// added: `None` for an empty set or one that names a duty this build
+    /// does not perform.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits == 0 || bits & !Self::BUILT.0 != 0 {
+            None
+        } else {
+            Some(Self(bits | Self::ALWAYS.0))
+        }
+    }
+
+    /// The set as one byte, each duty at [`Scope`]'s place in aterm's order.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Whether the set holds `scope`.
+    #[must_use]
+    pub const fn takes(self, scope: Scope) -> bool {
+        self.0 & scope.bit() != 0
+    }
+
+    /// The duties in aterm's canonical order, as a claim names them.
+    #[must_use]
+    pub fn scopes(self) -> Vec<Scope> {
+        Scope::ALL
+            .into_iter()
+            .filter(|scope| self.takes(*scope))
+            .collect()
+    }
+
+    /// Whether the set holds a duty that types ([`Scope::types`]): one a
+    /// claim names only while the session's Autopilot types
+    /// ([`Duties::under`]).
+    #[must_use]
+    pub fn types(self) -> bool {
+        self.scopes().into_iter().any(Scope::types)
+    }
+
+    /// The duties of this set a claim names while `status` states the
+    /// session's Autopilot as `autopilot`: every one under Cruise or Land,
+    /// whose turn ends, boxes and walls the harness then types into; under
+    /// `-` (aterm admits no agent in the session yet) or no word at all (a
+    /// launch's first claim, made before its mode is read), only those that
+    /// type nothing ([`Duties::ALWAYS`]), so the claim never names a duty the
+    /// harness would not perform, and it is made again with the typing duties
+    /// once a read states a word that types ([`Duties::types`]). Never empty:
+    /// the vendor update, a crash's relaunch and the move off Fable's limit
+    /// are named in every claim. Under `off` this is only words: aterm's
+    /// policy is not in effect there (`why=autopilot-off`), so no claim is
+    /// made, and one that stands is given back.
+    #[must_use]
+    pub fn under(self, autopilot: Option<Autopilot>) -> Vec<Scope> {
+        let typing = matches!(autopilot, Some(Autopilot::Cruise | Autopilot::Land));
+        self.scopes()
+            .into_iter()
+            .filter(|scope| typing || !scope.types())
+            .collect()
+    }
+
+    /// The duties as a claim spells them: `relaunch,upgrade,turn-end,approvals`.
+    #[must_use]
+    pub fn words(self) -> String {
+        self.scopes()
+            .into_iter()
+            .map(Scope::word)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The set a comma-separated list of duty words names, as
+    /// `--alab-duties=` takes it, with [`Duties::ALWAYS`] added: each word
+    /// aterm's own spelling of a duty this build performs, none empty; a word
+    /// given twice is the same duty, and `relaunch` or `upgrade` names one the
+    /// set holds anyway. `None` for anything else, and for an empty list.
+    #[must_use]
+    pub fn parse(words: &str) -> Option<Self> {
+        let mut bits = 0;
+        for word in words.split(',') {
+            let scope = Scope::from_word(word).filter(|scope| Self::BUILT.takes(*scope))?;
+            bits |= scope.bit();
+        }
+        Self::from_bits(bits)
+    }
+}
+
+impl Default for Duties {
+    fn default() -> Self {
+        Self::BUILT
     }
 }
 
@@ -205,16 +371,18 @@ fn addressed(sid: &str, verb: &str) -> Option<String> {
     session_id(sid).then(|| format!("@{sid} {verb}"))
 }
 
-/// The contract-3 claim for session `sid` by harness process `pid`:
+/// The claim for session `sid` by harness process `pid`:
 ///
-/// `@<sid> meta set supervisor claude-code-alab@<pid> contract=3 scope=<words> version=<version>[ vendor=<vendor>]`
+/// `@<sid> meta set supervisor claude-code-alab@<pid> contract=<3|4> scope=<words> version=<version>[ vendor=<vendor>]`
 ///
 /// `scopes` are spelled once each in aterm's canonical order, comma-joined.
-/// `version` is this harness's own ([`crate::cli::VERSION`]); `vendor` is the
-/// vendor build the child runs, and is left out when it is unknown or is not a
-/// word aterm would accept, because aterm refuses the whole claim over one bad
-/// word (`contract.rs`, `read_in`). `login=` is never sent: this harness keeps no
-/// account.
+/// The contract is 3, or [`ACCOUNTS_CONTRACT`] where `scopes` take
+/// [`Scope::Accounts`], a word contract 3 refuses; contract 4 requires the
+/// `version=` every claim here carries. `version` is this harness's own
+/// ([`crate::cli::VERSION`]); `vendor` is the vendor build the child runs, and
+/// is left out when it is unknown or is not a word aterm would accept, because
+/// aterm refuses the whole claim over one bad word (`contract.rs`, `read_in`).
+/// The account the child runs on, `login=`, is added by [`with_login`].
 ///
 /// `None`, and nothing may be sent, when `sid` is not a session ID, `pid` is not
 /// above 1, `scopes` is empty, or `version` is not `MAJOR.MINOR.0[+meta]`.
@@ -240,8 +408,9 @@ pub fn claim_verb(
         .map(|scope| scope.word())
         .collect::<Vec<_>>()
         .join(",");
+    let contract = claim_contract(&scopes);
     let mut verb = format!(
-        "meta set supervisor {} contract={REQUIRED_CONTRACT} scope={scope} version={version}",
+        "meta set supervisor {} contract={contract} scope={scope} version={version}",
         holder(pid)
     );
     if let Some(vendor) = vendor_word(vendor) {
@@ -250,6 +419,141 @@ pub fn claim_verb(
     }
     addressed(sid, &verb)
 }
+
+/// The contract a claim naming `scopes` is made under: [`ACCOUNTS_CONTRACT`]
+/// where it takes [`Scope::Accounts`], [`REQUIRED_CONTRACT`] otherwise.
+#[must_use]
+pub fn claim_contract(scopes: &[Scope]) -> u32 {
+    if scopes.contains(&Scope::Accounts) {
+        ACCOUNTS_CONTRACT
+    } else {
+        REQUIRED_CONTRACT
+    }
+}
+
+/// The duties a claim names under `policy`: the launch's `duties`, and
+/// [`Scope::Accounts`] where the policy serves [`ACCOUNTS_CONTRACT`]. A host
+/// that serves contract 3 alone gets the contract-3 claim it always had, and
+/// a host that serves 4 a contract-4 claim that also takes the account moves
+/// (docs/DECISIONS.md 51). Whatever `duties` say of `accounts` is not read:
+/// the policy decides it afresh on every claim.
+#[must_use]
+pub fn claim_scopes(policy: &Policy, duties: &[Scope]) -> Vec<Scope> {
+    let mut scopes: Vec<Scope> = duties
+        .iter()
+        .copied()
+        .filter(|scope| *scope != Scope::Accounts)
+        .collect();
+    if policy.contracts.contains(&ACCOUNTS_CONTRACT) {
+        scopes.push(Scope::Accounts);
+    }
+    scopes.sort_unstable();
+    scopes.dedup();
+    scopes
+}
+
+/// Whether aterm would take `label` as an account label, in a claim's
+/// `login=` or a restart's `to=`: 1 to 64 bytes, the first an ASCII lowercase
+/// letter or digit, the rest those or `.`, `_`, `-`, and never `help`
+/// (`aterm/crates/aterm-agent/src/harness/accounts.rs`, `admissible_label`).
+#[must_use]
+pub fn account_label(label: &str) -> bool {
+    let mut bytes = label.bytes();
+    let first = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    label.len() <= 64
+        && label != "help"
+        && bytes.next().is_some_and(first)
+        && bytes.all(|byte| first(byte) || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Whether `word` is an account key, the one identity of an account on the
+/// wire (aterm's `aterm_file::account_key::AccountKey`): `ac-` and 16 lower
+/// hex digits. A key is an [`account_label`] by its grammar, so it rides a
+/// restart's `to=` and a claim's `login=` unchanged; a roster label, a slug
+/// or an address is none, and this harness moves a session only onto a key
+/// (`Supervisor::restart_asked` in [`crate::supervise`]).
+#[must_use]
+pub fn account_key(word: &str) -> bool {
+    word.strip_prefix("ac-").is_some_and(|hex| {
+        hex.len() == 16
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// `verb`, a claim, with ` login=<label>` added where the child runs on the
+/// account `login` names: aterm reads the word as the account the claim's
+/// child last started on, and waits for it after an account move it asked for
+/// (`restart cause=account`). `None` where `verb` is, or where `login` is no
+/// [`account_label`], since aterm would refuse the whole claim over it.
+#[must_use]
+pub fn with_login(verb: Option<String>, login: Option<&str>) -> Option<String> {
+    let mut verb = verb?;
+    if let Some(label) = login {
+        if !account_label(label) {
+            return None;
+        }
+        verb.push_str(" login=");
+        verb.push_str(label);
+    }
+    Some(verb)
+}
+
+/// What aterm confirmed of the agent image in the session, which decides
+/// whether it types a write into it, as `status supervisor_act=` says it
+/// (`aterm/crates/aterm-agent/src/harness/agent_image.rs`, `Act`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineAct {
+    /// `on`: aterm confirmed the agent's running image, and types the writes
+    /// fenced on it.
+    On,
+    /// `observe`: aterm confirmed no agent image, and types no write. In a tab
+    /// this harness leads, that is the tab without a kept child: the image
+    /// aterm then reads is the harness's own.
+    Observe,
+    /// `-`: aterm admits no agent in the session, or has read no image yet.
+    Unread,
+}
+
+/// What aterm confirmed of the agent image in one `status` reply: its one
+/// `supervisor_act=` word.
+/// `None` for a reply that is not `OK`, or that states the word twice, not at
+/// all, or as a word not known here.
+#[must_use]
+pub fn engine_act(status_reply: &str) -> Option<EngineAct> {
+    let mut words = status_reply.split_ascii_whitespace();
+    if words.next() != Some("OK") {
+        return None;
+    }
+    let mut values = words.filter_map(|word| word.strip_prefix("supervisor_act="));
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(match value {
+        "on" => EngineAct::On,
+        "observe" => EngineAct::Observe,
+        "-" => EngineAct::Unread,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+#[path = "aterm_duties_tests.rs"]
+mod duties_tests;
+
+#[cfg(test)]
+#[path = "aterm_restart_tests.rs"]
+mod restart_tests;
+
+#[cfg(test)]
+#[path = "aterm_account_tests.rs"]
+mod account_tests;
+
+#[cfg(test)]
+#[path = "aterm_act_tests.rs"]
+mod act_tests;
 
 /// The release of process `pid`'s claim on session `sid`:
 /// `@<sid> meta unset supervisor holder=claude-code-alab@<pid>`. Naming the
@@ -601,6 +905,17 @@ pub struct Status {
     pub input: Option<String>,
     /// `need=`: what the session waits on a person for (`-` for nothing).
     pub need: Option<String>,
+    /// `autopilot=`: how far Autopilot carries this session's turn ends, the
+    /// session's own word over the policy's default, and `off` wherever the
+    /// policy is off for it (`aterm/crates/aterm-gui/src/autopilot.rs`,
+    /// `wire_field`). `None` for `-` (aterm admits no agent in the session), an
+    /// absent field, or a word not known here: the turn-end duty then types
+    /// nothing.
+    pub autopilot: Option<Autopilot>,
+    /// Whether the reply carried `autopilot=` at all, `-` included: a host
+    /// that states the field names a mode once it admits an agent in the
+    /// session, and one that never states it (an older aterm) never will.
+    pub autopilot_stated: bool,
 }
 
 impl Status {
@@ -648,6 +963,12 @@ impl Status {
             hold: word("hold"),
             input: word("input"),
             need: word("need"),
+            // Exactly the three wire words: `parse`'s other names for a mode
+            // are a person's, never aterm's.
+            autopilot: fields
+                .get("autopilot")
+                .and_then(|word| Autopilot::ALL.into_iter().find(|mode| mode.word() == word)),
+            autopilot_stated: fields.get("autopilot").is_some(),
         })
     }
 
@@ -667,38 +988,331 @@ impl Status {
 }
 
 /// A restart aterm asks the claim holder to make, from an
-/// `EVENT <local> restart cause=<why>[ to=<label> home=<path>]` line
-/// (`aterm/crates/aterm-gui/src/restart_act.rs`, `record_restart` and
-/// `record_scoped_account`). aterm sends it instead of signalling a harness
+/// `EVENT <local> restart cause=<why>[ to=<key> home=<path>][ model=<word>]`
+/// line (`aterm/crates/aterm-gui/src/restart_act.rs`, `record_restart` and
+/// `record_scoped_restart`). aterm sends it instead of signalling a harness
 /// whose proven claim takes `relaunch`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Restart {
     /// Why: `asked` (a person's `aterm ctl restart`), `stall` (the stall's
-    /// remedy), or an account cause. Only the cause is read; this harness keeps
-    /// no account, so `to=` and `home=` are passed over.
+    /// remedy), `model` (aterm moves the child onto another model), one of
+    /// [`ACCOUNT_CAUSES`] (aterm moves the child onto another account, which
+    /// [`Restart::account`] names), or a bare cause, which names neither a
+    /// model nor an account: `memory` (aterm's memory restart) and
+    /// `input-lost` (a line it wrote that the child never drew), the two of
+    /// its own loop (`restart_act.rs`, `BARE_CAUSES`), and `route`, the word
+    /// aterm's HX-58 tells a session whose route must change (the vault's
+    /// token for a stored login or back; aterm's token helper judges the
+    /// route when it starts the child again). The word is free
+    /// ([`Restart::parse`]): a cause not named here is read, and made as a
+    /// restart of the child as it is, which is how `route` is obeyed whether
+    /// or not the aterm beside the harness sends it yet.
     pub cause: String,
+    /// `model=<word>`: the model aterm asks the child to be resumed on
+    /// ([`model_word`]), or [`MODEL_LAUNCH`], which names none and asks for
+    /// the launch's own. `None` for a restart that names none: the child
+    /// comes back on the model it had.
+    pub model: Option<String>,
+    /// `to=<key> home=<dir|->`: the account aterm moves the child onto, for
+    /// a restart whose cause is one of [`ACCOUNT_CAUSES`]; `None` for every
+    /// other cause, whose `to=` and `home=` are passed over.
+    pub account: Option<Account>,
+}
+
+/// The causes of a restart that moves the child onto another account
+/// (`aterm/crates/aterm-gui/src/harness_host.rs`, the scoped account move):
+/// `account`, at a limit, and `account-ahead`, before one.
+pub const ACCOUNT_CAUSES: [&str; 2] = ["account", "account-ahead"];
+
+/// An account aterm keeps for the person, as a restart names it: its key
+/// (`to=`, [`account_key`]), the one identity it has on the wire, and the
+/// login directory the vendor reads its login from
+/// (`CLAUDE_SECURESTORAGE_CONFIG_DIR`; aterm's `accounts::LOGIN_ENV`), or
+/// `None` for the machine's default login (`home=-`). No credential is ever
+/// here: the vendor is started through aterm's token helper, which serves the
+/// account's token itself ([`crate::launch::vendor_command_as`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Account {
+    /// The restart's `to=` word. aterm sends the account's key; the word is
+    /// read by the grammar aterm holds a `to=` to ([`account_label`]), and
+    /// the supervisor makes no move onto one that is no [`account_key`].
+    pub key: String,
+    /// The login directory, absolute, byte for byte what aterm sent; `None`
+    /// for the default login.
+    pub home: Option<std::path::PathBuf>,
+}
+
+impl Account {
+    /// The account a restart's `to=` and percent-encoded `home=` name: `None`
+    /// for a word aterm would not take as a `to=`, or a home that is not `-`
+    /// and does not decode to an absolute path free of NUL. The decoded path
+    /// is kept as sent, never canonicalised.
+    #[must_use]
+    pub fn of_words(to: &str, home: &str) -> Option<Self> {
+        if !account_label(to) {
+            return None;
+        }
+        let home = if home == "-" {
+            None
+        } else {
+            let decoded = percent_decode(home).ok()?;
+            let path = std::path::PathBuf::from(decoded);
+            if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+                return None;
+            }
+            Some(path)
+        };
+        Some(Self {
+            key: to.to_string(),
+            home,
+        })
+    }
+}
+
+/// The reserved `model=` word of a restart: not a model, but "the model this
+/// session was launched on". The holder drops any model an earlier restart
+/// moved the child onto and resumes on the launch line's own model words: its
+/// `--model`, or none at all where the launch named none and Claude Code's
+/// settings chose. aterm sends it for the move back at a limit's reset, where
+/// naming a model would pin an alias the launch never asked for.
+pub const MODEL_LAUNCH: &str = "launch";
+
+/// Whether `word` may be a restart's `model=` and so a `--model` value on the
+/// vendor's command line: aterm's own rule for the event
+/// (`restart_act.rs`, `model_word`), 1 to 256 bytes of ASCII alphanumerics and
+/// `._-:@/[]`, never starting with `-`, which the vendor would read as an
+/// option.
+#[must_use]
+pub fn model_word(word: &str) -> bool {
+    (1..=256).contains(&word.len())
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-:@/[]".contains(&byte))
+}
+
+/// Why a restart event is not acted on ([`Restart::parse`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unacted {
+    /// No `cause=<word>` first, a cause that is no such word, or a cause
+    /// named again: a line nobody can name a restart from, which the event
+    /// stream treats as a fault of the stream.
+    Cause,
+    /// A restart that names its `cause` but whose other words cannot be acted
+    /// on. `why` is `model` (a `model=` that is no [`model_word`], or one
+    /// given twice), `to` or `home` (given twice), or `account` (a move of one
+    /// of [`ACCOUNT_CAUSES`] whose `to=` and `home=` name no [`Account`]). The
+    /// holder journals it and passes it over; the stream stands.
+    Words {
+        /// The restart's cause, a word of the [`Restart::parse`] rule.
+        cause: String,
+        /// Which of its words could not be read.
+        why: &'static str,
+    },
 }
 
 impl Restart {
     /// Read the words after `restart` in an event line. The first must be
     /// `cause=<word>`, a word of 1 to 64 ASCII alphanumerics, `-` and `_`, and no
-    /// later word may name a cause again; any other trailing word is passed
-    /// over. `None` otherwise: a restart nobody can name is not acted on.
-    #[must_use]
-    pub fn parse<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<Self> {
-        let cause = words.next()?.strip_prefix("cause=")?;
+    /// later word may name a cause again. A later `model=<word>` names the model
+    /// to resume on ([`MODEL_LAUNCH`] for the launch's own); it must be a
+    /// [`model_word`] and may be given once. `to=` and `home=` may each be
+    /// given once; for one of [`ACCOUNT_CAUSES`] both must be there and name
+    /// an [`Account`], and for any other cause they are passed over. Any other
+    /// trailing word (a key not known here) is passed over.
+    ///
+    /// # Errors
+    /// [`Unacted::Cause`] for a restart nobody can name, and
+    /// [`Unacted::Words`] for one whose model could not be put on a command
+    /// line or an account move whose account cannot be read. Neither is acted
+    /// on at all, so a malformed move never ends the child only to resume it
+    /// unmoved.
+    pub fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Result<Self, Unacted> {
+        let words: Vec<&'a str> = words.collect();
+        let (first, rest) = words.split_first().ok_or(Unacted::Cause)?;
+        let cause = first.strip_prefix("cause=").ok_or(Unacted::Cause)?;
         if cause.is_empty()
             || cause.len() > JOURNAL_WORD_MAX
             || !cause
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            || words.any(|word| word.starts_with("cause="))
+            || rest.iter().any(|word| word.starts_with("cause="))
         {
-            return None;
+            return Err(Unacted::Cause);
         }
-        Some(Self {
+        let unacted = |why: &'static str| Unacted::Words {
             cause: cause.to_string(),
+            why,
+        };
+        let mut model = None;
+        let mut to = None;
+        let mut home = None;
+        for &word in rest {
+            if let Some(value) = word.strip_prefix("model=")
+                && (!model_word(value) || model.replace(value).is_some())
+            {
+                return Err(unacted("model"));
+            }
+            if let Some(value) = word.strip_prefix("to=")
+                && to.replace(value).is_some()
+            {
+                return Err(unacted("to"));
+            }
+            if let Some(value) = word.strip_prefix("home=")
+                && home.replace(value).is_some()
+            {
+                return Err(unacted("home"));
+            }
+        }
+        let account = if ACCOUNT_CAUSES.contains(&cause) {
+            let read = to
+                .zip(home)
+                .and_then(|(to, home)| Account::of_words(to, home));
+            Some(read.ok_or_else(|| unacted("account"))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            cause: cause.to_string(),
+            model: model.map(str::to_string),
+            account,
         })
+    }
+}
+
+/// What Land's check was answered with, as the act this harness reports to
+/// aterm's task record ([`act_verb`]), the act codex-alab reports for the
+/// same rest: aterm's `acts::RULE_LANDED` and `acts::RULE_LEFT`
+/// (`aterm/crates/aterm-agent/src/harness/acts.rs`), each filed under the
+/// `turn-end` duty (`act_scope`), so a claim that takes `turn-end` may
+/// report it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandAct {
+    /// The check was answered `LANDED` over a clean repository: `landed@v1`.
+    Landed,
+    /// The check was answered with a `NEEDS YOU:` line: the rest is the
+    /// person's, `left-to-person@v1` ([`alab_policy::words::RULE_LEFT`]).
+    Left,
+}
+
+impl LandAct {
+    /// The act's word on the wire.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Landed => "landed@v1",
+            Self::Left => alab_policy::words::RULE_LEFT,
+        }
+    }
+}
+
+/// The lease a task-face act is reported under:
+/// `@<sid> meta prepare harness_act`, answered `OK until_us=<n> lease_ms=<ms>`
+/// ([`Lease::parse`]). aterm answers it only for the proven holder of a claim
+/// that takes `turn-end` (`aterm/crates/aterm-gui/src/control_session.rs`,
+/// `cmd_meta_harness_act_with_clock`). `None` when `sid` is not a session ID.
+#[must_use]
+pub fn act_prepare_verb(sid: &str) -> Option<String> {
+    addressed(sid, "meta prepare harness_act")
+}
+
+/// The report of `act` inside the lease that ends at `until_us`:
+/// `@<sid> meta set harness_act <act> until_us=<n>`. aterm refuses it once
+/// the lease has run (`ERR expired harness_act`) and while its own reading
+/// of the session is not at rest (`ERR busy harness_act`), so a report
+/// delayed past the next turn never lands on it. `None` when `sid` is not a
+/// session ID.
+#[must_use]
+pub fn act_verb(sid: &str, act: LandAct, until_us: u64) -> Option<String> {
+    addressed(
+        sid,
+        &format!("meta set harness_act {} until_us={until_us}", act.word()),
+    )
+}
+
+/// The longest lease aterm grants (its `HARNESS_ACT_LEASE_MS`); a reply that
+/// names a longer one, or none, is not read.
+pub const ACT_LEASE_MAX_MS: u64 = 5_000;
+
+/// What one exchange of a task-face report heard ([`Lease::parse`],
+/// [`Reported::parse`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reported {
+    /// aterm recorded the act.
+    Recorded,
+    /// aterm cannot take it now (not at rest, the lease ran out, the claim
+    /// does not take `turn-end` at this moment, or another refusal that may
+    /// pass): report again later; the journal words.
+    Later(String),
+    /// This aterm takes no such report, or answered what is not read here:
+    /// nothing is reported to it; the journal words.
+    Unserved(String),
+}
+
+impl Reported {
+    /// A `meta set harness_act` reply: `OK` is recorded; aterm's usage, or
+    /// a field or verb it does not know, is unserved; any other refusal is
+    /// for later.
+    #[must_use]
+    pub fn parse(reply: &str) -> Self {
+        if reply.split_ascii_whitespace().next() == Some("OK") {
+            return Self::Recorded;
+        }
+        Self::refusal("act", reply)
+    }
+
+    /// A refusal of the `step` exchange: unserved where this aterm does not
+    /// know the request (codex-alab's `prepare_unknown`: its usage, an
+    /// unknown meta field or an unknown verb), else for later.
+    fn refusal(step: &str, reply: &str) -> Self {
+        let words = format!("{step} {}", ReplyError::refused(reply));
+        if reply.starts_with("ERR usage")
+            || reply.starts_with("ERR unknown meta field")
+            || reply.starts_with("ERR unknown verb")
+        {
+            Self::Unserved(words)
+        } else {
+            Self::Later(words)
+        }
+    }
+}
+
+/// The lease a [`act_prepare_verb`] reply grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lease {
+    /// When it ends, on aterm's clock (epoch µs): sent back with the act.
+    pub until_us: u64,
+}
+
+impl Lease {
+    /// Parse a `meta prepare harness_act` reply: `OK until_us=<n>
+    /// lease_ms=<ms>`, exactly those two words in that order, `<n>` a
+    /// canonical number above 0 and `<ms>` one from 1 to
+    /// [`ACT_LEASE_MAX_MS`].
+    ///
+    /// # Errors
+    /// A refusal ([`Reported::Later`], or [`Reported::Unserved`] from an
+    /// aterm with no such request), or an `OK` not in that grammar
+    /// ([`Reported::Unserved`], `prepare lease=malformed`).
+    pub fn parse(reply: &str) -> Result<Self, Reported> {
+        let mut words = reply.split_ascii_whitespace();
+        if words.next() != Some("OK") {
+            return Err(Reported::refusal("prepare", reply));
+        }
+        let until_us = words
+            .next()
+            .and_then(|word| word.strip_prefix("until_us="))
+            .and_then(canonical_u64)
+            .filter(|until| *until > 0);
+        let lease_ms = words
+            .next()
+            .and_then(|word| word.strip_prefix("lease_ms="))
+            .and_then(canonical_u64)
+            .filter(|ms| (1..=ACT_LEASE_MAX_MS).contains(ms));
+        match (until_us, lease_ms, words.next()) {
+            (Some(until_us), Some(_), None) => Ok(Self { until_us }),
+            _ => Err(Reported::Unserved("prepare lease=malformed".to_string())),
+        }
     }
 }
 
@@ -750,18 +1364,81 @@ impl SafePoint {
     }
 }
 
-/// Judge one fresh `harness policy` and `status` pair as an upgrade safe point
-/// for the claim `holder`, by aterm's own facts.
+/// The first of the claim's own conditions that does not hold for `duty`,
+/// when one does not ([`judge_safe_point`], items 1 to 4).
+fn claim_hold(policy: &Policy, status: &Status, holder: &str, duty: Scope) -> Option<SafePoint> {
+    if status.supervisor.as_deref() != Some(holder) {
+        return Some(Hold::on(
+            "supervisor",
+            Some(status.supervisor.as_deref().unwrap_or("-")),
+        ));
+    }
+    if !status.supervisor_proven {
+        return Some(Hold::on("supervisor_proven", Some("0")));
+    }
+    if !status.takes(duty) {
+        let scope = status.supervisor_scope.join(",");
+        return Some(Hold::on(
+            "supervisor_scope",
+            Some(if scope.is_empty() { "-" } else { &scope }),
+        ));
+    }
+    if !policy.serves_contract() {
+        let contracts = policy
+            .contracts
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        return Some(Hold::on("contract", Some(&contracts)));
+    }
+    if !policy.effective {
+        return Some(Hold::on("effective", Some("off")));
+    }
+    None
+}
+
+/// The hold of a person who typed within the grace (the larger of the
+/// policy's `human_grace_s` and `grace`), or whose last key cannot be read,
+/// when there is one ([`judge_safe_point`], item 9).
+fn person_hold(policy: &Policy, status: &Status, grace: Duration) -> Option<SafePoint> {
+    let grace = policy.human_grace.max(grace);
+    match status.human {
+        Human::Never => None,
+        Human::Ago(ago) if ago >= grace => None,
+        Human::Ago(ago) => Some(SafePoint::Hold(Hold {
+            field: "human_ms",
+            value: ago.as_millis().to_string(),
+            grace_left: Some(grace.saturating_sub(ago)),
+        })),
+        Human::Unknown => Some(Hold::on("human_ms", Some("unknown"))),
+    }
+}
+
+/// The first of `fields` (a `status` key, what aterm said for it, and the one
+/// value that does not hold) that reads otherwise, when one does.
+fn field_hold(fields: &[(&'static str, Option<&str>, &str)]) -> Option<SafePoint> {
+    fields
+        .iter()
+        .find(|(_, value, wanted)| *value != Some(*wanted))
+        .map(|(field, value, _)| Hold::on(field, *value))
+}
+
+/// Judge one fresh `harness policy` and `status` pair as a safe point for
+/// ending the child of the claim `holder` under its duty `duty`, by aterm's
+/// own facts: `upgrade` for a move onto another vendor build, `relaunch` for
+/// a restart the harness makes of its own accord at a quiet moment (the
+/// session's return onto its launch's model, [`crate::limit`]).
 ///
 /// It is [`SafePoint::Safe`] only when all of these read exactly so, checked in
 /// this order, and otherwise the first that does not is the [`Hold`]:
 ///
 /// 1. `supervisor=<holder>`: the standing claim is this harness's;
 /// 2. `supervisor_proven=1`: aterm proved it;
-/// 3. `supervisor_scope` names `upgrade`: the claim took this duty;
+/// 3. `supervisor_scope` names `duty`: the claim took this duty;
 /// 4. `contract=` serves 3 and `effective=on`: the policy still stands;
-/// 5. `upgrade=true`;
-/// 6. `upgrade_ask=false`: nobody has to say when;
+/// 5. for `upgrade`, `upgrade=true`;
+/// 6. for `upgrade`, `upgrade_ask=false`: nobody has to say when;
 /// 7. `agent=idle`;
 /// 8. `composer=empty` or `composer=placeholder`: no draft;
 /// 9. `human_ms=-`, or at least the grace: the larger of the policy's
@@ -769,7 +1446,8 @@ impl SafePoint {
 /// 10. `hand=-`, `hold=0`, `input=clear`, `need=-`.
 ///
 /// A field that is absent or unreadable holds; nothing is assumed. `grace` can
-/// lengthen aterm's grace and never shorten it.
+/// lengthen aterm's grace and never shorten it. The two upgrade switches are
+/// a person's word on vendor updates and are read for that duty alone.
 ///
 /// This judges only what aterm sees. The harness's own kernel checks (the
 /// foreground group, the session record, background work, the re-validated
@@ -780,40 +1458,18 @@ pub fn judge_safe_point(
     status: &Status,
     holder: &str,
     grace: Duration,
+    duty: Scope,
 ) -> SafePoint {
-    if status.supervisor.as_deref() != Some(holder) {
-        return Hold::on(
-            "supervisor",
-            Some(status.supervisor.as_deref().unwrap_or("-")),
-        );
+    if let Some(hold) = claim_hold(policy, status, holder, duty) {
+        return hold;
     }
-    if !status.supervisor_proven {
-        return Hold::on("supervisor_proven", Some("0"));
-    }
-    if !status.takes(Scope::Upgrade) {
-        let scope = status.supervisor_scope.join(",");
-        return Hold::on(
-            "supervisor_scope",
-            Some(if scope.is_empty() { "-" } else { &scope }),
-        );
-    }
-    if !policy.serves_contract() {
-        let contracts = policy
-            .contracts
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        return Hold::on("contract", Some(&contracts));
-    }
-    if !policy.effective {
-        return Hold::on("effective", Some("off"));
-    }
-    if !policy.upgrade {
-        return Hold::on("upgrade", Some("false"));
-    }
-    if policy.upgrade_ask {
-        return Hold::on("upgrade_ask", Some("true"));
+    if duty == Scope::Upgrade {
+        if !policy.upgrade {
+            return Hold::on("upgrade", Some("false"));
+        }
+        if policy.upgrade_ask {
+            return Hold::on("upgrade_ask", Some("true"));
+        }
     }
     if status.agent.as_deref() != Some("idle") {
         return Hold::on("agent", status.agent.as_deref());
@@ -821,31 +1477,69 @@ pub fn judge_safe_point(
     if !matches!(status.composer.as_deref(), Some("empty" | "placeholder")) {
         return Hold::on("composer", status.composer.as_deref());
     }
-    let grace = policy.human_grace.max(grace);
-    match status.human {
-        Human::Never => {}
-        Human::Ago(ago) if ago >= grace => {}
-        Human::Ago(ago) => {
-            return SafePoint::Hold(Hold {
-                field: "human_ms",
-                value: ago.as_millis().to_string(),
-                grace_left: Some(grace.saturating_sub(ago)),
-            });
-        }
-        Human::Unknown => return Hold::on("human_ms", Some("unknown")),
+    if let Some(hold) = person_hold(policy, status, grace) {
+        return hold;
     }
-    for (field, value, wanted) in [
+    field_hold(&[
         ("hand", status.hand.as_deref(), "-"),
         ("hold", status.hold.as_deref(), "0"),
         ("input", status.input.as_deref(), "clear"),
         ("need", status.need.as_deref(), "-"),
-    ] {
-        if value != Some(wanted) {
-            return Hold::on(field, value);
-        }
-    }
-    SafePoint::Safe
+    ])
+    .unwrap_or(SafePoint::Safe)
 }
+
+/// Judge one fresh `harness policy` and `status` pair as the moment to end a
+/// child that stands at a usage limit, for the claim `holder`
+/// ([`crate::limit`]). The vendor's limit dialog may be open then: the agent
+/// is not `idle`, no composer is drawn (`composer=-`), and the session may
+/// read as needing a person, so neither the agent nor the need is asked. What
+/// is asked is whether a person or a driver would be interrupted, or a draft
+/// lost:
+///
+/// 1. `supervisor=<holder>` and `supervisor_proven=1`;
+/// 2. `supervisor_scope` names `relaunch`: the restart is made under that duty;
+/// 3. `contract=` serves 3 and `effective=on`;
+/// 4. `composer=empty`, `placeholder` or `-`: no draft aterm can see. Once the
+///    dialog is closed (pressed, or never drawn under the vendor's own
+///    countdown) the composer is back, and a draft in it reads `draft`;
+/// 5. `human_ms=-`, or at least the grace (the larger of the policy's
+///    `human_grace_s` and `grace`);
+/// 6. `hand=-`, `hold=0`, `input=clear`.
+///
+/// A field that is absent or unreadable holds. The first that does not read so
+/// is the [`Hold`]. aterm's `-` also stands for a composer whose placeholder
+/// cannot be told from a draft; that one is let through here, where the
+/// dialog's own `-` must be, and the person's grace (5) is what guards it.
+#[must_use]
+pub fn judge_wall_point(
+    policy: &Policy,
+    status: &Status,
+    holder: &str,
+    grace: Duration,
+) -> SafePoint {
+    claim_hold(policy, status, holder, Scope::Relaunch)
+        .or_else(|| {
+            (!matches!(
+                status.composer.as_deref(),
+                Some("empty" | "placeholder" | "-")
+            ))
+            .then(|| Hold::on("composer", status.composer.as_deref()))
+        })
+        .or_else(|| person_hold(policy, status, grace))
+        .or_else(|| {
+            field_hold(&[
+                ("hand", status.hand.as_deref(), "-"),
+                ("hold", status.hold.as_deref(), "0"),
+                ("input", status.input.as_deref(), "clear"),
+            ])
+        })
+        .unwrap_or(SafePoint::Safe)
+}
+
+#[cfg(test)]
+#[path = "aterm_wall_tests.rs"]
+mod wall_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1089,6 +1783,8 @@ mod tests {
                 hold: Some("0".to_string()),
                 input: Some("clear".to_string()),
                 need: Some("-".to_string()),
+                autopilot: Some(Autopilot::Cruise),
+                autopilot_stated: true,
             }
         );
         assert!(status.held_by(ME) && !status.held_by("claude-code-alab@4243"));
@@ -1101,6 +1797,22 @@ mod tests {
         // A holder aterm percent-encodes reads the same.
         let encoded = with(LIVE_STATUS, "supervisor", Some("claude-code-alab%404242"));
         assert!(Status::parse(&encoded).unwrap().held_by(ME));
+        // Autopilot is one of aterm's three wire words; `-`, another name for
+        // a mode and an absent field state none.
+        for (word, mode) in [
+            (Some("land"), Some(Autopilot::Land)),
+            (Some("off"), Some(Autopilot::Off)),
+            (Some("cruise"), Some(Autopilot::Cruise)),
+            (Some("-"), None),
+            (Some("forever"), None),
+            (Some("Land"), None),
+            (None, None),
+        ] {
+            let reply = with(LIVE_STATUS, "autopilot", word);
+            let parsed = Status::parse(&reply).unwrap();
+            assert_eq!(parsed.autopilot, mode, "{word:?}");
+            assert_eq!(parsed.autopilot_stated, word.is_some(), "{word:?}");
+        }
     }
 
     #[test]
@@ -1159,6 +1871,8 @@ mod tests {
                 hold: None,
                 input: None,
                 need: None,
+                autopilot: None,
+                autopilot_stated: false,
             }
         );
         assert!(!bare.held_by(ME) && !bare.takes(Scope::Upgrade));
@@ -1388,7 +2102,7 @@ mod tests {
 
     #[test]
     fn a_restart_event_names_exactly_one_cause() {
-        let parse = |tail: &str| Restart::parse(tail.split_ascii_whitespace());
+        let parse = |tail: &str| Restart::parse(tail.split_ascii_whitespace()).ok();
         for (tail, cause) in [
             ("cause=asked", "asked"),
             ("cause=stall", "stall"),
@@ -1397,10 +2111,8 @@ mod tests {
             ("cause=asked a_later_key=1 bare", "asked"),
         ] {
             assert_eq!(
-                parse(tail),
-                Some(Restart {
-                    cause: cause.to_string()
-                }),
+                parse(tail).map(|restart| (restart.cause, restart.model)),
+                Some((cause.to_string(), None)),
                 "{tail}"
             );
         }
@@ -1424,7 +2136,7 @@ mod tests {
     }
 
     fn held(policy: &Policy, status: &Status) -> String {
-        match judge_safe_point(policy, status, ME, Duration::ZERO) {
+        match judge_safe_point(policy, status, ME, Duration::ZERO, Scope::Upgrade) {
             SafePoint::Safe => "safe".to_string(),
             SafePoint::Hold(hold) => hold.to_string(),
         }
@@ -1432,7 +2144,7 @@ mod tests {
 
     #[test]
     fn a_quiet_proven_session_is_a_safe_point() {
-        let verdict = judge_safe_point(&policy(), &status(), ME, Duration::ZERO);
+        let verdict = judge_safe_point(&policy(), &status(), ME, Duration::ZERO, Scope::Upgrade);
         assert_eq!(verdict, SafePoint::Safe);
         assert!(verdict.is_safe());
         for (key, value) in [
@@ -1596,27 +2308,38 @@ mod tests {
     #[test]
     fn the_persons_grace_is_aterms_or_longer_and_says_how_long_is_left() {
         let typed = Status::parse(&with(LIVE_STATUS, "human_ms", Some("90000"))).unwrap();
-        let SafePoint::Hold(hold) = judge_safe_point(&policy(), &typed, ME, Duration::ZERO) else {
+        let SafePoint::Hold(hold) =
+            judge_safe_point(&policy(), &typed, ME, Duration::ZERO, Scope::Upgrade)
+        else {
             panic!("typing 90 s ago is inside a 120 s grace");
         };
         assert_eq!((hold.field, hold.value.as_str()), ("human_ms", "90000"));
         assert_eq!(hold.grace_left, Some(Duration::from_secs(30)));
         // The caller's own grace lengthens aterm's and never shortens it.
         let aged = Status::parse(&with(LIVE_STATUS, "human_ms", Some("150000"))).unwrap();
-        assert!(judge_safe_point(&policy(), &aged, ME, Duration::from_secs(1)).is_safe());
-        let SafePoint::Hold(hold) =
-            judge_safe_point(&policy(), &aged, ME, Duration::from_secs(200))
-        else {
+        assert!(
+            judge_safe_point(&policy(), &aged, ME, Duration::from_secs(1), Scope::Upgrade)
+                .is_safe()
+        );
+        let SafePoint::Hold(hold) = judge_safe_point(
+            &policy(),
+            &aged,
+            ME,
+            Duration::from_secs(200),
+            Scope::Upgrade,
+        ) else {
             panic!("150 s is inside the caller's 200 s grace");
         };
         assert_eq!(hold.grace_left, Some(Duration::from_secs(50)));
         // A grace of zero is a policy aterm may state: only `-` and any age pass.
         let none = Policy::parse(&with(LIVE_POLICY, "human_grace_s", Some("0"))).unwrap();
         let now = Status::parse(&with(LIVE_STATUS, "human_ms", Some("0"))).unwrap();
-        assert!(judge_safe_point(&none, &now, ME, Duration::ZERO).is_safe());
+        assert!(judge_safe_point(&none, &now, ME, Duration::ZERO, Scope::Upgrade).is_safe());
         // Any other hold carries no grace.
         let busy = Status::parse(&with(LIVE_STATUS, "agent", Some("working"))).unwrap();
-        let SafePoint::Hold(hold) = judge_safe_point(&policy(), &busy, ME, Duration::ZERO) else {
+        let SafePoint::Hold(hold) =
+            judge_safe_point(&policy(), &busy, ME, Duration::ZERO, Scope::Upgrade)
+        else {
             panic!("a working agent holds");
         };
         assert_eq!(hold.grace_left, None);

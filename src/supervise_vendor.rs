@@ -23,6 +23,19 @@ pub(super) struct Launch {
     pub build: Build,
     pub args: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
+    /// The account a move aterm asked for starts this launch on
+    /// ([`Plan::with_account`]): its key is named to the token helper
+    /// ([`crate::launch::vendor_command_as`]), which then serves that
+    /// account or starts nothing, and its login directory is in
+    /// `environment` ([`crate::account::environment`]). `None` for every
+    /// other start, the later starts of a session that was moved onto an
+    /// account among them ([`Plan::on_account`]): the helper is told
+    /// `--auto` and serves whatever the login directory holds.
+    pub account: Option<crate::aterm::Account>,
+    /// `environment` as it was pinned before `account` was put on it
+    /// ([`Plan::with_account`]), which a start the token helper would not
+    /// make goes back to ([`Plan::unmade`]); `None` with no account.
+    before: Option<Vec<(OsString, OsString)>>,
     hold: retention::Hold,
 }
 impl std::fmt::Debug for Launch {
@@ -31,6 +44,10 @@ impl std::fmt::Debug for Launch {
             .field("build", &self.build.number)
             .field("executable", &self.build.exe)
             .field("args", &self.args)
+            .field(
+                "account",
+                &self.account.as_ref().map(|account| &account.key),
+            )
             .field(
                 "environment_keys",
                 &self
@@ -64,18 +81,29 @@ impl Launch {
             build,
             args: args.to_vec(),
             environment: environment.into_iter().collect(),
+            account: None,
+            before: None,
             hold,
         })
     }
-    pub fn command(&self) -> Command {
-        let mut command = crate::launch::vendor_command(&self.build.exe, &self.args, true);
+    /// The command that starts this launch.
+    ///
+    /// # Errors
+    /// The launch names an account and no token helper is reachable now
+    /// ([`crate::launch::vendor_command_as`]): nothing may be started.
+    pub fn command(&self) -> io::Result<Command> {
+        let mut command = crate::launch::vendor_command_as(
+            &self.build.exe,
+            &self.args,
+            self.account.as_ref().map(|account| account.key.as_str()),
+        )?;
         command
             .env_clear()
             .envs(self.environment.iter().map(|(k, v)| (k, v)));
         crate::launch::renderer(&mut command);
         // The continuing parent never changes cwd. Inheriting it keeps the
         // original directory object even if its pathname was renamed meanwhile.
-        command
+        Ok(command)
     }
 }
 
@@ -128,6 +156,65 @@ impl Plan {
         };
         value.revalidate_all()?;
         Ok(value)
+    }
+    /// The same plan resumed with `resume` instead: the argument list of both
+    /// launches is replaced, and every pin (the builds and their holds, the
+    /// environment, the working directory, the streams and the terminal's
+    /// modes) is the one taken before the first SIGTERM.
+    pub fn resumed_with(mut self, resume: Vec<String>) -> Self {
+        let args: Vec<OsString> = resume.iter().map(OsString::from).collect();
+        self.old.args.clone_from(&args);
+        self.target.args = args;
+        self.resume = resume;
+        self
+    }
+    /// The same plan for a session that runs on `account`, where it runs on
+    /// one: both launches carry its login directory and no credential
+    /// variable ([`crate::account::environment`]), and name no account, so
+    /// the token helper is told `--auto`. It is the start of the harness's
+    /// own (a crash, an update, a model move, a restart that names no
+    /// account): aterm admitted no move for it, and only an admitted move
+    /// names a key ([`Plan::with_account`]). `None` leaves the plan as it
+    /// was pinned. Every other pin stays, and this is what the plan goes
+    /// back to if a move put on top of it is not made ([`Plan::unmade`]).
+    pub fn on_account(mut self, account: Option<&crate::aterm::Account>) -> Self {
+        if let Some(account) = account {
+            for launch in [&mut self.old, &mut self.target] {
+                crate::account::environment(&mut launch.environment, account);
+            }
+        }
+        self
+    }
+    /// The same plan moved onto `account`, where a restart aterm asked for
+    /// names one: both launches name its key to the token helper and carry
+    /// its login directory, and none of them a credential variable
+    /// ([`crate::account::environment`]). `None` leaves the plan as it was
+    /// pinned. Every other pin stays.
+    pub fn with_account(mut self, account: Option<&crate::aterm::Account>) -> Self {
+        if let Some(account) = account {
+            for launch in [&mut self.old, &mut self.target] {
+                if launch.before.is_none() {
+                    launch.before = Some(launch.environment.clone());
+                }
+                crate::account::environment(&mut launch.environment, account);
+                launch.account = Some(account.clone());
+            }
+        }
+        self
+    }
+    /// The same plan as it was pinned before any account was put on it
+    /// ([`Plan::with_account`]): both launches name no account and carry
+    /// the environment they had, the login directory and the credential
+    /// variables the account's start took out among it. Every other pin
+    /// stays, the resume line included.
+    pub fn unmade(mut self) -> Self {
+        for launch in [&mut self.old, &mut self.target] {
+            if let Some(before) = launch.before.take() {
+                launch.environment = before;
+            }
+            launch.account = None;
+        }
+        self
     }
     pub fn revalidate(&self) -> io::Result<()> {
         let cwd = std::fs::metadata(".")?;

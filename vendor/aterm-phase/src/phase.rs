@@ -14,7 +14,7 @@ use alab_policy::vocab::{Phase, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 42, "0.42");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 44, "0.44");
 
 /// The glyphs Claude Code's spinner cycles through, plus the static ones it leaves mid-thought.
 const SPINNERS: &[char] = &['✢', '✽', '✻', '✶', '✳', '✧', '✦', '⚡', '·', '*'];
@@ -1127,11 +1127,11 @@ pub(crate) fn is_activity_row(row: &str) -> bool {
 
 /// The text of the vendor's API-retry status row, which no ellipsis ends.
 fn is_retry_status(text: &str) -> bool {
-    let items: Vec<&str> = text.split(" · ").map(crate::text::trim_end).collect();
-    let [_, .., last] = items.as_slice() else {
+    let items = || text.split(" · ").map(crate::text::trim_end);
+    if items().nth(1).is_none() {
         return false;
-    };
-    if *last == "esc to interrupt" {
+    }
+    if items().last() == Some("esc to interrupt") {
         return true;
     }
     let number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
@@ -1156,13 +1156,15 @@ fn is_retry_status(text: &str) -> bool {
         "retrying, waiting up to ",
         "retrying once, waiting up to ",
     ];
-    let Some(at) = items.iter().skip(1).position(|item| {
-        CLAUSES
+    // The items after the first that names the retry's wait.
+    let mut after = items().skip(1).skip_while(|item| {
+        !CLAUSES
             .iter()
             .any(|c| item.strip_prefix(c).is_some_and(wait_reset))
-    }) else {
+    });
+    if after.next().is_none() {
         return false;
-    };
+    }
     let count = |a: &str| match a.split_once('/') {
         Some((k, n)) => number(k) && number(n),
         None => number(a),
@@ -1183,10 +1185,16 @@ fn is_retry_status(text: &str) -> bool {
                         }))
             })
     };
-    match items[at + 2..].split_last() {
-        None => true,
-        Some((&end, between)) => between.iter().all(|&i| tail(i)) && (tail(end) || cut(end)),
+    let mut after = after.peekable();
+    while let Some(item) = after.next() {
+        if after.peek().is_none() {
+            return tail(item) || cut(item);
+        }
+        if !tail(item) {
+            return false;
+        }
     }
+    true
 }
 
 /// The network or no-response class an API-retry row names ([`api_retry_row`]).
@@ -1907,7 +1915,14 @@ fn line_end_in(rows: &[String], i: usize, until: usize, width: usize) -> Option<
         i
     } else {
         let boxed = crate::wrap::transcript_line_end(rows, i, text, lead + 2, width, until);
-        if is_done_shape(&crate::wrap::rejoined(&rows[i..=boxed])) {
+        // A line of one row is that row: `is_done_shape` reads it trimmed, as it reads the
+        // rejoined one.
+        let done = if boxed == i {
+            is_done_shape(row)
+        } else {
+            is_done_shape(&crate::wrap::rejoined(&rows[i..=boxed]))
+        };
+        if done {
             boxed
         } else {
             crate::wrap::line_end(rows, i, text, lead + 2, width, until)
@@ -2052,7 +2067,7 @@ pub(crate) fn is_transcript_row(row: &str) -> bool {
 }
 
 /// A `⎿ Tip: …` row, or a row of the todo list Claude Code can hang under its spinner.
-fn is_tip_or_todo(t: &str) -> bool {
+pub(crate) fn is_tip_or_todo(t: &str) -> bool {
     let under_gutter = t.strip_prefix('⎿').map(str::trim_start);
     under_gutter.is_some_and(|g| g.starts_with("Tip:")) || {
         let item = under_gutter.unwrap_or(t);
@@ -2060,10 +2075,19 @@ fn is_tip_or_todo(t: &str) -> bool {
     }
 }
 
-/// Claude Code's session survey, which it parks above the composer between turns and during them.
+/// A row of Claude Code's session survey, which it parks above the composer between turns and
+/// during them: its head or its options. A `●` head is one that says the card's question; a
+/// [`crate::survey::MESSAGE_DOT`] head (Claude Code 2.1.328 on) only one in column 0 whose
+/// question opens the row, since every message's first row starts with that dot too, and a reply
+/// that names the card (`⏺ Fixed: the harness dismisses the How is Claude doing this session
+/// card`) is said, never the card.
 pub fn is_survey(row: &str) -> bool {
     let t = crate::text::trim_start(row);
-    (t.starts_with('●') && t.contains("How is Claude doing this session"))
+    let question = const { crate::anchor!("survey.question") };
+    (t.starts_with('●') && t.contains(question))
+        || row
+            .strip_prefix(crate::survey::MESSAGE_DOT)
+            .is_some_and(|said| crate::text::trim_start(said).starts_with(question))
         || (t.starts_with("1: Bad") && t.contains("0: Dismiss"))
 }
 

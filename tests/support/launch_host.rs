@@ -154,6 +154,12 @@ pub(super) fn entry() {
                     .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)),
                 "private fixture session is a plain JSON word"
             );
+            if std::env::var_os("ALAB_TEST_HOST_GATE").is_some_and(|mode| mode == "unserved") {
+                // An aterm from before the verb: `aterm harness` refuses the words it does not
+                // know with exit 2 and nothing on its standard output.
+                eprintln!("aterm harness: unknown flag --cwd-hex; run `aterm harness --help`");
+                std::process::exit(2);
+            }
             // These older launch controls deliberately have no configured
             // folder policy. A closed unread observation leaves their vendor
             // dialog behavior alone and starts no attestation child.
@@ -175,6 +181,12 @@ pub(super) fn entry() {
         }
         ["harness", "tap", "--launch", "--", ..] => {
             record_signal_state(&dir, "tap-signals");
+            // What the launch said of its own standard output; this helper's is a pipe.
+            std::fs::write(
+                dir.join("tap-stdout-tty"),
+                std::env::var("ATERM_LAUNCH_STDOUT_TTY").unwrap_or_else(|_| "unset".into()),
+            )
+            .expect("tap terminal word");
             match std::env::var("ALAB_TEST_TAP_MODE").ok().as_deref() {
                 Some("empty") => std::process::exit(0),
                 Some("failed") => std::process::exit(1),
@@ -208,7 +220,11 @@ pub(super) fn entry() {
                     );
                     std::process::exit(0);
                 }
-                Some("sleep") => std::thread::sleep(Duration::from_secs(5)),
+                // Never answers: the query's own deadline ends it, and this helper with it.
+                Some("sleep") => std::thread::sleep(Duration::from_secs(60)),
+                // Answers past the two seconds the query once allowed, as an aterm that
+                // settles a folder's trust first does, and well inside its bound.
+                Some("slow") => std::thread::sleep(Duration::from_secs(3)),
                 Some("oversized") => {
                     if let Err(error) = std::io::stdout().write_all(&vec![b'x'; 64 * 1024 + 1]) {
                         std::fs::write(dir.join("oversized-write-error"), error.to_string())
@@ -240,11 +256,48 @@ pub(super) fn entry() {
             "harness",
             "accounts",
             "token-run",
-            "--auto",
+            word,
             "--",
             vendor,
             rest @ ..,
         ] => {
+            // What this start was asked to run on, as aterm's helper reads
+            // it: the word (`--auto`, or the key of the account a move
+            // names), the login directory, and whether a credential variable
+            // reached it (never its value).
+            let mut starts = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("token-log"))
+                .expect("token log");
+            writeln!(
+                starts,
+                "{word}\t{}\t{}",
+                std::env::var("CLAUDE_SECURESTORAGE_CONFIG_DIR").unwrap_or_else(|_| "-".into()),
+                if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+                    "set"
+                } else {
+                    "-"
+                }
+            )
+            .expect("token start");
+            drop(starts);
+            // The helper starts nothing for an account this launch's login
+            // directory does not resolve to (`token-refuse` names its key),
+            // and says so by its exit status alone: at once, or only after
+            // the time `token-refuse-after-ms` names, as a helper does that
+            // is slow to decide.
+            if std::fs::read_to_string(dir.join("token-refuse"))
+                .is_ok_and(|refused| refused.trim() == *word)
+            {
+                if let Some(after) = std::fs::read_to_string(dir.join("token-refuse-after-ms"))
+                    .ok()
+                    .and_then(|ms| ms.trim().parse().ok())
+                {
+                    std::thread::sleep(Duration::from_millis(after));
+                }
+                std::process::exit(claude_code_alab::launch::NOT_STARTED);
+            }
             record_signal_state(&dir, "token-signals");
             std::fs::write(
                 dir.join("renderer"),
@@ -270,13 +323,13 @@ pub(super) fn entry() {
     }
 }
 
-fn helper(s: &Scenario) -> PathBuf {
+pub(super) fn helper(s: &Scenario) -> PathBuf {
     let path = s.root.join("aterm-host");
     copy_fixture(&std::env::current_exe().expect("test image"), &path);
     path
 }
 
-fn command(s: &Scenario, host: &Path, args: &[&str]) -> Command {
+pub(super) fn command(s: &Scenario, host: &Path, args: &[&str]) -> Command {
     let mut command = s.command(args);
     command
         .env("ATERM_HARNESS_HOST", host)
@@ -567,6 +620,7 @@ pub(super) fn managed_usage_query_retains_a_foreign_native_wait_at_the_executabl
 pub(super) fn managed_usage_query_is_bounded_in_the_actual_single_threaded_cli() {
     for tap in [
         "fast",
+        "slow",
         "empty",
         "failed",
         "sleep",
@@ -579,7 +633,17 @@ pub(super) fn managed_usage_query_is_bounded_in_the_actual_single_threaded_cli()
         s.set_current(BUILD_1);
         s.put("mode", "echo:7");
         let host = helper(&s);
+        let asked = std::time::Instant::now();
         let output = signal_launch(&s, &host, "default", tap);
+        if tap == "sleep" {
+            // CONTROL for `slow`: a host that never answers is still cut off, and no sooner
+            // than the bound that covers aterm's own folder-trust deadline.
+            assert!(
+                asked.elapsed() >= claude_code_alab::launch::TAP_BOUND,
+                "the query ended a silent host after {:?}",
+                asked.elapsed()
+            );
+        }
         assert_eq!(
             output.status.code(),
             Some(7),
@@ -588,7 +652,12 @@ pub(super) fn managed_usage_query_is_bounded_in_the_actual_single_threaded_cli()
         );
         let log = std::fs::read_to_string(s.fake.join("host-log")).unwrap();
         assert_eq!(log.lines().count(), 2, "one tap and one token exec: {log}");
-        let expected: Vec<String> = if tap == "fast" {
+        assert_eq!(
+            std::fs::read_to_string(s.fake.join("tap-stdout-tty")).unwrap(),
+            "0",
+            "{tap}: this launch's standard output is a file, and the host is told so"
+        );
+        let expected: Vec<String> = if tap == "fast" || tap == "slow" {
             vec![
                 "--settings",
                 "{\"statusLine\":{\"type\":\"command\",\"command\":\"fake-tap\"}}",
@@ -1060,7 +1129,7 @@ pub(super) fn leading_word_metadata_opens_no_host_vendor_or_store_state() {
             .stdin(Stdio::null())
             .output()
             .expect("metadata request");
-        let expected = if args == ["--alab-launches=claude"] {
+        let expected = if args == ["--alab-launches=claude"] || args == ["--alab-leads=claude"] {
             0
         } else {
             1
@@ -1085,6 +1154,8 @@ pub(super) fn launch_only_executes_the_vendor_in_place_even_inside_a_rostered_at
     let fake = rostered_aterm(&s);
     let pty = Pty::open();
     let mut launch = command(&s, &host, &["launch", "--", "--model", "opus", "a task"]);
+    // This launch's host answers the folder-policy gate; the launch whose host does not know
+    // it is `a_host_that_does_not_know_the_trust_gate_is_asked_it_once_and_then_only_for_the_usage_tap`.
     launch.envs(fake.env());
     let (_child, pid) = spawn_on_pty(&s, &pty, launch, None);
     assert_eq!(
@@ -1155,6 +1226,11 @@ pub(super) fn launch_only_executes_the_vendor_in_place_even_inside_a_rostered_at
         calls[2].starts_with("harness\taccounts\ttoken-run\t--auto\t--\t"),
         "{calls:?}"
     );
+    assert_eq!(
+        std::fs::read_to_string(s.fake.join("tap-stdout-tty")).unwrap(),
+        "1",
+        "this launch's standard output is a terminal, and the host is told so"
+    );
     s.set_current(BUILD_2);
     s.put("command", "exit:5");
     assert_eq!(
@@ -1166,6 +1242,137 @@ pub(super) fn launch_only_executes_the_vendor_in_place_even_inside_a_rostered_at
     assert_eq!(s.starts().len(), 1, "no lifecycle supervisor remains");
     assert_eq!(fake.connections(), 0);
     assert!(!s.journal().contains("aterm claimed"));
+}
+
+/// An aterm from before `harness launch-trust gate` refuses it as words it does not know (exit
+/// 2, nothing on stdout) and settles a folder's trust inside the usage query. A launch from
+/// such a host asks the gate once, takes the refusal for no gate, asks for the usage tap,
+/// says whether its own output is a terminal, and journals no trust refusal. CONTROL: the
+/// launch above, whose host answers the gate (`unread`), makes the same three calls, and its
+/// answer is obeyed and journaled as a refusal.
+pub(super) fn a_host_that_does_not_know_the_trust_gate_is_asked_it_once_and_then_only_for_the_usage_tap()
+ {
+    for unserved in [true, false] {
+        let s = Scenario::new(if unserved {
+            "launch-host-without-trust-gate"
+        } else {
+            "launch-host-with-trust-gate"
+        });
+        s.add_build(BUILD_1, Some("9.9.1"));
+        s.set_current(BUILD_1);
+        s.put("command", "exit:5");
+        let host = helper(&s);
+        let fake = rostered_aterm(&s);
+        let pty = Pty::open();
+        let mut launch = command(&s, &host, &["launch", "--", "--model", "opus", "a task"]);
+        launch.envs(fake.env());
+        if unserved {
+            launch.env("ALAB_TEST_HOST_GATE", "unserved");
+        } else {
+            launch.env_remove("ALAB_TEST_HOST_GATE");
+        }
+        let (_child, pid) = spawn_on_pty(&s, &pty, launch, None);
+        assert_eq!(
+            wait_status(pid, Duration::from_secs(60)),
+            Some(Status::Exited(5)),
+            "{}",
+            s.report()
+        );
+        let calls = std::fs::read_to_string(s.fake.join("host-log")).expect("host calls");
+        let calls = calls.lines().collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the gate, the usage tap and the token exec: {calls:?}"
+        );
+        assert!(
+            calls[0].starts_with("harness\tlaunch-trust\tgate\t--cwd-hex\t"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[1].starts_with("harness\ttap\t--launch\t--\t"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[2].starts_with("harness\taccounts\ttoken-run\t--auto\t--\t"),
+            "{calls:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(s.fake.join("tap-stdout-tty")).unwrap(),
+            "1",
+            "the host that settles the folder's trust is told this launch has a terminal"
+        );
+        assert_eq!(
+            s.journal().contains("folder-trust"),
+            !unserved,
+            "a host that does not know the gate refused nothing; one that answered is \
+             obeyed{}",
+            s.report()
+        );
+        assert_eq!(
+            s.starts()[0].args[..2],
+            [
+                "--settings",
+                "{\"statusLine\":{\"type\":\"command\",\"command\":\"fake-tap\"}}"
+            ]
+        );
+    }
+}
+
+/// A launch the launcher handed over whose vendor build this harness cannot run ends 127
+/// having started nothing: no host helper and no vendor. It names the one store it read
+/// and the way round, since the launcher holds a build of its own. The control is the same
+/// launch once that store holds a usable build.
+pub(super) fn a_handed_over_launch_whose_vendor_cannot_run_starts_nothing_and_names_the_way_round()
+{
+    for (case, entry) in [("absent", "run"), ("absent", "launch"), ("unready", "run")] {
+        let s = Scenario::new(&format!("handed-over-vendor-{case}-{entry}"));
+        if case == "unready" {
+            s.add_build(BUILD_1, Some("9.9.1"));
+            std::fs::remove_file(s.store.join(format!("{BUILD_1}.ready"))).expect("unready");
+            s.set_current(BUILD_1);
+        }
+        s.put("mode", "echo:7");
+        let host = helper(&s);
+        let launch = || {
+            command(&s, &host, &[entry, "--", "-p", "a task"])
+                .stdin(Stdio::null())
+                .output()
+                .expect("handed-over launch")
+        };
+        let out = launch();
+        assert_eq!(out.status.code(), Some(127), "{out:?}{}", s.report());
+        let err = String::from_utf8_lossy(&out.stderr);
+        let prefix = s.store.parent().and_then(Path::parent).expect("prefix");
+        assert!(
+            err.contains("nothing was run")
+                && err.contains("`claude --no-alab-harness …`")
+                && err.contains(&prefix.display().to_string()),
+            "{err}"
+        );
+        assert!(
+            err.contains(if case == "absent" {
+                "aterm pkg install claude"
+            } else {
+                "aterm pkg doctor"
+            }),
+            "{err}"
+        );
+        assert!(!s.fake.join("host-log").exists(), "a host helper was run");
+        assert!(s.starts().is_empty(), "the vendor was run{}", s.report());
+        assert!(s.journal().contains(" refused vendor-"), "{}", s.report());
+        // CONTROL: the same launch with a usable build in that store runs the vendor.
+        s.add_build(BUILD_2, Some("9.9.2"));
+        s.set_current(BUILD_2);
+        let out = launch();
+        assert_eq!(out.status.code(), Some(7), "{out:?}{}", s.report());
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("nothing was run"),
+            "{out:?}"
+        );
+        assert_eq!(s.starts().len(), 1, "{}", s.report());
+        assert!(s.fake.join("host-log").exists(), "the host was not asked");
+    }
 }
 
 pub(super) fn renderer_honors_explicit_config_without_home() {

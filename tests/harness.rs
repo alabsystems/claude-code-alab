@@ -35,7 +35,9 @@
 //! graceful exit does), the command `die:<signal>` (die by that signal and
 //! leave the record; `raise:<signal>` removes it first), and the control file
 //! `record-hold` (while it exists the fake writes no session record, as a
-//! vendor that has not got that far yet).
+//! vendor that has not got that far yet). For the account scenarios it takes
+//! `raw-hold` too: while that file exists at its start the fake leaves the
+//! terminal's modes as it found them, and takes raw mode once it is gone.
 //!
 //! Tests run one at a time (`harness = false`): they share nothing, but
 //! terminal and process-group signals are easier to read one scenario at a time.
@@ -54,6 +56,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use claude_code_alab::cli::VERSION;
 
+// aterm's account moves, made under a contract 4 claim that takes `accounts`
+// (Decision 63).
+#[path = "support/accounts.rs"]
+mod accounts;
+// The scenarios of the typing duties. None is registered below: the shared
+// link's claim takes no typing duty yet (`src/supervise_link.rs`, Decision
+// 61), so nothing they wait for is typed. They are compiled so they stay
+// current with the fake aterm.
+#[allow(dead_code)]
+#[path = "support/boxes.rs"]
+mod boxes;
 #[path = "support/child_start.rs"]
 mod child_start;
 #[path = "support/aterm.rs"]
@@ -66,8 +79,16 @@ mod inspect;
 mod launch_host;
 #[path = "support/launch_query_entry.rs"]
 mod launch_query_entry;
+#[path = "support/limit.rs"]
+mod limit;
 #[path = "support/prime.rs"]
 mod prime;
+#[allow(dead_code)]
+#[path = "support/turn_end.rs"]
+mod turn_end;
+#[allow(dead_code)]
+#[path = "support/walls.rs"]
+mod walls;
 
 const HARNESS: &str = env!("CARGO_BIN_EXE_claude-alab");
 const TMP: &str = env!("CARGO_TARGET_TMPDIR");
@@ -118,6 +139,10 @@ fn main() {
         ("cold_native_owner_settles_trust_before_usage_and_preserves_in_place_launch",folder_trust::cold_native_owner_settles_trust_before_usage_and_preserves_in_place_launch),
         ("cold_native_trailing_partial_is_not_a_recorded_exchange",folder_trust::cold_native_trailing_partial_is_not_a_recorded_exchange),
         ("cold_native_refusals_never_become_recorded_or_run_in_nonterminal_launches",folder_trust::cold_native_refusals_never_become_recorded_or_run_in_nonterminal_launches),
+        (
+            "a_host_that_does_not_know_the_gate_is_no_gate_and_one_that_answers_is_obeyed",
+            folder_trust::a_host_that_does_not_know_the_gate_is_no_gate_and_one_that_answers_is_obeyed,
+        ),
         ("cold_native_linger_and_inherited_writer_keep_the_owned_cohort_until_retired",folder_trust::cold_native_linger_and_inherited_writer_keep_the_owned_cohort_until_retired),
         ("cold_native_interrupts_retire_the_sdk_before_original_signal_propagation",folder_trust::cold_native_interrupts_retire_the_sdk_before_original_signal_propagation),
         ("cold_native_signal_scope_preserves_ignore_block_resize_and_continue",folder_trust::cold_native_signal_scope_preserves_ignore_block_resize_and_continue),
@@ -162,6 +187,14 @@ fn main() {
         (
             "launch_only_executes_the_vendor_in_place_even_inside_a_rostered_aterm",
             launch_host::launch_only_executes_the_vendor_in_place_even_inside_a_rostered_aterm,
+        ),
+        (
+            "a_host_that_does_not_know_the_trust_gate_is_asked_it_once_and_then_only_for_the_usage_tap",
+            launch_host::a_host_that_does_not_know_the_trust_gate_is_asked_it_once_and_then_only_for_the_usage_tap,
+        ),
+        (
+            "a_handed_over_launch_whose_vendor_cannot_run_starts_nothing_and_names_the_way_round",
+            launch_host::a_handed_over_launch_whose_vendor_cannot_run_starts_nothing_and_names_the_way_round,
         ),
         (
             "renderer_honors_explicit_config_without_home",
@@ -359,6 +392,62 @@ fn main() {
         (
             "the_c4_stream_reports_the_owned_childs_model_and_resends_it_on_reconnect",
             the_c4_stream_reports_the_owned_childs_model_and_resends_it_on_reconnect,
+        ),
+        (
+            "the_c4_stream_tells_each_starts_session_and_the_moves_phases",
+            the_c4_stream_tells_each_starts_session_and_the_moves_phases,
+        ),
+        (
+            "the_c4_stream_tells_aterm_each_move_it_abandons",
+            the_c4_stream_tells_aterm_each_move_it_abandons,
+        ),
+        (
+            "a_fable_limit_resumes_on_opus_and_goes_back_when_it_resets",
+            limit::a_fable_limit_resumes_on_opus_and_goes_back_when_it_resets,
+        ),
+        (
+            "a_fable_limit_move_that_cannot_be_made_backs_off",
+            limit::a_fable_limit_move_that_cannot_be_made_backs_off,
+        ),
+        (
+            "a_fable_limit_never_moves_a_launch_on_another_model",
+            limit::a_fable_limit_never_moves_a_launch_on_another_model,
+        ),
+        (
+            "aterm_a_fable_limit_moves_under_the_claim_and_a_repeat_request_is_a_no_op",
+            limit::aterm_a_fable_limit_moves_under_the_claim_and_a_repeat_request_is_a_no_op,
+        ),
+        (
+            "aterm_a_fable_limit_moves_under_every_autopilot_word",
+            limit::aterm_a_fable_limit_moves_under_every_autopilot_word,
+        ),
+        (
+            "aterm_an_account_move_resumes_on_its_login_and_every_later_start_keeps_it",
+            accounts::aterm_an_account_move_resumes_on_its_login_and_every_later_start_keeps_it,
+        ),
+        (
+            "aterm_a_walled_child_is_resumed_on_the_account_aterm_names",
+            accounts::aterm_a_walled_child_is_resumed_on_the_account_aterm_names,
+        ),
+        (
+            "aterm_an_account_the_token_helper_will_not_start_is_unmade_and_the_session_stays",
+            accounts::aterm_an_account_the_token_helper_will_not_start_is_unmade_and_the_session_stays,
+        ),
+        (
+            "aterm_an_account_restart_that_names_no_key_is_never_made",
+            accounts::aterm_an_account_restart_that_names_no_key_is_never_made,
+        ),
+        (
+            "aterm_the_accounts_own_limit_asks_aterm_nothing",
+            accounts::aterm_the_accounts_own_limit_asks_aterm_nothing,
+        ),
+        (
+            "aterm_an_account_move_without_the_grant_is_not_made",
+            accounts::aterm_an_account_move_without_the_grant_is_not_made,
+        ),
+        (
+            "aterm_a_route_restart_resumes_the_same_conversation_through_the_token_helper",
+            accounts::aterm_a_route_restart_resumes_the_same_conversation_through_the_token_helper,
         ),
         (
             "a_broken_stderr_does_not_lose_the_session",
@@ -709,6 +798,22 @@ fn main() {
             aterm_ctrl_z_during_the_launch_claim_stops_the_job,
         ),
         (
+            "aterm_a_model_restart_during_an_updates_ending_is_made_by_the_updates_relaunch",
+            aterm_a_model_restart_during_an_updates_ending_is_made_by_the_updates_relaunch,
+        ),
+        (
+            "aterm_a_model_restart_during_another_restarts_ending_is_made_by_that_relaunch",
+            aterm_a_model_restart_during_another_restarts_ending_is_made_by_that_relaunch,
+        ),
+        (
+            "aterm_a_model_restart_during_a_crash_is_made_by_the_crash_relaunch",
+            aterm_a_model_restart_during_a_crash_is_made_by_the_crash_relaunch,
+        ),
+        (
+            "aterm_a_restart_onto_the_launchs_model_drops_the_switched_model",
+            aterm_a_restart_onto_the_launchs_model_drops_the_switched_model,
+        ),
+        (
             "aterm_a_restart_whose_relaunch_cannot_start_gives_the_keys_back",
             aterm_a_restart_whose_relaunch_cannot_start_gives_the_keys_back,
         ),
@@ -735,6 +840,10 @@ fn main() {
         (
             "aterm_typed_text_is_guarded_on_the_composer_row",
             fake_aterm::aterm_typed_text_is_guarded_on_the_composer_row,
+        ),
+        (
+            "aterm_a_key_on_a_box_is_fenced_on_its_read",
+            fake_aterm::aterm_a_key_on_a_box_is_fenced_on_its_read,
         ),
         (
             "the_fake_aterm_is_found_and_authenticates_this_crates_client",
@@ -1002,6 +1111,7 @@ impl Scenario {
             // Nor may it inherit that tab's `claude --no-harness`.
             .env_remove("ATERM_NO_HARNESS")
             .env_remove("ATERM_HARNESS_HOST")
+            .env_remove("ATERM_LAUNCH_STDOUT_TTY")
             .env_remove("ALAB_TEST_HOST_IMAGE")
             .env_remove("CLAUDE_ALAB_PID")
             .env_remove("CLAUDE_ALAB_DEPTH");
@@ -1379,6 +1489,8 @@ fn refuses_when_the_vendor_is_missing() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not installed by atpkg"), "{err}");
     assert!(err.contains("aterm pkg install claude"), "{err}");
+    // No launcher handed this launch over, so there is no launcher's build to name.
+    assert!(!err.contains("--no-alab-harness"), "{err}");
     assert!(s.starts().is_empty());
     assert!(
         s.journal()
@@ -2748,7 +2860,7 @@ fn a_relaunch_preserves_option_values_that_spell_permission_flags() {
     std::fs::write(
         project.join(format!("{SID}.jsonl")),
         format!(
-            "{{\"type\":\"permission-mode\",\"permissionMode\":\"auto\",\"sessionId\":\"{SID}\"}}\n"
+            "{{\"type\":\"permission-mode\",\"permissionMode\":\"plan\",\"sessionId\":\"{SID}\"}}\n"
         ),
     )
     .expect("transcript");
@@ -2770,7 +2882,7 @@ fn a_relaunch_preserves_option_values_that_spell_permission_flags() {
             "--append-system-prompt",
             "--dangerously-skip-permissions",
             "--permission-mode",
-            "auto",
+            "plan",
             "--resume",
             SID,
         ],
@@ -2895,6 +3007,277 @@ fn the_c4_stream_reports_the_owned_childs_model_and_resends_it_on_reconnect() {
         s.report()
     );
     assert_eq!(fake.child(), child.word());
+    end_session(&s, pid);
+}
+
+/// HX-19: on an admitted stream the real supervisor tells aterm how each
+/// start's conversation resumes (`session`), and where a vendor move stands
+/// (`upgrade`), in the order the move makes them: what aterm's watchdog types
+/// after `claude-alab run --` once the harness is gone, and what aterm shows of
+/// the move.
+fn the_c4_stream_tells_each_starts_session_and_the_moves_phases() {
+    use alab_wire::record::{Mode, UpgradePhase};
+    use alab_wire::{Body, Config, Scope, fake::FakeAterm};
+
+    let s = Scenario::new("session-stream");
+    s.add_build(BUILD_1, Some("9.9.1"));
+    s.add_build(BUILD_2, Some("9.9.2"));
+    s.set_current(BUILD_1);
+    let config = Config::new(
+        "claude-code-alab",
+        "claude",
+        &[Scope::Relaunch, Scope::Upgrade],
+        VERSION,
+    )
+    .unwrap();
+    let fake = FakeAterm::for_harness("claude-session-stream", &config);
+    fake.serve_contracts(&[4]);
+    fake.serve_stream(true);
+    let pty = Pty::open();
+    let mut command = s.command(&["--alab-quiet-ms=600", "--alab-poll-ms=40"]);
+    command.envs(fake.env());
+    let (_child, pid) = spawn_on_pty(&s, &pty, command, None);
+    await_record(&s, 0);
+    let sessions = || {
+        fake.stream_records()
+            .into_iter()
+            .filter_map(|record| match record.body {
+                Body::Session {
+                    agent,
+                    version,
+                    vendor,
+                    account,
+                    conversation,
+                    cwd,
+                    resume,
+                    mode,
+                    takes,
+                } => {
+                    assert_eq!(
+                        (agent.as_str(), version.as_str(), account, mode, takes),
+                        ("claude", VERSION, None, Mode::Tui, Vec::new()),
+                        "{}",
+                        s.report()
+                    );
+                    let cwd = cwd.expect("the conversation's directory");
+                    assert_eq!(
+                        Path::new(&cwd).canonicalize().ok(),
+                        s.work.canonicalize().ok(),
+                        "{}",
+                        s.report()
+                    );
+                    Some((vendor, conversation, resume))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let upgrades = || {
+        fake.stream_records()
+            .into_iter()
+            .filter_map(|record| match record.body {
+                Body::Upgrade { phase, to } => Some((phase, to)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let said = |vendor: &str| {
+        (
+            Some(vendor.to_string()),
+            Some(SID.to_string()),
+            vec!["--resume".to_string(), SID.to_string()],
+        )
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || !sessions().is_empty()),
+        "the launch's session record{}",
+        s.report()
+    );
+    assert_eq!(sessions(), [said("9.9.1")], "{}", s.report());
+    assert!(upgrades().is_empty(), "no move yet{}", s.report());
+    // A vendor update: the move is told, then the new child's session.
+    s.set_current(BUILD_2);
+    assert!(
+        wait_until(Duration::from_secs(60), || sessions().len() >= 2),
+        "the relaunch's session record{}",
+        s.report()
+    );
+    assert_eq!(s.starts().len(), 2, "{}", s.report());
+    assert_eq!(s.starts()[1].build(), Some(BUILD_2));
+    assert_eq!(s.starts()[1].args, ["--resume", SID]);
+    assert_eq!(sessions(), [said("9.9.1"), said("9.9.2")], "{}", s.report());
+    let phases: Vec<UpgradePhase> = upgrades()
+        .into_iter()
+        .map(|(phase, to)| {
+            assert_eq!(to, "9.9.2", "{}", s.report());
+            phase
+        })
+        .collect();
+    let waited = phases.contains(&UpgradePhase::Waiting);
+    let mut expected = vec![UpgradePhase::Seen];
+    if waited {
+        expected.push(UpgradePhase::Waiting);
+    }
+    expected.extend([UpgradePhase::Moving, UpgradePhase::Done]);
+    assert_eq!(phases, expected, "{}", s.report());
+    // One journal line for each record put, the separator escaped.
+    let journal = s.journal();
+    for vendor in ["9.9.1", "9.9.2"] {
+        let tail =
+            format!(" conversation={SID} account=- vendor={vendor} argv=--resume\\u{{1f}}{SID}");
+        assert_eq!(
+            journal
+                .lines()
+                .filter(|l| l.contains(" aterm told session seq=") && l.ends_with(&tail))
+                .count(),
+            1,
+            "{tail}{}",
+            s.report()
+        );
+    }
+    assert_eq!(
+        journal
+            .lines()
+            .filter(|l| l.contains(" aterm told upgrade seq=") && l.ends_with(" to=9.9.2"))
+            .count(),
+        expected.len(),
+        "{}",
+        s.report()
+    );
+    end_session(&s, pid);
+}
+
+/// HX-19: a move the real supervisor does not make is told `abandoned` at
+/// each place it is given up: a `current` that names the child's build again
+/// while a turn holds the move, a child that outlives its SIGTERM
+/// (`update-abandoned`), and a build that exits inside the startup grace
+/// (`relaunch-fallback`). aterm shows the newest `upgrade` record, so a move
+/// left at `waiting` or `moving` would stay on its band.
+fn the_c4_stream_tells_aterm_each_move_it_abandons() {
+    use alab_wire::record::UpgradePhase::{Abandoned, Moving, Seen, Waiting};
+    use alab_wire::{Body, Config, Scope, fake::FakeAterm};
+
+    let s = Scenario::new("upgrade-abandoned-stream");
+    s.add_build(BUILD_1, Some("9.9.1"));
+    s.add_build(BUILD_2, Some("9.9.2"));
+    // A build that refuses to start, and states its version.
+    s.add_build_script(BUILD_3, "exit 2");
+    std::fs::write(
+        s.store.join(format!("{BUILD_3}.vendor")),
+        "schema = 1\nprogram = \"claude\"\nversion = \"9.9.3\"\nvendor = \"Fake\"\n",
+    )
+    .expect("vendor");
+    s.set_current(BUILD_1);
+    let config = Config::new(
+        "claude-code-alab",
+        "claude",
+        &[Scope::Relaunch, Scope::Upgrade],
+        VERSION,
+    )
+    .unwrap();
+    let fake = FakeAterm::for_harness("claude-upgrade-abandoned", &config);
+    fake.serve_contracts(&[4]);
+    fake.serve_stream(true);
+    let pty = Pty::open();
+    let mut command = s.command(&[
+        "--alab-quiet-ms=600",
+        "--alab-poll-ms=40",
+        "--alab-term-grace-ms=1000",
+    ]);
+    command.envs(fake.env());
+    let (_child, pid) = spawn_on_pty(&s, &pty, command, None);
+    let first = await_record(&s, 0);
+    let upgrades = || {
+        fake.stream_records()
+            .into_iter()
+            .filter_map(|record| match record.body {
+                Body::Upgrade { phase, to } => Some((phase, to)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let has = |phase, n: usize| {
+        wait_until(Duration::from_secs(60), || {
+            upgrades().iter().filter(|(p, _)| *p == phase).count() >= n
+        })
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || fake
+            .stream_records()
+            .iter()
+            .any(|record| matches!(record.body, Body::Session { .. }))),
+        "the stream never opened{}",
+        s.report()
+    );
+    // 1. A turn holds the move, and the store takes it back.
+    s.put("status", "busy");
+    assert!(
+        wait_until(Duration::from_secs(15), || std::fs::read_to_string(
+            record_of(&s, first)
+        )
+        .is_ok_and(|record| record.contains(r#""status":"busy""#))),
+        "{}",
+        s.report()
+    );
+    s.set_current(BUILD_2);
+    assert!(has(Waiting, 1), "the move never waited{}", s.report());
+    s.set_current(BUILD_1);
+    assert!(has(Abandoned, 1), "the move taken back{}", s.report());
+    s.put("status", "idle");
+    // 2. The child outlives its SIGTERM.
+    s.put("term", "ignore");
+    s.set_current(BUILD_2);
+    assert!(has(Abandoned, 2), "update-abandoned{}", s.report());
+    assert!(s.journal().contains("update-abandoned"), "{}", s.report());
+    // 3. The new build exits at once: the old one resumes the conversation.
+    s.put("term", "exit");
+    s.set_current(BUILD_3);
+    assert!(has(Abandoned, 3), "relaunch-fallback{}", s.report());
+    // The stream is told before the previous build is started; the journal
+    // line is written only once it has been.
+    assert!(
+        wait_until(Duration::from_secs(60), || s.journal().contains(&format!(
+            "relaunch-fallback child=Exited(2) failed-build={BUILD_3} fallback-build={BUILD_1}"
+        ))),
+        "{}",
+        s.report()
+    );
+    // Each move in the order it went, its version named throughout. A safe
+    // point that passed at the first look waited for nothing.
+    let told = upgrades();
+    assert_eq!(
+        told.get(1),
+        Some(&(Waiting, "9.9.2".to_string())),
+        "{told:?}"
+    );
+    let phases: Vec<_> = told
+        .into_iter()
+        .filter(|(phase, _)| *phase != Waiting)
+        .collect();
+    let at = |phase, to: &str| (phase, to.to_string());
+    assert_eq!(
+        phases,
+        [
+            at(Seen, "9.9.2"),
+            at(Abandoned, "9.9.2"),
+            at(Seen, "9.9.2"),
+            at(Moving, "9.9.2"),
+            at(Abandoned, "9.9.2"),
+            at(Seen, "9.9.3"),
+            at(Moving, "9.9.3"),
+            at(Abandoned, "9.9.3"),
+        ],
+        "{}",
+        s.report()
+    );
+    // The script build logs no start: the second is the fallback's.
+    assert!(
+        wait_until(Duration::from_secs(15), || s.starts().len() >= 2),
+        "{}",
+        s.report()
+    );
+    assert_eq!(s.starts().len(), 2, "{}", s.report());
+    assert_eq!(s.starts()[1].build(), Some(BUILD_1), "{}", s.report());
     end_session(&s, pid);
 }
 
@@ -5432,18 +5815,21 @@ fn aterm_a_model_restart_waits_and_preserves_the_selected_model() {
     await_journal(
         &s,
         Duration::from_secs(5),
-        "aterm restart cause=model deferred no-record",
+        "aterm restart cause=model model=opus[1m] deferred no-record",
     );
     assert!(!got_term(&s), "{}", s.report());
     assert_eq!(s.starts().len(), 1, "{}", s.report());
 
     std::fs::remove_file(s.fake.join("record-hold")).expect("release the record");
     let replacement = await_record(&s, 1);
+    // The launch's `--model=sonnet` is dropped and the requested model named
+    // in front of the resume pair (`profile::with_model`); the permission
+    // mode the conversation left follows it.
     let resume = [
-        "--model",
-        "opus[1m]",
         "--name",
         "kept",
+        "--model",
+        "opus[1m]",
         "--permission-mode",
         "plan",
         "--resume",
@@ -5458,7 +5844,7 @@ fn aterm_a_model_restart_waits_and_preserves_the_selected_model() {
     await_journal(
         &s,
         Duration::from_secs(5),
-        "aterm restart cause=model ignored held hold=0 hand=lease:driver@4 human_ms=-",
+        "aterm restart cause=model model=haiku ignored held hold=0 hand=lease:driver@4 human_ms=-",
     );
     command_logged(&s, "cont-fence", "cont-fence 0");
     assert_eq!(s.starts().len(), 2, "{}", s.report());
@@ -5516,7 +5902,7 @@ fn aterm_a_restart_stays_bound_to_the_conversation_it_read() {
     await_journal(
         &s,
         Duration::from_secs(60),
-        "aterm restart cause=model deferred aterm policy reply=ERR:aterm",
+        "aterm restart cause=model model=opus[1m] deferred aterm policy reply=ERR:aterm",
     );
     let current = switched.replace(SWITCHED, CURRENT);
     std::fs::write(&staged, &current).expect("stage the current conversation");
@@ -5525,7 +5911,7 @@ fn aterm_a_restart_stays_bound_to_the_conversation_it_read() {
     await_journal(
         &s,
         Duration::from_secs(60),
-        "aterm restart cause=model ignored record-changed",
+        "aterm restart cause=model model=opus[1m] ignored record-changed",
     );
     command_logged(&s, "cont-fence", "cont-fence 0");
     assert!(!got_term(&s) && s.starts().len() == 1, "{}", s.report());
@@ -6807,6 +7193,295 @@ fn aterm_a_restart_sent_for_the_child_an_update_replaced_is_ignored() {
     end_session(&s, pid);
 }
 
+/// The resume line of a relaunch on `model`, for a launch with no arguments.
+fn on_model(model: &str) -> [&str; 4] {
+    ["--model", model, "--resume", SID]
+}
+
+/// How often `s`'s fake vendor logged a `SIGTERM`.
+fn terms(s: &Scenario) -> usize {
+    s.log().iter().filter(|l| *l == "signal TERM").count()
+}
+
+/// aterm moves the session onto another model while a vendor update's
+/// SIGTERM is out. The update's plan was pinned on the launch's line, and
+/// the child it ends is the one the request was sent for. The model was asked
+/// of the conversation: the request waits, and the update's own relaunch is
+/// made on it, with no second restart. A request that names no model is still
+/// the update's to answer alone.
+fn aterm_a_model_restart_during_an_updates_ending_is_made_by_the_updates_relaunch() {
+    let s = Scenario::new("aterm-model-joins-update");
+    let fake = rostered_aterm(&s);
+    s.put("term", "ignore");
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_record(&s, 0);
+    s.set_current(BUILD_2);
+    assert!(
+        wait_until(Duration::from_secs(15), || got_term(&s)),
+        "{}",
+        s.report()
+    );
+    // CONTROL: no model, no wait.
+    fake.send_restart("stall");
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "aterm restart cause=stall ignored update-ending",
+    );
+    fake.event("restart cause=model model=claude-opus-5-5");
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "aterm restart cause=model model=claude-opus-5-5 deferred update-ending",
+    );
+    assert_eq!(s.starts().len(), 1, "{}", s.report());
+    std::fs::remove_file(s.fake.join("term")).expect("heed TERM again");
+    s.put("command", "exit:0");
+    assert!(
+        wait_until(Duration::from_secs(10), || s.starts().len() >= 2),
+        "{}",
+        s.report()
+    );
+    let starts = s.starts();
+    assert_eq!(starts[1].build(), Some(BUILD_2), "{}", s.report());
+    assert_eq!(
+        starts[1].args,
+        on_model("claude-opus-5-5"),
+        "the update's relaunch was not made on the model{}",
+        s.report()
+    );
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "model-move to=claude-opus-5-5 from=- cause=model kept=switched back-at=-",
+    );
+    let order = [
+        " end-for-update SIGTERM ",
+        " aterm restart cause=model model=claude-opus-5-5 deferred update-ending",
+        " aterm restart cause=model model=claude-opus-5-5 joined update argv=--model",
+        " relaunch child=Exited(0) ",
+        " model-move to=claude-opus-5-5 ",
+    ]
+    .map(|line| journal_at(&s, line));
+    assert!(order.is_sorted(), "{order:?}{}", s.report());
+    // The request is over: the new child is not ended for it.
+    await_record(&s, 1);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(s.starts().len(), 2, "{}", s.report());
+    assert_eq!(terms(&s), 1, "one SIGTERM, the update's{}", s.report());
+    // The model is the session's from here: a plain restart resumes on it.
+    fake.send_restart("asked");
+    assert!(
+        wait_until(Duration::from_secs(10), || s.starts().len() >= 3),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        s.starts()[2].args,
+        on_model("claude-opus-5-5"),
+        "{}",
+        s.report()
+    );
+    await_record(&s, 2);
+    end_session(&s, pid);
+}
+
+/// aterm moves the session onto another model while the SIGTERM of a restart
+/// it asked for earlier is out: the one relaunch answers both, on the model.
+fn aterm_a_model_restart_during_another_restarts_ending_is_made_by_that_relaunch() {
+    let s = Scenario::new("aterm-model-joins-restart");
+    let fake = rostered_aterm(&s);
+    s.put("term", "ignore");
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    let first = await_record(&s, 0);
+    fake.send_restart("asked");
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        &format!(
+            "aterm restart cause=asked SIGTERM pid={first} session={SID} build={BUILD_1} \
+             argv=--resume\\u{{1f}}{SID}"
+        ),
+    );
+    fake.event("restart cause=model model=claude-opus-5-5");
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "aterm restart cause=model model=claude-opus-5-5 deferred restart-ending",
+    );
+    std::fs::remove_file(s.fake.join("term")).expect("heed TERM again");
+    s.put("command", "exit:0");
+    assert!(
+        wait_until(Duration::from_secs(10), || s.starts().len() >= 2),
+        "{}",
+        s.report()
+    );
+    let starts = s.starts();
+    assert_eq!(starts[1].build(), Some(BUILD_1), "{}", s.report());
+    assert_eq!(
+        starts[1].args,
+        on_model("claude-opus-5-5"),
+        "{}",
+        s.report()
+    );
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "model-move to=claude-opus-5-5 from=- cause=model kept=switched back-at=-",
+    );
+    assert!(
+        s.journal()
+            .contains(" aterm restart cause=model model=claude-opus-5-5 joined restart argv="),
+        "{}",
+        s.report()
+    );
+    await_record(&s, 1);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(s.starts().len(), 2, "{}", s.report());
+    assert_eq!(
+        terms(&s),
+        1,
+        "one SIGTERM, the first restart's{}",
+        s.report()
+    );
+    end_session(&s, pid);
+}
+
+/// aterm moves the session onto another model while a crash is being
+/// answered: no child runs, and the relaunch the crash makes is made on the
+/// model. The harness is stopped while the crash and the request arrive, so
+/// both are read in one pass.
+fn aterm_a_model_restart_during_a_crash_is_made_by_the_crash_relaunch() {
+    let s = Scenario::new("aterm-model-joins-crash");
+    let fake = rostered_aterm(&s);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_record(&s, 0);
+    signal(pid, libc::SIGSTOP);
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(5)),
+        Some(Status::Stopped)
+    );
+    command_logged(&s, "crash:7", "crash 7");
+    fake.event("restart cause=model model=claude-opus-5-5");
+    std::thread::sleep(Duration::from_millis(300));
+    signal(pid, libc::SIGCONT);
+    assert_eq!(
+        wait_status(pid, Duration::from_secs(5)),
+        Some(Status::Continued)
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || s.starts().len() >= 2),
+        "the crash was not relaunched{}",
+        s.report()
+    );
+    let starts = s.starts();
+    assert_eq!(starts[1].build(), Some(BUILD_1), "{}", s.report());
+    assert_eq!(
+        starts[1].args,
+        on_model("claude-opus-5-5"),
+        "the crash relaunch was not made on the model{}",
+        s.report()
+    );
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "model-move to=claude-opus-5-5 from=- cause=model kept=switched back-at=-",
+    );
+    // The move is booked first; the claim is said again and only then is the
+    // relaunch's own line written.
+    assert!(
+        wait_until(Duration::from_secs(60), || s
+            .journal()
+            .contains(" crash-relaunch pid=")),
+        "{}",
+        s.report()
+    );
+    let journal = s.journal();
+    assert!(
+        journal.contains(" aterm restart cause=model model=claude-opus-5-5 deferred ")
+            && journal
+                .contains(" aterm restart cause=model model=claude-opus-5-5 joined crash argv=")
+            && journal.contains(" crash-relaunch pid="),
+        "{}",
+        s.report()
+    );
+    assert_eq!(terms(&s), 0, "nobody was signalled{}", s.report());
+    await_record(&s, 1);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(s.starts().len(), 2, "{}", s.report());
+    end_session(&s, pid);
+}
+
+/// aterm moves a session that was launched with no `--model` onto another
+/// model at a limit, and back at the limit's reset with the reserved word
+/// `model=launch`. The move back resumes on the launch's own model: its line
+/// names the alias `fable`, since a line with no `--model` would take up the
+/// conversation's newest model, the one it was moved onto. The return has
+/// yet to answer (the fake vendor writes no model row), so every relaunch
+/// after it names the launch's model too (`limit::State::back_on_launch`).
+fn aterm_a_restart_onto_the_launchs_model_drops_the_switched_model() {
+    let s = Scenario::new("aterm-model-launch-word");
+    let fake = rostered_aterm(&s);
+    let pty = Pty::open();
+    let (_child, pid) = start_in_aterm(&s, &pty, &fake, 40);
+    await_record(&s, 0);
+    let restarted = |nth: usize, event: &str| {
+        fake.event(event);
+        assert!(
+            wait_until(Duration::from_secs(10), || s.starts().len() > nth),
+            "{event}: no start {nth}{}",
+            s.report()
+        );
+        await_record(&s, nth);
+        s.starts()[nth].args.clone()
+    };
+    assert_eq!(
+        restarted(1, "restart cause=model model=claude-opus-5-5"),
+        on_model("claude-opus-5-5"),
+        "{}",
+        s.report()
+    );
+    // CONTROL: a restart with no `model=` keeps the switched model.
+    assert_eq!(
+        restarted(2, "restart cause=asked"),
+        on_model("claude-opus-5-5"),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        restarted(3, "restart cause=model model=launch"),
+        on_model("fable"),
+        "the move back was not made onto the launch's own model{}",
+        s.report()
+    );
+    await_journal(
+        &s,
+        Duration::from_secs(5),
+        "model-move to=launch launch-model=- from=claude-opus-5-5 cause=model kept=launch back-at=-",
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || pty.output().contains(&format!(
+            "claude-alab: claude 9.9.1 restarted at aterm's request (model: the launch's own); \
+             resuming conversation {SID}"
+        ))),
+        "--- pty ---\n{}{}",
+        pty.output(),
+        s.report()
+    );
+    // The switched model is dropped; the launch's stays named until the
+    // return answers.
+    assert_eq!(
+        restarted(4, "restart cause=asked"),
+        on_model("fable"),
+        "the relaunch before the return answered dropped the launch's model{}",
+        s.report()
+    );
+    end_session(&s, pid);
+}
+
 /// `SIGTSTP` reaches the harness while the launch's claim sequence runs: the
 /// vendor is started, and the job is then stopped as asked, not left
 /// running. The harness runs as a shell's job does ([`start_grouped`]): in a
@@ -7644,6 +8319,20 @@ mod fake {
                 std::env::var("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY").unwrap_or_default(),
             ),
         );
+        // The account this start runs on: its login directory, and whether a
+        // credential variable reached it (never its value).
+        log(
+            dir,
+            &format!(
+                "login\tCLAUDE_SECURESTORAGE_CONFIG_DIR={}\tANTHROPIC_API_KEY={}",
+                std::env::var("CLAUDE_SECURESTORAGE_CONFIG_DIR").unwrap_or_else(|_| "-".into()),
+                if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+                    "set"
+                } else {
+                    "-"
+                },
+            ),
+        );
         log(
             dir,
             &format!(
@@ -7685,6 +8374,10 @@ mod fake {
         // SAFETY: `isatty` only inspects fd 0.
         let tty = unsafe { libc::isatty(0) } == 1;
         let mut original_modes = None;
+        // A vendor that has not got as far as its interface leaves the
+        // terminal as it found it: while `raw-hold` exists it takes no raw
+        // mode, and takes it once the file is gone.
+        let mut raw_held = false;
         if tty {
             // Raw mode, as a TUI runs: keys arrive one by one, no signals from keys.
             // The modes found at start are logged first: a relaunched child must
@@ -7696,8 +8389,12 @@ mod fake {
                     original_modes = Some(t);
                     let icanon = t.c_lflag & libc::ICANON != 0;
                     log(dir, &format!("modes icanon={}", u8::from(icanon)));
-                    libc::cfmakeraw(&raw mut t);
-                    libc::tcsetattr(0, libc::TCSANOW, &raw const t);
+                    if dir.join("raw-hold").exists() {
+                        raw_held = true;
+                    } else {
+                        libc::cfmakeraw(&raw mut t);
+                        libc::tcsetattr(0, libc::TCSANOW, &raw const t);
+                    }
                 }
             }
         }
@@ -7719,6 +8416,16 @@ mod fake {
         loop {
             if let Some(actor) = foreground_actor.as_mut() {
                 assert!(actor.try_wait().expect("foreground actor wait").is_none());
+            }
+            if raw_held && !dir.join("raw-hold").exists() {
+                raw_held = false;
+                let mut t = original_modes.expect("terminal modes");
+                // SAFETY: fd 0 is this fake's terminal; the modes came from
+                // tcgetattr at its start.
+                unsafe {
+                    libc::cfmakeraw(&raw mut t);
+                    libc::tcsetattr(0, libc::TCSANOW, &raw const t);
+                }
             }
             let count = CONT.load(Ordering::Relaxed);
             if count != continued {

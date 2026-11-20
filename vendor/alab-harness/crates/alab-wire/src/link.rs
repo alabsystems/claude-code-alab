@@ -76,7 +76,8 @@
 //!
 //! **Bounds.** Opening at launch may take [`CONNECT_TIMEOUT`]; every later
 //! exchange, the reopening of a lost link included, is bounded by
-//! [`REQUEST_TIMEOUT`], because it runs in the harness's loop. An exchange that
+//! [`REQUEST_TIMEOUT`], because it runs in the harness's loop, except a
+//! [`Link::request_counted`], which its caller bounds. An exchange that
 //! fails or outlives its bound drops the connection and the link is lost. aterm
 //! drops a contract-3 claim with the connection that made it, and keeps a
 //! contract-4 claim for its re-exec grace, [`record::REEXEC_GRACE_MS`] (the
@@ -89,8 +90,9 @@
 //! granted, and unless the config says not to ([`Config::with_stream`]), the
 //! link sends `stream @<sid> v=1` on the claim's connection. An `OK` turns that
 //! connection into the stream ([`crate::stream`]); the link opens a second
-//! request connection for every read, the release and [`Link::request`] included,
-//! and keeps the event subscription. While the stream is open:
+//! request connection for every read, the release, [`Link::request`] and
+//! [`Link::request_counted`] included, and keeps the event subscription. While
+//! the stream is open:
 //!
 //! * the caller's records go out with [`Link::send`], numbered, paced under
 //!   aterm's rate budget and kept until aterm acknowledges them, and a stream
@@ -2304,7 +2306,9 @@ impl Link {
     /// (`meta set harness_*`, the plan's D24), or a read of the harness's own.
     /// A claim, a release, `stream` and `subscribe` are the link's to send and
     /// are refused: `meta set supervisor` on the second connection would bind
-    /// the claim to it and close the stream.
+    /// the claim to it and close the stream. The verb goes as written past its
+    /// leading spaces, since aterm reads some verbs' text verbatim (a `turn`'s
+    /// after `--`).
     ///
     /// # Errors
     /// The verb is one of those, holds a control character, or names no
@@ -2312,6 +2316,67 @@ impl Link {
     /// is held ([`Failure::Refused`]); or the exchange failed, which loses the
     /// link ([`Failure::Gone`]).
     pub fn request(&mut self, verb: &str, now_ms: u64) -> Result<String, Failure> {
+        self.addressed(verb, now_ms, |conn, request| {
+            ask(conn, "request", Some(request.to_string()))
+        })
+    }
+
+    /// Send one request, `@<sid> <verb>`, whose `OK` reply counts the lines
+    /// after it (`turn … harness-duty=turn-end`, `text --json`), on the
+    /// connection [`Link::request`] uses and as it sends, and return the
+    /// header and exactly those lines, at most `max_lines` of them; an `ERR`
+    /// header has none ([`Connection::request_counted_until`]).
+    ///
+    /// One `timeout` bounds the write, the header and the whole body, and the
+    /// body is read whole before the connection carries another request. It is
+    /// the caller's, not [`REQUEST_TIMEOUT`]: a read such as `text --json`
+    /// fits that, but aterm answers a `turn` only once the screen has settled
+    /// after its submit, so a turn's bound is its own `timeout=` and the settle
+    /// (claude-code-alab gives its turn's `timeout=` and 5 s). The caller, and
+    /// with it the link, waits as long.
+    ///
+    /// # Errors
+    /// As [`Link::request`], and a `max_lines` of 0 or over
+    /// [`crate::wire::MAX_COUNTED_LINES`], or a `timeout` of zero or past what
+    /// a deadline can be, is refused with nothing sent ([`Failure::Refused`]).
+    /// A reply with no count, a count over `max_lines`, a body that does not
+    /// read whole, or no reply within `timeout` fails the exchange, which loses
+    /// the link.
+    pub fn request_counted(
+        &mut self,
+        verb: &str,
+        max_lines: usize,
+        timeout: Duration,
+        now_ms: u64,
+    ) -> Result<(String, Vec<String>), Failure> {
+        if crate::wire::counted_bound(max_lines).is_err() {
+            return Err(Failure::Refused(format!(
+                "request max_lines={max_lines} unsendable"
+            )));
+        }
+        if crate::wire::exchange_bound(timeout).is_err() {
+            return Err(Failure::Refused(format!(
+                "request timeout_ms={} unsendable",
+                timeout.as_millis()
+            )));
+        }
+        self.addressed(verb, now_ms, |conn, request| {
+            conn.request_counted_within(request, max_lines, timeout)
+                .map_err(|error| transport_failure("request", error))
+        })
+    }
+
+    /// The one sender of [`Link::request`] and [`Link::request_counted`]:
+    /// `@<sid> <verb>` on the held request connection, the verb as written past
+    /// its leading spaces (its words judge it, its text is not rebuilt from
+    /// them), the verbs that are the link's own refused unsent, and a failed
+    /// exchange losing the link.
+    fn addressed<T>(
+        &mut self,
+        verb: &str,
+        now_ms: u64,
+        exchange: impl FnOnce(&mut Connection, &str) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
         let words: Vec<&str> = verb.split_ascii_whitespace().collect();
         let linked = matches!(
             words.as_slice(),
@@ -2330,8 +2395,13 @@ impl Link {
         let State::Held(claimed) = &mut self.state else {
             return Err(Failure::Refused("request no-link".to_string()));
         };
-        let request = Some(format!("@{} {}", claimed.locator.sid(), words.join(" ")));
-        match ask(&mut claimed.conn, "request", request) {
+        // A control character is refused above, so only spaces separate the words.
+        let request = format!(
+            "@{} {}",
+            claimed.locator.sid(),
+            verb.trim_start_matches(' ')
+        );
+        match exchange(&mut claimed.conn, &request) {
             Ok(reply) => Ok(reply),
             Err(failure) => {
                 self.lose(failure.why(), now_ms);

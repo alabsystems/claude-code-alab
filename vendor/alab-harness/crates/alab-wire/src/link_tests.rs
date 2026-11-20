@@ -3326,6 +3326,164 @@ fn request_goes_on_the_second_connection_and_refuses_the_links_own_verbs() {
     link.release(clock.now());
 }
 
+/// Longer than [`REQUEST_TIMEOUT`]: a fake that answers a turn this late is one whose screen took
+/// that long to settle after the submit, as aterm's `turn` replies only then.
+const SETTLE: Duration = Duration::from_millis(800);
+
+/// A turn as claude-code-alab sends one, its text after `--` with runs of spaces and a trailing
+/// space, which aterm types as written.
+const TURN: &str = "turn if-supervisor=h if-supervisor-revision=1 harness-duty=turn-end idle=600 \
+                    timeout=2500 -- |a  |  b| ";
+
+/// `request_counted` goes where `request` goes, the second connection while a stream is open,
+/// sends the verb as written past its leading spaces, waits out a turn that settles past
+/// [`REQUEST_TIMEOUT`] within the caller's bound, reads the counted body whole, so the next
+/// request there reads its own reply, and refuses what `request` refuses, a bound of no lines or
+/// over the ceiling, and a timeout of zero or past any deadline, sending nothing.
+#[test]
+fn a_counted_request_goes_on_the_second_connection_and_reads_its_whole_body() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("counted-stream", child(), clock.now());
+    let stream = fake.stream_connection().expect("the stream");
+    fake.set_counted_reply("text --json", "OK 2", &[r#"{"a":1}"#, r#"{"b":2}"#]);
+    assert_eq!(
+        link.request_counted("  text --json", 4, REQUEST_TIMEOUT, clock.now()),
+        Ok((
+            "OK 2".to_string(),
+            vec![r#"{"a":1}"#.to_string(), r#"{"b":2}"#.to_string()]
+        ))
+    );
+    let (id, verb) = fake.requests().pop().expect("the request");
+    assert_eq!(verb, "text --json");
+    assert_ne!(id, stream);
+
+    fake.set_counted_reply(
+        TURN,
+        "OK 1 turn submitted=1 status=settled seq=9",
+        &["|a  |  b| "],
+    );
+    fake.set_reply_delay(SETTLE);
+    assert_eq!(
+        link.request_counted(TURN, 4, HANG, clock.now()),
+        Ok((
+            "OK 1 turn submitted=1 status=settled seq=9".to_string(),
+            vec!["|a  |  b| ".to_string()]
+        ))
+    );
+    fake.set_reply_delay(Duration::ZERO);
+    assert_eq!(
+        fake.requests().pop().expect("the turn"),
+        (id, TURN.to_string())
+    );
+    assert!(link.streaming() && !link.is_lost());
+
+    assert_eq!(
+        link.request("meta set harness_act word=x", clock.now()),
+        Ok("ERR unknown verb".to_string())
+    );
+    assert_eq!(fake.requests().pop().expect("the next request").0, id);
+    let before = fake.requests().len();
+    for (verb, max_lines, timeout) in [
+        ("meta set supervisor x@1 contract=4", 4, HANG),
+        ("stream @s v=1", 4, HANG),
+        ("@s text --json", 4, HANG),
+        ("  @s text --json", 4, HANG),
+        ("text --json\ntext", 4, HANG),
+        ("", 4, HANG),
+        ("   ", 4, HANG),
+        ("text --json", 0, HANG),
+        ("text --json", crate::wire::MAX_COUNTED_LINES + 1, HANG),
+        ("text --json", 4, Duration::ZERO),
+        ("text --json", 4, Duration::MAX),
+    ] {
+        assert!(
+            matches!(
+                link.request_counted(verb, max_lines, timeout, clock.now()),
+                Err(Failure::Refused(_))
+            ),
+            "{verb:?} {max_lines} {timeout:?}"
+        );
+    }
+    assert_eq!(fake.requests().len(), before);
+    assert!(link.streaming());
+    link.release(clock.now());
+}
+
+/// Without a stream `request_counted` goes on the claim's own connection, as `request` does, with
+/// the verb as written and the caller's bound; an `ERR` header is an answer with no body, and a
+/// reply counting more lines than the caller bounds fails the exchange, which loses the link.
+#[test]
+fn without_a_stream_a_counted_request_goes_on_the_claims_connection() {
+    let clock = Clock::new();
+    let fake = FakeAterm::for_harness("counted-claim", &config());
+    let mut link = launched(&fake, config(), child(), clock.now());
+    assert!(link.judges() && !link.streaming());
+    let claimed = fake.claim_connection().expect("the claim");
+    fake.set_counted_reply(
+        TURN,
+        "OK 1 turn submitted=1 status=settled seq=9",
+        &["\u{276f} hi"],
+    );
+    fake.set_reply_delay(SETTLE);
+    assert_eq!(
+        link.request_counted(TURN, 4, HANG, clock.now()),
+        Ok((
+            "OK 1 turn submitted=1 status=settled seq=9".to_string(),
+            vec!["\u{276f} hi".to_string()]
+        ))
+    );
+    fake.set_reply_delay(Duration::ZERO);
+    let (id, verb) = fake.requests().pop().expect("the request");
+    assert_eq!((id, verb.as_str()), (claimed, TURN));
+    fake.set_counted_reply(TURN, "ERR key delivery failed", &[]);
+    assert_eq!(
+        link.request_counted(TURN, 4, HANG, clock.now()),
+        Ok(("ERR key delivery failed".to_string(), Vec::new()))
+    );
+    assert_eq!(
+        fake.requests().pop().expect("the second request").0,
+        claimed
+    );
+    assert!(link.judges());
+
+    fake.set_counted_reply("text --json", "OK 5", &["a", "b", "c", "d", "e"]);
+    assert!(matches!(
+        link.request_counted("text --json", 4, REQUEST_TIMEOUT, clock.now()),
+        Err(Failure::Refused(_))
+    ));
+    assert!(link.is_lost());
+    assert_eq!(
+        link.request_counted("text --json", 4, HANG, clock.now()),
+        Err(Failure::Refused("request no-link".to_string()))
+    );
+}
+
+/// The control for the two above: the same late turn under [`REQUEST_TIMEOUT`] outlives its
+/// bound, which fails the exchange and loses the link, so the turns they wait out finish only by
+/// the caller's bound.
+#[test]
+fn a_counted_request_that_outlives_its_callers_bound_loses_the_link() {
+    let clock = Clock::new();
+    let fake = FakeAterm::for_harness("counted-late", &config());
+    let mut link = launched(&fake, config(), child(), clock.now());
+    assert!(link.judges());
+    fake.set_counted_reply(
+        TURN,
+        "OK 1 turn submitted=1 status=settled seq=9",
+        &["\u{276f} hi"],
+    );
+    fake.set_reply_delay(SETTLE);
+    assert!(matches!(
+        link.request_counted(TURN, 4, REQUEST_TIMEOUT, clock.now()),
+        Err(Failure::Gone(_))
+    ));
+    assert!(link.is_lost());
+    assert!(
+        fake.verbs().iter().any(|verb| verb == TURN),
+        "the turn was sent"
+    );
+}
+
 /// Each stream's rate budget is full at its open, as aterm's is a stream's (D10).
 #[test]
 fn each_stream_opens_with_a_full_rate_budget() {

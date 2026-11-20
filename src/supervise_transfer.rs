@@ -9,9 +9,12 @@
 //! entry validation, signal attachment, authority reproof, rollback and mask
 //! restoration. A decoded payload alone authorizes none of those actions.
 
-use super::{Abandoned, Child, Ending, MAX_ABANDONED, Setup, Supervisor};
+use super::{Abandoned, Child, Ending, LimitSaid, MAX_ABANDONED, Setup, Supervisor};
+use crate::aterm::Duties;
 use crate::cli::{self, Options};
+use crate::duty::Carried;
 use crate::journal::Journal;
+use crate::limit;
 use crate::model_facts;
 use crate::procs::{
     self, Birth, ChildIdentity, ChildObservation, ChildState, Executable, ProcessIdentity,
@@ -33,7 +36,29 @@ use std::path::{Component, Path, PathBuf};
 /// only for one that can ([`super::live_update_refusal`]). 4: the model
 /// reader travels ([`crate::model_facts::Reader::put`]), preserving its
 /// conversation-entry facts for bounded replay of changed transcript versions.
-pub(super) const SCHEMA: u32 = 4;
+/// 5: the model
+/// a restart moved the session onto travels ([`Supervisor::model`]), so the
+/// new image's resume lines keep naming it. 6: where the session is with
+/// respect to Fable's limit travels ([`limit::State`]), so a session moved
+/// onto the fallback still goes back after the new image starts, with what
+/// the journal already says about it ([`LimitSaid`]), so the new image says
+/// nothing twice, and the reset grace option (`--alab-reset-grace-ms`). 7: the
+/// duties the claim takes (`--alab-duties`, one byte,
+/// [`crate::aterm::Duties::bits`]) and the turn-end duty's memory
+/// ([`crate::duty::Carried`]) travel, so the new image claims what the old one
+/// did and never types again on a screen the old one already acted on. 8: the
+/// turn-end duty's memory carries when its acts were typed
+/// ([`crate::duty::Carried::acts`]), so `continue_per_hour` counts across the
+/// move. 9: it no longer carries the irreversible ask answered last, since
+/// such an ask is answered each time it stands; a layout-8 payload, which
+/// held that digest, is refused rather than misread. 10: layout 9's fields
+/// beside the model reader as layout 4 last wrote it (the two were made on
+/// separate lines of work and both shipped), so neither earlier payload is
+/// misread as this one.
+pub(super) const SCHEMA: u32 = 10;
+/// The longest kept model: aterm's own bound for a restart's `model=`
+/// ([`crate::aterm::model_word`]).
+const MAX_MODEL: usize = 256;
 const MAX_PATH: usize = 16 * 1024;
 const MAX_ARG: usize = 128 * 1024;
 const MAX_ARGS: usize = 4096;
@@ -73,6 +98,10 @@ pub(super) struct Saved {
     background_hold_until: u64,
     background_found: String,
     facts: model_facts::Reader,
+    model: Option<String>,
+    limit_said: LimitSaid,
+    limit: limit::State,
+    duty: Carried,
 }
 
 /// The same child may have stopped or ended during exec. Unreaped is only
@@ -121,6 +150,8 @@ fn options(value: &Options) -> io::Result<()> {
         format!("--alab-quiet-ms={}", value.quiet_ms),
         format!("--alab-poll-ms={}", value.poll_ms),
         format!("--alab-term-grace-ms={}", value.term_grace_ms),
+        format!("--alab-reset-grace-ms={}", value.reset_grace_ms),
+        format!("--alab-duties={}", value.duties.words()),
     ]
     .into_iter()
     .map(OsString::from)
@@ -353,7 +384,17 @@ fn validate_saved(saved: &Saved) -> io::Result<()> {
             "runtime tracker history does not match the original child and settings",
         ));
     }
+    if saved
+        .model
+        .as_deref()
+        .is_some_and(|model| !crate::aterm::model_word(model))
+    {
+        return Err(invalid("the kept model is not a model word"));
+    }
     text(&saved.noted, MAX_TEXT)?;
+    text(&saved.limit_said.seen, MAX_TEXT)?;
+    text(&saved.limit_said.wait, MAX_TEXT)?;
+    text(&saved.limit_said.over, MAX_TEXT)?;
     text(&saved.background_found, MAX_TEXT)
 }
 
@@ -404,6 +445,12 @@ fn capture_budget(supervisor: &Supervisor) -> io::Result<()> {
     add(supervisor.noted.len())?;
     add(supervisor.background_found.len())?;
     add(model_facts::Reader::TRANSFER_BOUND)?;
+    add(supervisor.model.as_ref().map_or(0, String::len))?;
+    let said = &supervisor.limit_said;
+    add(said.seen.len())?;
+    add(said.wait.len())?;
+    add(said.over.len())?;
+    add(crate::duty::MAX_TEXT_BYTES)?;
     Ok(())
 }
 
@@ -413,6 +460,7 @@ pub(super) fn encode(supervisor: &Supervisor, signals: &SignalSnapshot) -> io::R
     if supervisor.ending != Ending::None
         || supervisor.restart_deferred.is_some()
         || supervisor.moved.is_some()
+        || supervisor.admitting.is_some()
         || supervisor.child.stopped
     {
         return Err(invalid("supervisor is ending or stopped"));
@@ -481,6 +529,10 @@ pub(super) fn encode(supervisor: &Supervisor, signals: &SignalSnapshot) -> io::R
         } else {
             model_facts::Reader::default()
         },
+        model: supervisor.model.clone(),
+        limit_said: supervisor.limit_said.clone(),
+        limit: supervisor.limit,
+        duty: supervisor.turn_end.carried.clone(),
     };
     encode_saved(&saved)
 }
@@ -692,6 +744,8 @@ fn put_setup(encoder: &mut Encoder, value: &Setup) -> io::Result<()> {
     encoder.u64(value.opts.quiet_ms)?;
     encoder.u64(value.opts.poll_ms)?;
     encoder.u64(value.opts.term_grace_ms)?;
+    encoder.u64(value.opts.reset_grace_ms)?;
+    encoder.u8(value.opts.duties.bits())?;
     put_argv(encoder, &value.args)?;
     encoder.u32(value.depth)
 }
@@ -708,8 +762,15 @@ fn get_setup(decoder: &mut Decoder<'_>) -> io::Result<Setup> {
             quiet_ms: decoder.u64()?,
             poll_ms: decoder.u64()?,
             term_grace_ms: decoder.u64()?,
+            reset_grace_ms: decoder.u64()?,
+            duties: Duties::from_bits(decoder.u8()?)
+                .ok_or_else(|| invalid("runtime duties are not a set this build performs"))?,
         },
         args: get_argv(decoder)?,
+        // Not carried: the tap runs only inside aterm, where no own-image move
+        // is admitted, and only a `session` record, which a restored image's
+        // absent link never sends, reads it.
+        tapped: false,
         depth: decoder.u32()?,
     })
 }
@@ -837,7 +898,57 @@ fn encode_fields(saved: &Saved) -> io::Result<Vec<u8>> {
     encoder.u64(saved.background_hold_until)?;
     put_text(&mut encoder, &saved.background_found)?;
     saved.facts.put(&mut encoder)?;
+    encoder.boolean(saved.model.is_some())?;
+    if let Some(model) = &saved.model {
+        put_text(&mut encoder, model)?;
+    }
+    put_text(&mut encoder, &saved.limit_said.seen)?;
+    encoder.boolean(saved.limit_said.due)?;
+    put_text(&mut encoder, &saved.limit_said.wait)?;
+    put_text(&mut encoder, &saved.limit_said.over)?;
+    put_limit(&mut encoder, &saved.limit)?;
+    saved.duty.put(&mut encoder)?;
     Ok(encoder.finish())
+}
+
+/// The phase tags of a [`limit::State`] in the payload.
+const LIMIT_ON_LAUNCH: u8 = 0;
+const LIMIT_OFF_FABLE: u8 = 1;
+
+fn put_limit(encoder: &mut Encoder, value: &limit::State) -> io::Result<()> {
+    match value.phase {
+        limit::Phase::OnLaunch { returned } => {
+            encoder.u8(LIMIT_ON_LAUNCH)?;
+            encoder.boolean(returned)?;
+        }
+        limit::Phase::OffFable { back_at_ms } => {
+            encoder.u8(LIMIT_OFF_FABLE)?;
+            encoder.u64(back_at_ms)?;
+        }
+    }
+    encoder.u64(value.floor_ms)?;
+    encoder.u32(value.walled_returns)?;
+    encoder.u32(value.attempts)?;
+    encoder.u64(value.retry_at_ms)
+}
+
+fn get_limit(decoder: &mut Decoder<'_>) -> io::Result<limit::State> {
+    let phase = match decoder.u8()? {
+        LIMIT_ON_LAUNCH => limit::Phase::OnLaunch {
+            returned: decoder.boolean()?,
+        },
+        LIMIT_OFF_FABLE => limit::Phase::OffFable {
+            back_at_ms: decoder.u64()?,
+        },
+        _ => return Err(invalid("unknown Fable-limit phase")),
+    };
+    Ok(limit::State {
+        phase,
+        floor_ms: decoder.u64()?,
+        walled_returns: decoder.u32()?,
+        attempts: decoder.u32()?,
+        retry_at_ms: decoder.u64()?,
+    })
 }
 
 /// Decode all state with bounded fields and strict trailing-data rejection, without
@@ -872,6 +983,19 @@ pub(super) fn decode(payload: &[u8]) -> io::Result<Saved> {
         background_hold_until: decoder.u64()?,
         background_found: get_text(&mut decoder, MAX_TEXT)?,
         facts: model_facts::Reader::get(&mut decoder)?,
+        model: if decoder.boolean()? {
+            Some(get_text(&mut decoder, MAX_MODEL)?)
+        } else {
+            None
+        },
+        limit_said: LimitSaid {
+            seen: get_text(&mut decoder, MAX_TEXT)?,
+            due: decoder.boolean()?,
+            wait: get_text(&mut decoder, MAX_TEXT)?,
+            over: get_text(&mut decoder, MAX_TEXT)?,
+        },
+        limit: get_limit(&mut decoder)?,
+        duty: Carried::get(&mut decoder)?,
     };
     decoder.finish()?;
     validate_saved(&saved)?;
@@ -1011,10 +1135,38 @@ impl Saved {
                 restart_deferred: None,
                 // The model reader goes on where the old image's stopped.
                 facts: self.facts,
+                // The model a restart moved the session onto stays its model.
+                model: self.model,
+                untyped_noted: String::new(),
+                // Where the session is with respect to Fable's limit stays
+                // too, with what the journal already says of it; the witness
+                // reads the transcript's tail again.
+                limit: self.limit,
+                limit_source: Box::new(limit::Transcript::default()),
+                limit_said: self.limit_said,
+                // What the turn-end duty typed and waits on stays; its clocks
+                // start again at the new image's first look.
+                turn_end: super::turn_end::Driver::carrying(self.duty),
+                // No account is carried: aterm alone moves a session onto
+                // one, and inside aterm no own-image move is admitted
+                // ([`super::image::default_host`]); the new image runs on
+                // what its launch said, as the old one did before any move.
+                account: None,
+                admitting: None,
+                // Asked again: where the state crossed, its phase or its kept
+                // model makes the question a no-op.
+                limit_adopted: false,
+                // The new image has no link to tell anything to.
+                described: None,
+                upgrading: None,
             },
         })
     }
 }
+
+#[cfg(test)]
+#[path = "supervise_transfer_limit_tests.rs"]
+mod limit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1022,7 +1174,7 @@ mod tests {
     use crate::transfer_capsule::{FdRoles, Image};
     use std::os::unix::ffi::OsStringExt;
 
-    fn fixture() -> Saved {
+    pub(super) fn fixture() -> Saved {
         let store = Store::new(Path::new("/owned/pkg"), profile::PACKAGE, profile::COMMAND);
         let build = |number| Build {
             number,
@@ -1081,6 +1233,7 @@ mod tests {
                 build: initial,
                 opts,
                 args: vec!["--model".into(), OsString::from_vec(b"model-\xff".to_vec())],
+                tapped: false,
                 depth: 2,
             },
             process,
@@ -1135,6 +1288,10 @@ mod tests {
             background_hold_until: 5000,
             background_found: "background-work shell".into(),
             facts: model_facts::Reader::default(),
+            model: None,
+            limit_said: LimitSaid::default(),
+            limit: limit::State::new(1000),
+            duty: Carried::default(),
         }
     }
 
@@ -1261,6 +1418,30 @@ mod tests {
             encode_saved(&saved).is_err(),
             "a reader of another child is refused"
         );
+    }
+
+    /// The model a restart moved the session onto crosses, so the new image
+    /// keeps resuming on it. CONTROL: the fixture, moved onto none, crosses as
+    /// none, and a word that could not be a `--model` value restores nothing.
+    #[test]
+    fn the_kept_model_crosses_and_only_a_model_word_restores() {
+        let mut saved = fixture();
+        assert_eq!(decode(&encode_saved(&saved).unwrap()).unwrap().model, None);
+        saved.model = Some("claude-opus-5-5".into());
+        let payload = encode_saved(&saved).unwrap();
+        let restored = decode(&payload).unwrap();
+        assert_eq!(restored.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(encode_saved(&restored).unwrap(), payload);
+        for bad in ["", "-opus", "opus --dangerously-skip-permissions"] {
+            saved.model = Some(bad.into());
+            assert!(encode_saved(&saved).is_err(), "{bad:?} is refused");
+            // The same bytes written past the encoder's own check do not
+            // decode into a supervisor either.
+            assert!(
+                encode_fields(&saved).is_ok_and(|payload| decode(&payload).is_err()),
+                "{bad:?} does not restore"
+            );
+        }
     }
 
     #[test]

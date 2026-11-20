@@ -35,15 +35,52 @@ impl SurveyKind {
     }
 }
 
+/// THE GLYPHS A RATING CARD'S QUESTION ROW STARTS WITH, in column 0: `●` through Claude Code
+/// 2.1.327, and from 2.1.328 [`MESSAGE_DOT`] (its card draws the head with the component every
+/// message's dot is drawn with, where 2.1.327's drew a literal `●`: read on the 2.1.327, 2.1.328
+/// and 2.1.329 binaries, and on 2.1.329's screen in the real-Claude lab, 2026-11-19).
+pub const CARD_HEADS: [char; 2] = ['●', MESSAGE_DOT];
+
+/// The dot a message's first row starts with, `⏺`, and from Claude Code 2.1.328 a rating card's
+/// head. The glyph no longer tells the card from a message, so a [`MESSAGE_DOT`] head is a card
+/// only where its question is one of the known cards' ([`SurveyKind`] other than `Unknown`) and
+/// the card sits where Claude Code draws one, under the end of a turn ([`under_turn_end`]). A
+/// reply that says a card's words is told apart only by where it sits: a turn's reply has the
+/// turn's status row (`✻ … · done`) or a spinner under it, so the rows between it and the
+/// composer are not all parked; and one with nothing under it (a resumed transcript's last) has
+/// no turn's end above it.
+pub const MESSAGE_DOT: char = '⏺';
+
+/// WHETHER A TURN'S END STANDS RIGHT ABOVE ROW `head`, where Claude Code 2.1.329 draws its card:
+/// the nearest row above that is neither blank nor hung under the status row (a `⎿ Tip:` row, a
+/// todo row) is the status row, done or live (`✻ Churned for 0s · done`, `✻ Waiting for …`), or
+/// the notice of a turn a person stopped (`⎿  Interrupted · What should Claude do instead?`,
+/// [`crate::turn::interrupt_notice`]). Measured on 2.1.329 in the real-Claude lab's survey
+/// scenarios, 2026-11-19: under a done row (`s1-plain`, `s8-bg-static`), under the interrupt
+/// notice (`s4b-esc-slow`). A copy of a card that a reply or a resumed transcript ends on has a
+/// person's prompt, a message or a tool's output above it instead, so no `0` is pressed into a
+/// composer that holds no card; a real card drawn anywhere else is left in place and read as no
+/// card, which presses nothing.
+fn under_turn_end(rows: &[String], head: usize) -> bool {
+    rows[..head]
+        .iter()
+        .rev()
+        .find(|r| {
+            let t = crate::text::trim_start(r);
+            !t.is_empty() && !crate::phase::is_tip_or_todo(t)
+        })
+        .is_some_and(|r| is_glyph_row(r) || crate::turn::interrupt_notice(r))
+}
+
 /// An open rating card, as read from one screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurveyBlock {
     pub kind: SurveyKind,
-    /// The `●` question row.
+    /// The question row, led by one of [`CARD_HEADS`].
     pub head: usize,
     /// The options row (`1: Bad … 0: Dismiss`), the block's last row; where Ink wrapped the options' boxes, the last row of those boxes ([`options_line`]).
     pub options: usize,
-    /// The `key if=` guard for a row of the card as observed: Claude Code's head row, `^●.` and its first words; agy's options row whole ([`crate::agy::survey`]) — spaces as `.`, every metacharacter escaped.
+    /// The `key if=` guard for a row of the card as observed: Claude Code's head row, `^` and its glyph, one cell, and its first words (`^⏺.How.is.Claude.doing`); agy's options row whole ([`crate::agy::survey`]) — spaces as `.`, every metacharacter escaped.
     pub guard: String,
     /// Whether the loop may press its `0`: a known kind, or an unknown one that carries the vendor's `(optional)` mark.
     pub dismissable: bool,
@@ -64,7 +101,7 @@ impl SurveyBlock {
 }
 
 /// How far above the options row the question row may sit: the memory card is the
-/// tallest (`●` row, a blank, up to four rows of the cited sentence, a blank, the
+/// tallest (the head row, a blank, up to four rows of the cited sentence, a blank, the
 /// recollection row), and its sentence runs on when Claude is verbose.
 const MAX_ABOVE_OPTIONS: usize = 10;
 
@@ -132,7 +169,7 @@ fn is_parked(row: &str, width: usize) -> bool {
             .is_some_and(|g| crate::text::trim_start(g).starts_with("Tip:"))
 }
 
-/// The open rating card above the composer: its options ([`options_line`]) with only parked rows between them and the composer's top rule, a `●` question row in column 0 within [`MAX_ABOVE_OPTIONS`] rows above them, and only blank or column-2 rows between the two, each row read on the screen's transcript ([`card_rows`]).
+/// The open rating card above the composer: its options ([`options_line`]) with only parked rows between them and the composer's top rule, a question row led by one of [`CARD_HEADS`] in column 0 within [`MAX_ABOVE_OPTIONS`] rows above them (a [`MESSAGE_DOT`] one only for a known card's question under a turn's end, [`under_turn_end`]), and only blank or column-2 rows between the two, each row read on the screen's transcript ([`card_rows`]).
 #[must_use]
 pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
     survey_block_on(&Transcript::of(rows))
@@ -176,7 +213,7 @@ fn survey_block_on(transcript: &Transcript<'_>) -> Option<SurveyBlock> {
         .rev()
         .find_map(|i| {
             let row = &rows[i];
-            if row.starts_with('●') {
+            if row.starts_with(CARD_HEADS) {
                 Some(Some(i))
             } else if crate::text::trim(row).is_empty()
                 || (row.starts_with("  ") && !row.starts_with("   "))
@@ -186,11 +223,15 @@ fn survey_block_on(transcript: &Transcript<'_>) -> Option<SurveyBlock> {
                 Some(None)
             }
         })??;
-    let row = rows[head].trim_start_matches('●');
+    let glyph = rows[head].chars().next()?;
+    let row = &rows[head][glyph.len_utf8()..];
     let col = 1 + crate::phase::leading_spaces(row);
     let end = crate::wrap::line_end(rows, head, crate::text::trim(row), col, width, first);
     let line = crate::wrap::rejoined(&rows[head..=end]);
-    let kind = kind_of(line.trim_start_matches('●').trim());
+    let kind = kind_of(line.trim_start_matches(glyph).trim());
+    if glyph == MESSAGE_DOT && (kind == SurveyKind::Unknown || !under_turn_end(rows, head)) {
+        return None;
+    }
     let question = row.trim();
     let dismissable = kind != SurveyKind::Unknown
         || rows[head..=options]
@@ -200,7 +241,7 @@ fn survey_block_on(transcript: &Transcript<'_>) -> Option<SurveyBlock> {
         kind,
         head,
         options,
-        guard: guard_of(question),
+        guard: guard_of(glyph, question),
         dismissable,
     })
 }
@@ -221,9 +262,10 @@ fn kind_of(question: &str) -> SurveyKind {
     }
 }
 
-/// `^●.` and the first four words of `question`, as a `key if=` token; the guard ends before
-/// the first word that is over 24 characters or not plain text, and is empty under three words.
-fn guard_of(question: &str) -> String {
+/// `^`, the head row's `glyph` (one of [`CARD_HEADS`]), one cell and the first four words of
+/// `question`, as a `key if=` token; the guard ends before the first word that is over 24
+/// characters or not plain text, and is empty under three words.
+fn guard_of(glyph: char, question: &str) -> String {
     let words: Vec<&str> = question
         .split_whitespace()
         .take(4)
@@ -236,7 +278,7 @@ fn guard_of(question: &str) -> String {
     if words.len() < 3 {
         return String::new();
     }
-    format!("^●.{}", crate::anchors::guard_regex(&words.join(" ")))
+    format!("^{glyph}.{}", crate::anchors::guard_regex(&words.join(" ")))
 }
 
 /// The Claude-drafted-feedback card (`✻ Bug report drafted: <title>` over its preview and `1 to review · 2 to send · 0 to dismiss`), parked in the same slot, read on the screen's transcript ([`card_rows`]).

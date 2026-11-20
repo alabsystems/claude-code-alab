@@ -1047,7 +1047,10 @@ impl Runtime {
             && supervisor.ending == Ending::None
             && supervisor.restart_deferred.is_none()
             && supervisor.moved.is_none()
-            && !supervisor.child.stopped;
+            && !supervisor.child.stopped
+            // An exec keeps a running repository probe's process, with
+            // nobody in the new image to reap it.
+            && !supervisor.turn_end.probing();
         if self.recovery.is_some() {
             self.recover(supervisor, pipe);
             return;

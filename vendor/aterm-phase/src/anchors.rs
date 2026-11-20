@@ -494,8 +494,8 @@ pub const ANCHORS: &[Anchor] = &[
     composed("mode.plan", "plan mode on", "2.1.283"),
     composed("mode.manual", "manual mode on", "2.1.283"),
     hint("mode.cycle", "to cycle", "2.1.283"),
-    // The mode row's items after the pill, which the glass keeps or drops
-    // (`aterm_agent::harness::footer::mode_row_rewrite_under`).
+    // The mode row's items after the pill, which the reading keeps or drops
+    // (`aterm_agent::harness::footer::read_mode_row_under`).
     hint("mode.manage", "\u{2193} to manage", "2.1.283"),
     hint("mode.for_agents", "\u{2190} for agents", "2.1.283"),
     composed("mode.tasks", "/tasks to see subagents", "2.1.304"),

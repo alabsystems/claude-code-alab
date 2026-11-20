@@ -12,6 +12,42 @@ use std::path::Path;
 
 pub(super) const MAX_REPLY: usize = 320 * 1024;
 
+/// The exit status, with nothing on standard output, of an aterm that does not serve the gate:
+/// `aterm harness` refuses words it does not know so (its standard error says `aterm harness:
+/// unknown flag --cwd-hex`), and an aterm that serves the gate refuses so a question it cannot
+/// read. Neither is an answer.
+pub(super) const UNSERVED_EXIT: i32 = 2;
+
+/// What the host said to one [`Request`] ([`query`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Answer {
+    /// The host's folder policy trusts the folder, under this rule.
+    Allow(String),
+    /// The host serves no gate ([`UNSERVED_EXIT`]): this launch goes on as one whose host was
+    /// asked nothing, and any trust is the host's own usage query's to settle.
+    Unserved,
+    /// Anything else: the policy refused or could not read, or no valid reply came. Never trust.
+    Withheld,
+}
+
+/// [`Answer`] of how the host's run ended ([`crate::launch::bounded_run`]; `None`: no end was
+/// read). Only an exit 0 whose output [`Request::decode`] admits is [`Answer::Allow`].
+pub(super) fn answer(request: &Request, ended: Option<&crate::launch::Ended>) -> Answer {
+    let Some(ended) = ended else {
+        return Answer::Withheld;
+    };
+    if ended.status.code() == Some(UNSERVED_EXIT) && ended.output.is_empty() {
+        return Answer::Unserved;
+    }
+    if !ended.status.success() {
+        return Answer::Withheld;
+    }
+    std::str::from_utf8(&ended.output)
+        .ok()
+        .and_then(|reply| request.decode(reply))
+        .map_or(Answer::Withheld, Answer::Allow)
+}
+
 pub(super) struct Request {
     cwd: String,
     vendor: String,
@@ -137,12 +173,17 @@ fn safe(text: &str) -> bool {
         .any(|c| c.is_control() || ('\u{80}'..='\u{9f}').contains(&c))
 }
 
+/// Ask `host` the gate for `request`, within three seconds, retaining the argv and the reply
+/// where `records` names an evidence directory (a failed evidence write is
+/// [`Answer::Withheld`]).
+/// # Errors
+/// As [`crate::launch::bounded_run`].
 pub(super) fn query(
     host: &Path,
     request: &Request,
     changes: &[(OsString, OsString)],
     records: Option<&Path>,
-) -> Result<Option<String>, crate::sys::ProbeSpawnRefusal> {
+) -> Result<Answer, crate::sys::ProbeSpawnRefusal> {
     let arguments = request.arguments();
     let evidence = |name, bytes: &[u8]| -> io::Result<()> {
         if let Some(root) = records {
@@ -161,18 +202,20 @@ pub(super) fn query(
         .collect::<Vec<_>>()
         .join(",");
     if evidence("gate-argv.json", format!("[{words}]\n").as_bytes()).is_err() {
-        return Ok(None);
+        return Ok(Answer::Withheld);
     }
-    let reply = crate::launch::bounded_output_limit(
+    let ended = crate::launch::bounded_run(
         host,
         &arguments,
         changes,
         std::time::Duration::from_secs(3),
         MAX_REPLY,
     )?;
-    let Some(reply) = reply else { return Ok(None) };
-    if evidence("gate-response.json", reply.as_bytes()).is_err() {
-        return Ok(None);
+    if let Some(ended) = &ended
+        && !ended.output.is_empty()
+        && evidence("gate-response.json", &ended.output).is_err()
+    {
+        return Ok(Answer::Withheld);
     }
-    Ok(request.decode(&reply))
+    Ok(answer(request, ended.as_ref()))
 }

@@ -5,7 +5,7 @@
 //! judge, each against aterm's own words.
 
 use super::*;
-use crate::aterm_wire::{TURN_IDLE_MS, TypedFence, key_verb, send_verb, turn_verb};
+use crate::aterm_wire::{TURN_IDLE_MS, TypedFence, key_verb, press_verb, send_verb, turn_verb};
 
 const SID: &str = "t0000000001";
 const ME: &str = "claude-code-alab@4242";
@@ -83,6 +83,65 @@ fn a_typed_write_names_the_claim_its_revision_its_duty_and_the_persons_count() {
             )
             .as_str()
         )
+    );
+}
+
+fn press(key: &'static str, act: Option<KeyAct>) -> Press<'static> {
+    Press {
+        key,
+        generation: "1.90262",
+        guard: "^\\x20Do\\x20you\\x20want\\x20to\\x20proceed\\?\\s*$",
+        act,
+        human_seq: 1474,
+        grace: Duration::from_millis(2_500),
+    }
+}
+
+#[test]
+fn a_key_on_a_box_is_fenced_on_the_read_it_was_decided_from() {
+    assert_eq!(
+        press_verb(
+            SID,
+            &fence(Scope::Approvals),
+            &press("1", Some(KeyAct::Approve))
+        )
+        .as_deref(),
+        Some(
+            "@t0000000001 key if-supervisor=claude-code-alab@4242 if-supervisor-revision=136 \
+             harness-duty=approvals if-human=1474 if-gen=1.90262 \
+             if=^\\x20Do\\x20you\\x20want\\x20to\\x20proceed\\?\\s*$ act=approve 1"
+        )
+    );
+    // A key that only moves the focus means nothing for the box: no `act=`.
+    assert_eq!(
+        press_verb(SID, &fence(Scope::Questions), &press("down", None)).as_deref(),
+        Some(
+            "@t0000000001 key if-supervisor=claude-code-alab@4242 if-supervisor-revision=136 \
+             harness-duty=questions if-human=1474 if-gen=1.90262 \
+             if=^\\x20Do\\x20you\\x20want\\x20to\\x20proceed\\?\\s*$ down"
+        )
+    );
+    // Negative controls: no generation, no guard, a guard of two words, a key
+    // no verb spells and a duty that grants no typing are never pressed.
+    let duty = fence(Scope::Approvals);
+    for generation in ["", "1", "1.", "x.2"] {
+        let unfenced = Press {
+            generation,
+            ..press("1", Some(KeyAct::Approve))
+        };
+        assert_eq!(press_verb(SID, &duty, &unfenced), None, "{generation:?}");
+    }
+    for guard in ["", "^a b$", "^a\tb$"] {
+        let unguarded = Press {
+            guard,
+            ..press("1", Some(KeyAct::Approve))
+        };
+        assert_eq!(press_verb(SID, &duty, &unguarded), None, "{guard:?}");
+    }
+    assert_eq!(press_verb(SID, &duty, &press("if=x", None)), None);
+    assert_eq!(
+        press_verb(SID, &fence(Scope::Relaunch), &press("1", None)),
+        None
     );
 }
 
@@ -249,7 +308,36 @@ fn a_screen_read_is_taken_only_whole() {
             seq: 90262,
             human: Human::Never,
             human_seq: 1474,
+            cursor: Some((1, 2)),
+            title: Some(String::new()),
+            generation: Some("1.90262".to_string()),
         })
+    );
+    // A generation that is not two runs of digits joined by a dot is none,
+    // and the read is still a read.
+    for word in ["\"1.\"", "\".5\"", "\"1.2.3\"", "\"a.1\"", "12", "\"1 .2\""] {
+        let screen = Screen::parse(&body.replace("\"1.90262\"", word)).expect(word);
+        assert_eq!(screen.generation, None, "{word}");
+    }
+    let screen = Screen::parse(&body.replace("\"gen\":\"1.90262\",", "")).unwrap();
+    assert_eq!(screen.generation, None);
+    // The cursor and the title are read where they are, and a read without
+    // them is still a read; a cursor off the rows is none.
+    for (from, to) in [
+        ("\"title\":\"\",", ""),
+        ("\"title\":\"\"", "\"title\":7"),
+        ("\"row\":1,", ""),
+        ("\"row\":1", "\"row\":2"),
+        ("\"col\":2", "\"col\":-2"),
+    ] {
+        let screen = Screen::parse(&body.replace(from, to)).expect(to);
+        assert_eq!(screen.seq, 90262, "{to:?}");
+        assert!(screen.cursor.is_none() || screen.title.is_none(), "{to:?}");
+    }
+    let titled = body.replace("\"title\":\"\"", "\"title\":\"✳ Working\"");
+    assert_eq!(
+        Screen::parse(&titled).and_then(|screen| screen.title),
+        Some("✳ Working".to_string())
     );
     let typed = body.replace("\"human_ms\":null", "\"human_ms\":250");
     assert_eq!(
@@ -369,6 +457,22 @@ fn a_write_is_judged_by_the_claim_the_policy_and_the_persons_grace_in_that_order
     assert_eq!(typed.to_string(), "wait aterm human_ms=20000");
     assert_eq!(typed.grace_left, Some(Duration::from_secs(100)));
     assert!(judge(&on, &status("human_ms=120000"), ME, Scope::TurnEnd).is_ok());
+    // A press's own grace stands in the policy's: the same key 20 s old passes
+    // a 2.5 s grace and is held by a 30 s one.
+    let approving = status("supervisor_scope=approvals human_ms=20000");
+    let short = Duration::from_millis(2_500);
+    assert!(judge_within(&on, &approving, ME, Scope::Approvals, short).is_ok());
+    let long = judge_within(
+        &on,
+        &approving,
+        ME,
+        Scope::Approvals,
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        long.expect_err("grace").grace_left,
+        Some(Duration::from_secs(10))
+    );
     assert_eq!(
         held(&on, "human_ms=soon", Scope::TurnEnd),
         "wait aterm human_ms=unknown"

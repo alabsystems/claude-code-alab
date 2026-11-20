@@ -301,18 +301,18 @@ impl ModelFacts {
 // Claude Code's own words, each with the build it was first read on.
 
 /// A local command's row (`<command-name>/model</command-name>…`).
-const COMMAND_NAME: &str = "<command-name>";
+pub(crate) const COMMAND_NAME: &str = "<command-name>";
 const MODEL_COMMAND: &str = "<command-name>/model</command-name>";
 const EFFORT_COMMAND: &str = "<command-name>/effort</command-name>";
 /// A local command's result row.
-const COMMAND_STDOUT: &str = "<local-command-stdout>";
+pub(crate) const COMMAND_STDOUT: &str = "<local-command-stdout>";
 /// The `subtype` of the `system` row a command typed mid-turn is recorded in (2.1.322).
-const LOCAL_COMMAND: &str = "local_command";
+pub(crate) const LOCAL_COMMAND: &str = "local_command";
 /// The `type` of the row Claude Code writes as it sends a request (2.1.321).
 /// Also a candidate marker; whitespace around a JSON field decides no fact.
-const API_REQUEST: &str = "api-request";
+pub(crate) const API_REQUEST: &str = "api-request";
 /// The `querySource` of a request on the conversation's own thread (2.1.321).
-const MAIN_THREAD_QUERY: &str = "repl_main_thread";
+pub(crate) const MAIN_THREAD_QUERY: &str = "repl_main_thread";
 /// What every `attachment.type` of the key's own rows starts with (2.1.322):
 /// an `ultra_effort_enter` attachment with each prompt while the key is on,
 /// and one `ultra_effort_exit` once it stops.
@@ -320,10 +320,14 @@ const KEY_ROW: &str = "\"ultra_effort_";
 const KEY_ENTER: &str = "ultra_effort_enter";
 const KEY_EXIT: &str = "ultra_effort_exit";
 /// `/model`'s results (2.1.201, 2.1.283).
-const MODEL_SET: &str = "Set model to ";
+pub(crate) const MODEL_SET: &str = "Set model to ";
 const MODEL_KEPT: &str = "Kept model as ";
 /// `/fast on`'s result that moves the model, after a glyph (2.1.283).
 const FAST_ON_MODEL_SET: &str = "Fast mode ON \u{b7} model set to ";
+/// The end of [`FAST_ON_MODEL_SET`], which a transcript line holding that
+/// result contains however its middle dot is escaped: a cheap test of a raw
+/// line before it is parsed.
+pub(crate) const FAST_ON_TAIL: &str = "model set to ";
 /// How many UTF-16 units may lead [`FAST_ON_MODEL_SET`] (the glyph and a space).
 const FAST_ON_LEAD: usize = 4;
 /// `/effort`'s results (2.1.283).
@@ -445,7 +449,7 @@ fn model_display(id: &str) -> String {
     name
 }
 
-fn is_word(s: &str) -> bool {
+pub(crate) fn is_word(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.chars()
@@ -540,6 +544,34 @@ fn effort_clause(after: &str) -> Option<&str> {
     let (level, tail) = rest.split_once('`')?;
     let keyword = tail.strip_prefix(' ')?;
     (result_word(keyword) == "effort").then_some(level)
+}
+
+/// What a command result's `content` moved the model onto, when it moved it:
+/// a `/model` result that set it (`Set model to …`) or a `/fast on` result
+/// that moved it (`… Fast mode ON · model set to …`). The model is as the row
+/// spells it, quotes off (`Sonnet 5`, `claude-fable-5-1`), or `None` inside
+/// where those words cannot be read. `Kept model as …` moved nothing
+/// (`None`).
+pub(crate) fn moved_to(content: &str) -> Option<Option<String>> {
+    model_result_of(content)
+        .filter(|result| result.kind != ModelResultKind::Kept)
+        .map(|result| result.display.map(Cow::into_owned))
+}
+
+/// The argument of a `/model` command's row, from its text
+/// (`<command-name>/model</command-name>…<command-args>sonnet</command-args>`),
+/// trimmed: empty for a `/model` given none (its picker) or whose argument
+/// is not closed. `None` for any other row.
+pub(crate) fn model_command_args(text: &str) -> Option<&str> {
+    let text = text.trim_start();
+    if !text.starts_with("<command-") || !text.contains(MODEL_COMMAND) {
+        return None;
+    }
+    Some(
+        text.split_once("<command-args>")
+            .and_then(|(_, rest)| rest.split_once("</command-args>"))
+            .map_or("", |(args, _)| args.trim()),
+    )
 }
 
 /// What a command result's `content` says of the model, when it is a model result.
@@ -746,7 +778,7 @@ fn fold_result(content: &str, facts: &mut ModelFacts) -> Answered {
 /// row's plain-string `message.content` (a command run between turns), or a
 /// `system` row of subtype [`LOCAL_COMMAND`]'s own `content` (one typed while
 /// a turn ran, which Claude Code 2.1.322 writes once that turn's reply lands).
-fn command_text<'a>(kind: Option<&str>, row: &'a Value) -> Option<&'a str> {
+pub(crate) fn command_text<'a>(kind: Option<&str>, row: &'a Value) -> Option<&'a str> {
     match kind {
         Some("user") => row.get("message")?.get("content")?.as_str(),
         Some("system") if row.get("subtype").and_then(Value::as_str) == Some(LOCAL_COMMAND) => {
@@ -923,7 +955,7 @@ fn scan(rows: &[u8], since_ms: Option<u64>, chose: bool) -> (ModelFacts, bool) {
 /// labels are unsupported rather than normalized. `None` for any other text
 /// or for a time before 1970.
 #[must_use]
-fn stamp_ms(text: &str) -> Option<u64> {
+pub(crate) fn stamp_ms(text: &str) -> Option<u64> {
     let (&last, head) = text.as_bytes().split_last()?;
     let (stamp, fraction) = head.split_first_chunk::<19>()?;
     if last != b'Z' {
@@ -1344,6 +1376,14 @@ impl Reader {
     #[must_use]
     pub const fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// The transcript of the conversation the child was last read in, once
+    /// a lookup has found it: the file the facts are read from, which
+    /// [`crate::limit::Transcript`] reads for a usage limit too.
+    #[must_use]
+    pub fn transcript(&self) -> Option<&Path> {
+        self.session.as_ref()?.path.as_deref()
     }
 
     /// Follow `process` one look further, at `now_ms`, returning the typed facts,

@@ -982,7 +982,9 @@ pub(crate) fn trailers(rows: &[String], from: usize, width: usize) -> Option<Opt
 /// stores in a cell with the character before it (a combining mark, a joiner, a variation
 /// selector) widens no row, so a row drawn to the pane's edge measures the pane, whatever it holds.
 /// One read of a screen asks this of the same rows many times, and the width is a function of the
-/// rows' words alone, so each thread keeps the last [`MEASURED_SCREENS`] it measured.
+/// rows' words alone, so each thread keeps the last [`MEASURED_SCREENS`] it measured. A new screen
+/// is kept in the oldest one's buffers, written over in place, so a thread that reads screens of
+/// one size allocates nothing to keep them once it has kept a few.
 pub(crate) fn screen_width(rows: &[String]) -> usize {
     if rows.iter().map(String::len).sum::<usize>() > MEASURED_SCREEN_BYTES {
         return widest(rows);
@@ -996,10 +998,19 @@ pub(crate) fn screen_width(rows: &[String]) -> usize {
     known.unwrap_or_else(|| {
         let width = widest(rows);
         MEASURED.with_borrow_mut(|measured| {
-            if measured.len() == MEASURED_SCREENS {
-                measured.pop_front();
-            }
-            measured.push_back((rows.to_vec(), width));
+            let mut kept = if measured.len() == MEASURED_SCREENS {
+                measured
+                    .pop_front()
+                    .map(|(kept, _)| kept)
+                    .unwrap_or_default()
+            } else {
+                Vec::with_capacity(rows.len())
+            };
+            kept.truncate(rows.len());
+            let over = kept.len();
+            kept.clone_from_slice(&rows[..over]);
+            kept.extend_from_slice(&rows[over..]);
+            measured.push_back((kept, width));
         });
         width
     })

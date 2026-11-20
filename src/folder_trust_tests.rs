@@ -248,6 +248,67 @@ fn gate_requires_closed_complete_echoes_and_no_terminal_controls() {
     assert!(gate::Request::new(cwd, vendor, "bad\nword", true).is_err());
 }
 
+/// A host that refuses the question as words it does not know (exit 2, nothing on stdout: an
+/// aterm from before `harness launch-trust gate`) is no gate, and the launch goes on as one whose
+/// host was asked nothing. A host that answers is obeyed: its `allow` is the only trust, and its
+/// refusal, a refusal of any other shape, a failed or signalled run and no end read are never
+/// trust and never "no gate".
+#[test]
+fn a_host_that_does_not_know_the_gate_is_no_gate_and_one_that_answers_is_obeyed() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let cwd = Path::new("/work");
+    let vendor = Path::new("/vendor");
+    let request = gate::Request::new(cwd, vendor, "t0000000000", true).unwrap();
+    let ended = |code: i32, output: &str| crate::launch::Ended {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        output: output.as_bytes().to_vec(),
+    };
+    let good = allowed(cwd, vendor);
+    let refused = good
+        .replace("\"allow\"", "\"refused\"")
+        .replace("\"trusted-folder\"", "null")
+        .replace(
+            "\"reason\":null",
+            "\"reason\":\"the policy trusts no folder here\"",
+        );
+    assert_eq!(
+        gate::answer(&request, Some(&ended(gate::UNSERVED_EXIT, ""))),
+        gate::Answer::Unserved
+    );
+    assert_eq!(
+        gate::answer(&request, Some(&ended(0, &good))),
+        gate::Answer::Allow("trusted-folder".into())
+    );
+    for (what, run) in [
+        ("refused", Some(ended(0, &refused))),
+        (
+            "unread",
+            Some(ended(0, &refused.replace("\"refused\"", "\"unread\""))),
+        ),
+        ("empty success", Some(ended(0, ""))),
+        (
+            "an allow with exit 2",
+            Some(ended(gate::UNSERVED_EXIT, &good)),
+        ),
+        ("exit 1", Some(ended(1, ""))),
+        ("an allow with exit 1", Some(ended(1, &good))),
+        (
+            "signalled",
+            Some(crate::launch::Ended {
+                status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+                output: Vec::new(),
+            }),
+        ),
+        ("no end read", None),
+    ] {
+        assert_eq!(
+            gate::answer(&request, run.as_ref()),
+            gate::Answer::Withheld,
+            "{what}"
+        );
+    }
+}
+
 #[test]
 fn sdk_accepts_only_one_matching_explicit_recorded_answer_without_model_output() {
     let answer = |body: &str| {

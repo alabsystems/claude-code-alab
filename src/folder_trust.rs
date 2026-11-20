@@ -4,6 +4,11 @@
 //! One cold-launch workspace-trust exchange, owned separately from the usage query.
 //! Only the unmodified vendor writes its profile. A host policy answer is no SDK ACK,
 //! and neither observation supplies interactive permission or input authority.
+//! The exchange starts with a folder-policy question to the launcher's host
+//! (`<host> harness launch-trust gate`). A host whose answer allows the folder is obeyed and
+//! one that refuses it is obeyed; a host that refuses the question as words it does not know
+//! (an aterm from before the verb) is no gate: nothing is attested or journaled, and any
+//! folder trust it settles is settled inside its usage query, as before it was asked.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -237,6 +242,8 @@ fn interactive(args: &[OsString]) -> bool {
 
 /// Settle cold workspace trust for the already selected vendor and launch environment.
 /// Standard-output terminal state belongs to the original caller, before any private pipe.
+/// A launch whose host refuses the policy question as one it does not know is skipped
+/// (`host-serves-no-gate`) with no vendor started.
 /// # Errors
 /// Original selected-image custody changed, or native child/group or signal-mask custody
 /// remains unsettled. Retain the error and do not start the vendor.
@@ -325,8 +332,12 @@ fn settle_inner(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let Some(rule) = gate::query(&host, &request, &changes, records)? else {
-            return Ok(Outcome::Refused("policy-refused-or-unread".into()));
+        let rule = match gate::query(&host, &request, &changes, records)? {
+            gate::Answer::Allow(rule) => rule,
+            gate::Answer::Unserved => return Ok(Outcome::Skipped("host-serves-no-gate".into())),
+            gate::Answer::Withheld => {
+                return Ok(Outcome::Refused("policy-refused-or-unread".into()));
+            }
         };
         if scope.cancelled() {
             return Ok(Outcome::Skipped("cancelled-before-attestation".into()));

@@ -21,6 +21,12 @@
 //! 3. the write, once ([`send_verb`], [`key_verb`], [`turn_verb`]);
 //! 4. aterm's answer, read as a [`Reply`].
 //!
+//! [`Typist::press`] makes the other kind: one key on a box or a question
+//! dialog, judged the same way with the press's own grace and fenced on the
+//! screen read it was decided from (`if-gen=`, `if=`, `if-human=`;
+//! [`press_verb`]), so a box that moved, went or was touched since takes
+//! nothing.
+//!
 //! Two of aterm's answers are acted on here, before the caller sees them:
 //!
 //! * **A refused authority is read again, never retried.** `ERR denied
@@ -34,19 +40,22 @@
 //!   and sends nothing until the policy's `human_grace_s` has passed since that
 //!   key ([`Typed::Held`] with the grace left).
 //!
-//! Nothing here is a claim: the supervisor's claim takes no typing duty yet
-//! (`SCOPES` in `src/supervise_link.rs`), so no part of the harness calls this
-//! client, and its tests drive it against a stand-in aterm.
+//! Nothing here is a claim. The supervisor's typing duties
+//! (`src/supervise_duty.rs`: `turn-end`; `src/supervise_box_duty.rs`:
+//! `approvals`, `questions` and the wall dialogs of `walls`;
+//! `src/supervise_wall_duty.rs`: `walls`) call this client on the
+//! connection their claim was made on, each only while that claim takes its
+//! duty; their own tests drive it against a stand-in aterm.
 
 use std::io;
 use std::time::Duration;
 
-use alab_policy::guard::composer_guard_at;
+use alab_policy::guard::{KeyAct, composer_guard_at};
 use aterm_phase::{ClaudeReader, ScreenReader as _};
 
 use crate::aterm::{self, Hold, Human, Policy, ReplyError, Scope, Status};
 use crate::aterm_wire::{
-    Connection, TURN_TIMEOUT_MS, TypedFence, key_verb, send_verb, session_id, turn_verb,
+    Connection, TURN_TIMEOUT_MS, TypedFence, key_verb, press_verb, send_verb, session_id, turn_verb,
 };
 
 /// The most rows a turn's reply or a screen read may carry.
@@ -66,6 +75,28 @@ pub enum Write<'a> {
     /// `turn`: the text typed into Claude Code's composer and submitted with an
     /// Enter guarded on the composer's row.
     Turn(&'a str),
+}
+
+/// One key pressed on a box or a question dialog ([`Typist::press`]), fenced
+/// on the read it was decided from: aterm writes it only while the screen is
+/// still at `generation` (`if-gen=`), a visible row still matches `guard`
+/// (`if=`) and no person has made a gesture since `human_seq` (`if-human=`),
+/// all three judged under the terminal lock the key is written under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Press<'a> {
+    /// The key's name (`1`, `down`, `up`, `enter`).
+    pub key: &'a str,
+    /// The read's `"gen"`.
+    pub generation: &'a str,
+    /// A row guard ([`alab_policy::guard::row_guard`]) of a row of that read.
+    pub guard: &'a str,
+    /// What the key means for the box it dismisses (`act=`); `None` for a key
+    /// that only moves the focus.
+    pub act: Option<KeyAct>,
+    /// The read's `"human_seq"`.
+    pub human_seq: u64,
+    /// The person's grace this key waits out ([`judge_within`]).
+    pub grace: Duration,
 }
 
 /// What aterm answered a typed write. Each is read from aterm's own words
@@ -230,6 +261,32 @@ pub struct Screen {
     /// `"human_seq"`: the person's gesture count, read in the same hold as the
     /// rows, so a gesture they miss moves past it.
     pub human_seq: u64,
+    /// `"cursor"`: the cursor's row and column on `rows`, where both are stated
+    /// as numbers and the row is one of `rows`. aterm's readers find the
+    /// program's suggestion and vouch for a busy screen by it; a read without
+    /// it is read without them.
+    pub cursor: Option<(usize, usize)>,
+    /// `"title"`: the window title the program set, read with the rows; `None`
+    /// where it is absent or not a string.
+    pub title: Option<String>,
+    /// `"gen"`: the screen generation the rows were read at, `<epoch>.<seq>`,
+    /// which a key fenced with `if-gen=` names: aterm writes nothing once the
+    /// screen has moved past it (`OK skipped reason=changed`). `None` where it
+    /// is absent or not two runs of decimal digits joined by a dot; a key that
+    /// would answer a box is then not pressed at all.
+    pub generation: Option<String>,
+}
+
+/// Whether `value` is a screen generation as aterm states one: two runs of
+/// ASCII digits joined by one dot (`control.rs`, `ScreenGen::parse`).
+#[must_use]
+pub fn screen_generation(value: &str) -> bool {
+    value.len() <= 41
+        && value.split_once('.').is_some_and(|(epoch, seq)| {
+            [epoch, seq]
+                .iter()
+                .all(|run| !run.is_empty() && run.bytes().all(|byte| byte.is_ascii_digit()))
+        })
 }
 
 impl Screen {
@@ -251,11 +308,25 @@ impl Screen {
             crate::json::Value::Null => Human::Never,
             ms => Human::Ago(Duration::from_millis(ms.as_u64()?)),
         };
+        let cursor = value.get("cursor").and_then(|cursor| {
+            let at = |key: &str| usize::try_from(cursor.get(key)?.as_u64()?).ok();
+            Some((at("row")?, at("col")?))
+        });
         Some(Self {
-            rows,
             seq: value.get("seq")?.as_u64()?,
             human,
             human_seq: value.get("human_seq")?.as_u64()?,
+            cursor: cursor.filter(|(row, _)| *row < rows.len()),
+            title: value
+                .get("title")
+                .and_then(crate::json::Value::as_str)
+                .map(str::to_string),
+            generation: value
+                .get("gen")
+                .and_then(crate::json::Value::as_str)
+                .filter(|generation| screen_generation(generation))
+                .map(str::to_string),
+            rows,
         })
     }
 }
@@ -338,6 +409,23 @@ fn persons_grace(human: Human, grace: Duration) -> Result<(), Hold> {
 /// The first of those facts that does not hold, as a [`Hold`] on its field;
 /// a `human_ms` hold names in `grace_left` how long the grace still runs.
 pub fn judge(policy: &Policy, status: &Status, holder: &str, duty: Scope) -> Result<Judged, Hold> {
+    judge_within(policy, status, holder, duty, policy.human_grace)
+}
+
+/// [`judge`], with the person's grace `grace` in place of the policy's
+/// `human_grace_s` at step 5: a key on a box a person has not touched waits
+/// out a shorter grace than a turn typed into their composer
+/// ([`crate::boxes::grace`]).
+///
+/// # Errors
+/// As [`judge`].
+pub fn judge_within(
+    policy: &Policy,
+    status: &Status,
+    holder: &str,
+    duty: Scope,
+    grace: Duration,
+) -> Result<Judged, Hold> {
     if !duty.types() {
         return Err(hold("harness-duty", duty.word()));
     }
@@ -366,7 +454,7 @@ pub fn judge(policy: &Policy, status: &Status, holder: &str, duty: Scope) -> Res
     if !policy.effective {
         return Err(hold("effective", "off"));
     }
-    persons_grace(status.human, policy.human_grace)?;
+    persons_grace(status.human, grace)?;
     let human_seq = status
         .human_seq
         .ok_or_else(|| hold("human_seq", "absent"))?;
@@ -426,9 +514,28 @@ impl Typist {
         &self.holder
     }
 
-    fn status(&self, conn: &mut Connection) -> io::Result<Result<Status, ReplyError>> {
+    /// One fresh `status` on `conn`.
+    ///
+    /// # Errors
+    /// The exchange failed, and the connection is poisoned.
+    pub fn status(&self, conn: &mut Connection) -> io::Result<Result<Status, ReplyError>> {
         let request = format!("@{} status", self.sid);
         Ok(Status::parse(&conn.request_line(&request)?))
+    }
+
+    /// One fresh `text --json` on `conn`: the screen as aterm shows it, with
+    /// the person's counts read in the same hold. `Ok(None)` for an `OK 1`
+    /// whose body this client cannot read ([`Screen::parse`]).
+    ///
+    /// # Errors
+    /// The exchange failed, and the connection is poisoned.
+    pub fn read(&self, conn: &mut Connection) -> io::Result<Result<Option<Screen>, ReplyError>> {
+        let read = format!("@{} text --json", self.sid);
+        let (header, body) = conn.request_counted(&read, 1)?;
+        if header != "OK 1" {
+            return Ok(Err(ReplyError::refused(&header)));
+        }
+        Ok(Ok(body.first().and_then(|body| Screen::parse(body))))
     }
 
     /// Make one typed write of `duty` on `conn`, the connection the claim was
@@ -483,13 +590,10 @@ impl Typist {
                         status.composer.as_deref().unwrap_or("absent"),
                     )));
                 }
-                let read = format!("@{} text --json", self.sid);
-                let (header, body) = conn.request_counted(&read, 1)?;
-                if header != "OK 1" {
-                    return Ok(Typed::Unread(ReplyError::refused(&header)));
-                }
-                let Some(screen) = body.first().and_then(|body| Screen::parse(body)) else {
-                    return Ok(Typed::Held(hold("text", "unreadable")));
+                let screen = match self.read(conn)? {
+                    Ok(Some(screen)) => screen,
+                    Ok(None) => return Ok(Typed::Held(hold("text", "unreadable"))),
+                    Err(error) => return Ok(Typed::Unread(error)),
                 };
                 if let Err(hold) = persons_grace(screen.human, policy.human_grace) {
                     return Ok(Typed::Held(hold));
@@ -508,6 +612,52 @@ impl Typist {
                 Reply::of_turn(&answered?.0)
             }
         };
+        self.answered(conn, reply)
+    }
+
+    /// Press one key on a box or a question dialog for `duty` on `conn`, the
+    /// connection the claim was made on, under `policy`: judge a fresh
+    /// `status` with the press's own grace ([`judge_within`]), send the key
+    /// once, fenced on the read it was decided from ([`press_verb`]), and read
+    /// aterm's answer. A screen that moved past the read is aterm's
+    /// `OK skipped reason=changed` ([`Reply::Skipped`]); a guard no row
+    /// matches, its `OK skipped` ([`Reply::Skipped`] `guard`); a person's
+    /// gesture since the read, [`Reply::Person`].
+    ///
+    /// # Errors
+    /// An exchange failed: the connection is poisoned, and the key may have
+    /// been pressed. Nothing is sent again.
+    pub fn press(
+        &self,
+        conn: &mut Connection,
+        policy: &Policy,
+        duty: Scope,
+        press: &Press<'_>,
+    ) -> io::Result<Typed> {
+        let status = match self.status(conn)? {
+            Ok(status) => status,
+            Err(error) => return Ok(Typed::Unread(error)),
+        };
+        let judged = match judge_within(policy, &status, &self.holder, duty, press.grace) {
+            Ok(judged) => judged,
+            Err(hold) => return Ok(Typed::Held(hold)),
+        };
+        let fence = TypedFence {
+            holder: &self.holder,
+            revision: judged.revision,
+            duty,
+            human_seq: press.human_seq,
+        };
+        let Some(request) = press_verb(&self.sid, &fence, press) else {
+            return Ok(Typed::Held(hold("write", "unsendable")));
+        };
+        let reply = Reply::of_write(&conn.request_line(&request)?);
+        self.answered(conn, reply)
+    }
+
+    /// aterm's answer `reply` to a write that was sent: as it is, or, for a
+    /// refused authority, the one `status` read after it ([`Typed::Denied`]).
+    fn answered(&self, conn: &mut Connection, reply: Reply) -> io::Result<Typed> {
         if reply != Reply::Denied {
             return Ok(Typed::Answered(reply));
         }

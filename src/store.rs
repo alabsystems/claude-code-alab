@@ -7,8 +7,11 @@
 //! `~/Library/Application Support/aterm/pkg` on macOS and
 //! `~/.local/share/aterm/pkg` elsewhere (`crates/atpkg/src/platform/unix.rs:22-34`);
 //! a shipped atpkg ignores any configured `[packages] prefix`
-//! (`crates/atpkg/src/config.rs:510-549`, `admit_packages`), so this harness reads
-//! only the default. A program's builds live at `store/<program>/<build>/`, with
+//! (`crates/atpkg/src/config.rs:510-549`, `admit_packages`), so a direct launch
+//! reads only the default under its `HOME`. A launch the launcher handed over
+//! reads first the prefix this harness is installed under, the launcher's own,
+//! where it saw its vendor build, so a launch under another `HOME` still finds
+//! it ([`vendor_prefixes`]). A program's builds live at `store/<program>/<build>/`, with
 //! `store/<program>/current -> <build dir>` (`crates/atpkg/src/store.rs:70-125`),
 //! each build marked usable by `<build>.ready` (first line `ok`, an optional
 //! `platform=<arch>-<os>` that must be this machine's; `store.rs:366-445`), its
@@ -346,6 +349,18 @@ impl Store {
             })
     }
 
+    /// The vendor version build `number`'s `.vendor` record states, when the
+    /// record names that build ([`record_names_build`]), as [`Store::current`]
+    /// reads it, and nothing else of the build: what a report of a move onto
+    /// it says, never what decides one.
+    #[must_use]
+    pub fn version_of(&self, number: u64) -> Option<String> {
+        read_small(&self.program_dir.join(format!("{number}.vendor")))
+            .as_deref()
+            .and_then(vendor_version)
+            .filter(|v| record_names_build(v, number))
+    }
+
     /// Check the link's destination lexically without opening the build.
     fn selected_number(&self, target: &Path) -> Result<u64, String> {
         let number = target
@@ -433,10 +448,7 @@ impl Store {
                 ));
             }
         }
-        let version = read_small(&self.program_dir.join(format!("{name}.vendor")))
-            .as_deref()
-            .and_then(vendor_version)
-            .filter(|v| record_names_build(v, number));
+        let version = self.version_of(number);
         let env = read_small(&self.program_dir.join(format!("{name}.shim-env")))
             .as_deref()
             .map(parse_shim_env)
@@ -525,6 +537,102 @@ pub fn home_dir(env_home: Option<OsString>) -> Option<PathBuf> {
         _ => std::env::home_dir().filter(|p| p.is_absolute()),
     }
 }
+
+/// The atpkg prefix this harness is installed under, read off its own
+/// executable `own_exe`: `<prefix>/store/claude-code-alab/<build>/bin/claude-alab`,
+/// as given or else with every link resolved. That is the prefix of the
+/// launcher that handed a launch over (its hand-off runs
+/// `<prefix>/bin/claude-alab`, which leads into that store), and the
+/// launcher's own vendor build lives under it. `None` for an executable
+/// anywhere else (a build run from its checkout, a copy) or one that cannot
+/// be resolved.
+#[must_use]
+pub fn installed_prefix(own_exe: &Path) -> Option<PathBuf> {
+    installed_prefix_of(own_exe).or_else(|| installed_prefix_of(&own_exe.canonicalize().ok()?))
+}
+
+/// [`installed_prefix`] of `exe` exactly as written, with no link resolved.
+#[must_use]
+pub fn installed_prefix_of(exe: &Path) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    let bin = exe.parent()?;
+    let build = bin.parent()?;
+    let program = build.parent()?;
+    let store = program.parent()?;
+    let laid_out = exe.file_name() == Some(OsStr::new(crate::self_image::COMMAND))
+        && bin.file_name() == Some(OsStr::new("bin"))
+        && build
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(parse_build_name)
+            .is_some()
+        && program.file_name() == Some(OsStr::new(crate::self_image::PACKAGE))
+        && store.file_name() == Some(OsStr::new("store"));
+    if !laid_out {
+        return None;
+    }
+    store.parent().map(Path::to_path_buf)
+}
+
+/// The prefixes a launch reads the vendor's store under, in order. A launch
+/// the launcher handed over (`handed_over`) reads first the prefix this
+/// harness is installed under ([`installed_prefix`]), where the launcher
+/// found its own vendor build, and then the default one under `home`
+/// ([`default_prefix`]); a direct launch reads the default one alone, as does
+/// a hand-off whose installed prefix is that same folder (by path, or by
+/// both resolving to one).
+#[must_use]
+pub fn vendor_prefixes(handed_over: bool, own_exe: Option<&Path>, home: &Path) -> Vec<PathBuf> {
+    let under_home = default_prefix(home);
+    let installed = own_exe.filter(|_| handed_over).and_then(installed_prefix);
+    match installed {
+        Some(installed) if !same_folder(&installed, &under_home) => vec![installed, under_home],
+        _ => vec![under_home],
+    }
+}
+
+/// Whether `a` and `b` name one folder: the same path, or both resolving to
+/// the same one.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// The first of `prefixes` whose store of `program` (binary `bin/<command>`)
+/// names a usable build ([`Store::current`]), with that prefix, its store and
+/// the build.
+///
+/// # Errors
+/// No prefix does: the first prefix, and why its build cannot be run. With
+/// `prefixes` empty, an empty path and [`Missing::NotInstalled`] of an empty
+/// link.
+pub fn find_vendor(
+    prefixes: &[PathBuf],
+    program: &str,
+    command: &str,
+    own_exe: Option<&Path>,
+) -> Result<(PathBuf, Store, Build), (PathBuf, Missing)> {
+    let mut first = None;
+    for prefix in prefixes {
+        let store = Store::new(prefix, program, command);
+        match store.current(own_exe) {
+            Ok(build) => return Ok((prefix.clone(), store, build)),
+            Err(missing) => {
+                if first.is_none() {
+                    first = Some((prefix.clone(), missing));
+                }
+            }
+        }
+    }
+    Err(first.unwrap_or_else(|| (PathBuf::new(), Missing::NotInstalled(PathBuf::new()))))
+}
+
+#[cfg(test)]
+#[path = "store_prefix_tests.rs"]
+mod prefix_tests;
 
 #[cfg(test)]
 mod tests {

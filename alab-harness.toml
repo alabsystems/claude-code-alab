@@ -1,0 +1,9 @@
+# What aterm knows about this harness. `atpkg-publish pack` copies the [harness] table into the
+# package's signed manifest; aterm makes a registry row from it only when that manifest verifies
+# (aterm docs/DESIGN-harness-interface-2026-11-12.md §2.1). The publisher refuses unknown keys.
+[harness]
+id        = "claude-code-alab"
+tool      = "claude-alab"
+leads     = ["claude"]        # src/cli.rs LEADING_WORDS: the launcher hands `claude` to `run --`
+contracts = [3, 4]            # the contract 3 claim (src/aterm.rs REQUIRED_CONTRACT) and the contract 4 stream
+name      = "Claude Code"

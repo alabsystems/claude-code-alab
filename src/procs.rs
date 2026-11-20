@@ -15,8 +15,8 @@
 //! work (never as "nothing runs").
 //!
 //! The background table comes from `ps -A -o pid=,ppid=,comm=` under `LC_ALL=C`,
-//! as aterm reads it off macOS (aterm `upgrade_drive.rs:689-706`, `ps_table`), so this
-//! table needs no `unsafe`. It is read only when every other witness already
+//! as aterm reads it off macOS (aterm `upgrade_drive.rs:689-706`, `ps_table`), under
+//! one deadline ([`run_until`]). It is read only when every other witness already
 //! says "safe", never on every look. Separate kernel readers capture a child's
 //! identity without consuming any wait event; an incomplete read is no proof.
 
@@ -865,44 +865,323 @@ fn ps_table(paths: &[&str], limit: Duration) -> Option<String> {
     None
 }
 
-/// Run one `ps` until `deadline`; its output is read on a thread so a large
-/// table cannot fill the pipe and stall it.
+/// Run one `ps` until `deadline` ([`run_until`]).
 fn ps_output(ps: &str, deadline: Instant) -> Ps {
-    let Ok(mut child) = Command::new(ps)
+    let mut command = Command::new(ps);
+    command
         .args(["-A", "-o", "pid=,ppid=,comm="])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Ps::NotStarted;
-    };
-    let reader = child.stdout.take().map(|mut stdout| {
-        std::thread::spawn(move || {
-            let mut out = String::new();
-            stdout.read_to_string(&mut out).ok().map(|_| out)
-        })
-    });
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+        .env("LC_ALL", "C");
+    match run_until(&mut command, deadline) {
+        Ran::Ended { code: Some(0), out } => {
+            String::from_utf8(out).map_or(Ps::Failed, Ps::Answered)
         }
-    };
-    let out = reader.and_then(|reader| reader.join().ok().flatten());
-    match (status, out) {
-        (Some(status), Some(out)) if status.success() => Ps::Answered(out),
-        _ => Ps::Failed,
+        Ran::NotStarted => Ps::NotStarted,
+        Ran::Ended { .. } | Ran::Cut => Ps::Failed,
     }
 }
+
+/// The folder process `pid` runs in (its current directory), as the kernel
+/// names it; `None` where it cannot be read (the process is gone, is not
+/// this user's, or the platform has no such read).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn cwd_of(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
+    // SAFETY: PROC_PIDVNODEPATHINFO writes at most `size` bytes into this
+    // correctly laid-out native record.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if got != size {
+        return None;
+    }
+    // SAFETY: zeroed plain-data storage the kernel filled whole.
+    let info = unsafe { info.assume_init() };
+    let path: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
+        .take_while(|byte| *byte != 0)
+        .collect();
+    let path = PathBuf::from(std::ffi::OsString::from_vec(path));
+    path.is_absolute().then_some(path)
+}
+
+/// The folder process `pid` runs in (its current directory), as the kernel
+/// names it; `None` where it cannot be read (the process is gone, is not
+/// this user's, or the platform has no such read).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn cwd_of(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .filter(|path| path.is_absolute())
+}
+
+/// The folder process `pid` runs in: no platform read here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[must_use]
+pub fn cwd_of(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// What running one command under a deadline came to ([`run_until`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ran {
+    /// It ran to its end: its exit code (`None` where a signal ended it) and
+    /// everything it wrote to its standard output.
+    Ended {
+        /// The exit code, `None` for a signal.
+        code: Option<i32>,
+        /// Its standard output, whole.
+        out: Vec<u8>,
+    },
+    /// It could not be started at all (not there, not executable): nothing
+    /// ran and no time passed.
+    NotStarted,
+    /// The deadline had passed before it could start (nothing was started),
+    /// it was still running at the deadline, or a process it left behind
+    /// still held its output open then (its whole group was then killed and
+    /// it was reaped), or its output or its end could not be read: what it
+    /// would have said is not known.
+    Cut,
+}
+
+/// How long one wait of [`run_until`] lasts at most before it looks at the
+/// command's exit again: the pipe wakes it sooner for output or its end.
+const RUN_STEP: Duration = Duration::from_millis(5);
+
+/// The most bytes [`run_until`] reads from the pipe at once.
+const RUN_READ: usize = 16 * 1024;
+
+/// Run `command` until `deadline`, its standard input empty and its standard
+/// error discarded, in a process group of its own. A deadline already passed
+/// starts nothing. Its output is read on the calling thread as it is written
+/// ([`Running::poll`]), so a large one cannot fill the pipe and stall it, and
+/// no thread outlives the call: an own-image move, which needs this process
+/// single-threaded, never meets one. Run to its end with its pipe closed, it
+/// is reaped and its output returned whole. At the deadline, still running or
+/// still holding the pipe open through a process it left behind, its whole
+/// group is killed, it is reaped, and the run is cut; so is a run whose pipe
+/// or end could not be read.
+pub fn run_until(command: &mut Command, deadline: Instant) -> Ran {
+    if Instant::now() >= deadline {
+        return Ran::Cut;
+    }
+    let mut running = match Running::start(command) {
+        Ok(running) => running,
+        Err(ran) => return ran,
+    };
+    loop {
+        let step = deadline
+            .saturating_duration_since(Instant::now())
+            .min(RUN_STEP);
+        if let Some(ran) = running.poll(step) {
+            return ran;
+        }
+        if Instant::now() >= deadline {
+            return running.cut();
+        }
+    }
+}
+
+/// One command run a look at a time ([`Running::poll`]), its standard input
+/// empty and its standard error discarded, in a process group of its own: the
+/// caller decides between looks how long it may run, so a run can outlast
+/// many turns of a loop that never waits on it. Its end is looked at without
+/// reaping it (`waitid` with `WNOWAIT`), so its pid, and the group it leads, stay
+/// its own until the reap. Dropped before its end, or cut ([`Running::cut`]),
+/// its whole group is killed and it is reaped.
+#[derive(Debug)]
+pub struct Running {
+    /// The command, until it is reaped.
+    child: Option<std::process::Child>,
+    /// Its standard output.
+    stdout: std::process::ChildStdout,
+    /// What it wrote so far.
+    out: Vec<u8>,
+    /// Room for one read of [`RUN_READ`] bytes.
+    buf: Vec<u8>,
+    /// Whether its standard output reached its end.
+    closed: bool,
+}
+
+impl Running {
+    /// Start `command`.
+    ///
+    /// # Errors
+    /// [`Ran::NotStarted`] where it could not be started (not there, not
+    /// executable); [`Ran::Cut`] where its output could not be taken, when it
+    /// is killed with its group and reaped.
+    pub fn start(command: &mut Command) -> Result<Self, Ran> {
+        use std::os::unix::process::CommandExt as _;
+        let Ok(mut child) = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+        else {
+            return Err(Ran::NotStarted);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return Err(cut(&mut child));
+        };
+        Ok(Self {
+            child: Some(child),
+            stdout,
+            out: Vec::new(),
+            buf: vec![0_u8; RUN_READ],
+            closed: false,
+        })
+    }
+
+    /// One look, waiting up to `wait` for output: `None` while it runs or
+    /// holds its pipe open; [`Ran::Ended`] once it has ended with its pipe
+    /// closed, when it is reaped and its output returned whole; [`Ran::Cut`]
+    /// where its pipe or its end could not be read, when its group is killed
+    /// and it is reaped, and at every look after it answered.
+    pub fn poll(&mut self, wait: Duration) -> Option<Ran> {
+        let Some(child) = self.child.as_mut() else {
+            return Some(Ran::Cut);
+        };
+        let Some(ended) = exited_unreaped(child.id()) else {
+            return Some(self.cut());
+        };
+        if ended && self.closed {
+            let ran = match child.wait() {
+                Ok(status) => Ran::Ended {
+                    code: status.code(),
+                    out: std::mem::take(&mut self.out),
+                },
+                Err(_) => Ran::Cut,
+            };
+            self.child = None;
+            return Some(ran);
+        }
+        if self.closed {
+            std::thread::sleep(wait);
+            return None;
+        }
+        match readable(&self.stdout, wait) {
+            Some(true) => match self.stdout.read(&mut self.buf) {
+                Ok(0) => self.closed = true,
+                Ok(n) => {
+                    if let Some(read) = self.buf.get(..n) {
+                        self.out.extend_from_slice(read);
+                    } else {
+                        return Some(self.cut());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Some(self.cut()),
+            },
+            Some(false) => {}
+            None => return Some(self.cut()),
+        }
+        None
+    }
+
+    /// End the run without its answer ([`cut`]): [`Ran::Cut`].
+    pub fn cut(&mut self) -> Ran {
+        match self.child.take() {
+            Some(mut child) => cut(&mut child),
+            None => Ran::Cut,
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.cut();
+    }
+}
+
+/// End a run without its answer: SIGKILL to the group `child` leads (its pid,
+/// which no other group can take while it is unreaped) and to `child` itself,
+/// in case it left that group, then reap it.
+fn cut(child: &mut std::process::Child) -> Ran {
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: a plain syscall; `group` is the pid of this process's own
+        // unreaped child, which leads the group it was spawned into.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ran::Cut
+}
+
+/// Whether the unreaped child `pid` has ended, looked at without reaping it
+/// (`WNOWAIT`), so its pid stays its own until it is reaped. `None` where
+/// the look failed.
+fn exited_unreaped(pid: u32) -> Option<bool> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let id = libc::id_t::try_from(pid).ok()?;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `info` is writable siginfo_t storage. WNOWAIT leaves the
+        // child's end pending for its reap; WNOHANG never waits.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: zeroed plain-data storage, which the call either left
+            // as it was (no end to report: `si_signo` stays 0) or filled.
+            let info = unsafe { info.assume_init() };
+            return Some(info.si_signo == libc::SIGCHLD);
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return None;
+        }
+    }
+}
+
+/// Whether `pipe` can be read without waiting (output, or its end), waiting
+/// for that up to `wait`: `Some(false)` where nothing came in time or the
+/// wait was interrupted, `None` where the pipe reports an error.
+fn readable(pipe: &impl std::os::fd::AsRawFd, wait: Duration) -> Option<bool> {
+    let mut fd = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `fd` is one valid pollfd for the call's duration, naming the
+    // pipe `pipe` keeps open.
+    let n = unsafe { libc::poll(&raw mut fd, 1, ms) };
+    if n < 0 {
+        return (std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR))
+            .then_some(false);
+    }
+    if n == 0 {
+        return Some(false);
+    }
+    if fd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+#[path = "procs_run_tests.rs"]
+mod run_tests;
 
 #[cfg(test)]
 mod tests {

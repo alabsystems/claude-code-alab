@@ -338,7 +338,8 @@ fn renderer_keeps_empty_environment_choices_and_real_settings_keys() {
 fn account_routing_preserves_argument_boundaries_and_execs_the_exact_vendor() {
     let args = os(&["--model", "an opus", "", "a'quote", "--", "--no-harness"]);
     let exe = Path::new("/store/claude/42/bin/claude");
-    let command = vendor_command_for(exe, &args, Some(Path::new("/host/aterm")));
+    let command = vendor_command_for(exe, &args, Some(Path::new("/host/aterm")), None)
+        .expect("a start through the helper");
     assert_eq!(command.get_program(), "/host/aterm");
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
@@ -355,12 +356,52 @@ fn account_routing_preserves_argument_boundaries_and_execs_the_exact_vendor() {
         .map(OsString::as_os_str)
         .collect::<Vec<_>>()
     );
-    let plain = vendor_command_for(exe, &args, None);
+    let plain = vendor_command_for(exe, &args, None, None).expect("a start that names no account");
     assert_eq!(plain.get_program(), exe);
     assert_eq!(
         plain.get_args().collect::<Vec<_>>(),
         args.iter().map(OsString::as_os_str).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn a_session_aterm_moved_onto_an_account_names_its_key_to_the_token_helper() {
+    const KEY: &str = "ac-0123456789abcdef";
+    let args = os(&["--resume", "abc"]);
+    let exe = Path::new("/store/claude/42/bin/claude");
+    let command = vendor_command_for(exe, &args, Some(Path::new("/host/aterm")), Some(KEY))
+        .expect("a start through the helper");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        os(&[
+            "harness",
+            "accounts",
+            "token-run",
+            KEY,
+            "--",
+            "/store/claude/42/bin/claude",
+            "--resume",
+            "abc"
+        ])
+        .iter()
+        .map(OsString::as_os_str)
+        .collect::<Vec<_>>()
+    );
+    // With no helper a start that names an account is not made at all: the
+    // vendor is never run directly on an account's login directory, whatever
+    // was reachable when the move was admitted.
+    let refused = vendor_command_for(exe, &args, None, Some(KEY)).expect_err("no helper");
+    assert_eq!(refused.kind(), std::io::ErrorKind::NotFound);
+    // CONTROL: the same start that names no account runs the vendor as it is.
+    let plain = vendor_command_for(exe, &args, None, None).expect("a start that names no account");
+    assert_eq!(plain.get_program(), exe);
+}
+
+#[test]
+fn the_token_helper_that_started_nothing_exits_seventy_five() {
+    // The number is aterm's (`accounts_token_run::NOT_STARTED`): a change on
+    // either side is a change of the contract between the two.
+    assert_eq!(NOT_STARTED, 75);
 }
 
 #[test]

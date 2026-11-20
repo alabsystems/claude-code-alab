@@ -178,6 +178,7 @@ mod tests {
                 build: build.clone(),
                 opts: opts.clone(),
                 args: Vec::new(),
+                tapped: false,
                 depth: 0,
             },
             journal: journal::Journal::none(),
@@ -205,6 +206,17 @@ mod tests {
             ladder: crate::relaunch::Ladder::new(),
             restart_deferred: None,
             facts: crate::model_facts::Reader::default(),
+            model: None,
+            untyped_noted: String::new(),
+            limit: crate::limit::State::new(1),
+            limit_source: Box::new(crate::limit::Transcript::default()),
+            limit_said: supervise::LimitSaid::default(),
+            turn_end: supervise::turn_end::Driver::default(),
+            account: None,
+            admitting: None,
+            limit_adopted: false,
+            described: None,
+            upgrading: None,
         }
     }
     fn runtime(outcome: CommitOutcome) -> (Runtime, Rc<RefCell<Record>>) {

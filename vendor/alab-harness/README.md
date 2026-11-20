@@ -37,6 +37,11 @@ and refused connection admission remain permanent refusals.
   exchange. Also the field readers and the event subscription (`EventReader`),
   which needs aterm's real ACK, `OK subscribe 1` and then
   `sub <local> <sid> role=- attention=- user_title=-`.
+  `Connection::request_counted_until` reads a counted reply (`OK <n> …` and
+  the `<n>` lines after it, as `turn … harness-duty=turn-end` and `text
+  --json` answer) whole under one deadline, and `Link::request_counted`
+  sends one where `Link::request` sends, within a bound its caller gives
+  (Decision 34).
 - `claim`: the claim texts of contracts 3 and 4 and their guards. The
   contract is the highest of those the harness declares that `harness
   policy`'s `contract=` set lists (`Contract::choose`; Decision 33). A
@@ -74,9 +79,10 @@ and refused connection admission remain permanent refusals.
   `Link::safe_point` judges an upgrade by aterm's rule; `Link::read` hands a
   harness the fresh policy and status pair to judge a move by its own (one a
   person asked for under `upgrade_ask=true`).
-  Connecting may take 2 s and each request 500 ms. A lost claim is claimed
-  again every 5 s, and an event stream that ended is reopened every 5 s, the
-  policy read at each attempt while it stays down (Decision 18). Every claim
+  Connecting may take 2 s and each request 500 ms, a counted request as long
+  as its caller says. A lost claim is claimed again every 5 s, and an event
+  stream that ended is reopened every 5 s, the policy read at each attempt
+  while it stays down (Decision 18). Every claim
   (launch, adoption, reclaim, a policy switched back on) keeps to the
   config's declared contracts; a policy listing none of them is
   `Failure::Unserved`, read again every 5 s, and `Link::unclaimed` gives a
@@ -1058,6 +1064,34 @@ it, and the stream's when aterm first answers `stream` (HX-15b1).
       `the_default_contracts_are_three_and_four` pins the default; each link
       test has the default config claim at 3 in the same scene as its
       control.
+
+**Counted replies (2026-11-19).**
+
+34. **A counted reply is read whole, by one reader.** Under contract 4 the
+    claim's connection carries only records, so `turn …
+    harness-duty=turn-end` and `text --json` go on the request connection,
+    and aterm answers both with a header that counts the lines after it. A
+    one-line read leaves the body for the next request to take as its
+    reply. `Connection::request_counted_until` is claude-code-alab's reader
+    (`request_counted` in its `src/aterm_wire.rs`), ported with its tests:
+    one deadline for the write, the header and every body line; 1 to
+    `MAX_COUNTED_LINES` (1024) lines and one line's byte bound for the
+    body; an `ERR` header an answer with no body; and a header with no
+    canonical count or a count over `max_lines`, a body cut short or
+    followed by bytes it did not count, or no time left poisons the
+    connection, as every failed exchange does. Two changes: bytes read past
+    an `ERR` header fail that exchange rather than the next request's, and
+    claude-code-alab's stricter `request_body` (exactly `OK <n>`, `ERR` an
+    error) is not ported, since this reader reads that reply too.
+    `Link::request_counted` sends where `Link::request` sends, with its
+    refusals and its loss of the link on a failed exchange, and refuses a
+    bound out of range with nothing sent. Its caller gives the exchange's
+    timeout, since aterm answers a `turn` only once the screen has settled
+    after its submit, which outlasts the link's 500 ms; claude-code-alab
+    gives its turn's `timeout=` and 5 s. Both requests send the verb as
+    written past its leading spaces, since aterm types a turn's text after
+    `--` verbatim. `FakeAterm::set_counted_reply` gives a verb the fake
+    does not serve a counted reply.
 
 A client that opts into native child tracking asks for `native-act info capabilities=1`
 when it claims under contract 3. Older aterm parsers give an explicit native-act usage

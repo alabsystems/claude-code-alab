@@ -38,6 +38,9 @@ pub const HARNESS_ENV: &[(&str, &str)] = &[
 /// The one status in Claude Code's record that means "no turn is running".
 pub const STATUS_IDLE: &str = "idle";
 
+/// The status in Claude Code's record while a turn runs.
+pub const STATUS_BUSY: &str = "busy";
+
 /// The record kind of an interactive (TUI) session; print-mode runs are never relaunched.
 pub const KIND_INTERACTIVE: &str = "interactive";
 
@@ -492,15 +495,82 @@ pub fn permission_mode_of(tail: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The value of one parsed option that takes one: `--name=<value>` or the word
+/// after `--name`.
+fn unit_value<'a>(unit: &ParsedFlag<'a, String>) -> Option<&'a str> {
+    match unit.tokens.first()?.split_once('=') {
+        Some((name, value)) if name == unit.name => Some(value),
+        _ => unit.tokens.get(1).map(String::as_str),
+    }
+}
+
+/// How much a permission mode lets through without a person, for the four
+/// modes that order: `plan` runs nothing, `default` asks, `acceptEdits` takes
+/// file edits, `auto` takes what the vendor's classifier passes. `dontAsk`
+/// and `bypassPermissions` are not on this scale: the first is compared only
+/// with itself, the second is the launch's own word or nothing.
+fn mode_rank(mode: &str) -> Option<u8> {
+    Some(match mode {
+        "plan" => 0,
+        "default" | "manual" => 1,
+        "acceptEdits" => 2,
+        "auto" => 3,
+        _ => return None,
+    })
+}
+
+/// Whether resuming in `mode` stays within what the launch's command line
+/// asked for, `launch` being its `--permission-mode` value when it named one
+/// (and did not start in bypass). `plan` is within every launch. Any other mode is
+/// within a launch that named that very mode, or a mode that lets through at
+/// least as much ([`mode_rank`]). A launch that named no mode left the choice
+/// to the vendor's settings, which this harness does not read, so only `plan`
+/// is known to be within it.
+fn within_launch(launch: Option<&str>, mode: &str) -> bool {
+    mode == "plan"
+        || launch.is_some_and(|launch| {
+            let launch = if launch == "manual" {
+                "default"
+            } else {
+                launch
+            };
+            launch == mode
+                || matches!(
+                    (mode_rank(launch), mode_rank(mode)),
+                    (Some(asked), Some(resumed)) if resumed <= asked
+                )
+        })
+}
+
 /// `flags` (from [`resume_argv`], the resume pair last) resumed in the
-/// conversation's permission `mode`: with no mode, or still in bypass, the launch's own
-/// flags stand; any other mode replaces the launch's permission flags with
-/// `--permission-mode <mode>`, and a launch that allowed bypass keeps it
-/// reachable with `--allow-dangerously-skip-permissions`. A resume never moves
-/// a session into bypass that the launch did not allow, and never back into
-/// bypass from a mode the person chose inside the session. Option values and a
-/// literal `--` suffix keep their original boundaries; unknown arity leaves
-/// the input unchanged rather than guessing which words describe posture.
+/// conversation's permission `mode`, the newest one its transcript names
+/// ([`permission_mode_of`]). That line is history: it may predate this launch,
+/// and nothing here reads the running child's mode. So it is carried only
+/// where it cannot widen what the launch's own command line asked for:
+///
+/// * with no mode, or `bypassPermissions`, the launch's own flags stand;
+/// * a launch that started in bypass (`--permission-mode bypassPermissions`,
+///   or `--dangerously-skip-permissions` with no `--permission-mode` beside
+///   it) is resumed in `mode`, whichever it is: every mode is within bypass,
+///   and a session switched to plan inside is not resumed back in bypass;
+/// * any other launch is resumed in `mode` only when that is within the
+///   launch's own `--permission-mode` ([`within_launch`]: the same mode, a
+///   narrower one, or `plan`); otherwise the launch's own flags stand. A
+///   launch in `default` is never resumed in a historical `auto`, `dontAsk` or
+///   `acceptEdits`. That holds for a launch that only left bypass reachable
+///   (`--allow-dangerously-skip-permissions`) too: reachable is not asked
+///   for, so `--allow-dangerously-skip-permissions --permission-mode plan`
+///   is never resumed in a historical `auto`. A launch that named a mode
+///   beside `--dangerously-skip-permissions` is held to the mode it named:
+///   whichever of the two words Claude Code started it in, the named mode is
+///   the narrower.
+///
+/// Where the launch could reach bypass (either flag, or the mode), the line
+/// written keeps it reachable with `--allow-dangerously-skip-permissions`.
+/// A resume never moves a session into bypass that the launch did not allow.
+/// Option values and a literal `--` suffix keep their original boundaries;
+/// unknown arity leaves the input unchanged rather than guessing which words
+/// describe posture.
 #[must_use]
 pub fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Vec<String> {
     let Some(mode) = mode.filter(|m| *m != "bypassPermissions") else {
@@ -512,23 +582,34 @@ pub fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Vec<Strin
     if units.iter().any(|unit| unit.fate.is_none()) {
         return argv.into_iter().skip(1).collect();
     }
+    // The launch's own posture: whether it skipped permissions outright,
+    // whether it left bypass reachable, and the mode its last
+    // `--permission-mode` named (the one Claude Code's parser keeps).
+    let (mut skipped, mut allowed) = (false, false);
+    let mut launch_mode = None;
+    for unit in &units {
+        match unit.name {
+            "--dangerously-skip-permissions" => skipped = true,
+            "--allow-dangerously-skip-permissions" => allowed = true,
+            "--permission-mode" => launch_mode = unit_value(unit),
+            _ => {}
+        }
+    }
+    let started_in_bypass =
+        launch_mode == Some("bypassPermissions") || (skipped && launch_mode.is_none());
+    let bypass_in_cycle = skipped || allowed || launch_mode == Some("bypassPermissions");
+    if !started_in_bypass && !within_launch(launch_mode, mode) {
+        return argv.into_iter().skip(1).collect();
+    }
     let mut out = Vec::new();
     let mut insert_at = None;
-    let mut bypass_in_cycle = false;
     let mut after = 1;
     for unit in units {
         out.extend_from_slice(&argv[after..unit.at]);
         match unit.name {
-            "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions" => {
-                bypass_in_cycle = true;
-            }
-            "--permission-mode" => {
-                bypass_in_cycle |= unit.tokens[0] == "--permission-mode=bypassPermissions"
-                    || unit
-                        .tokens
-                        .get(1)
-                        .is_some_and(|mode| mode == "bypassPermissions");
-            }
+            "--dangerously-skip-permissions"
+            | "--allow-dangerously-skip-permissions"
+            | "--permission-mode" => {}
             "--resume" | "-r" => {
                 insert_at.get_or_insert(out.len());
                 out.extend_from_slice(unit.tokens);
@@ -563,6 +644,78 @@ pub fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Vec<Strin
 #[must_use]
 pub fn pins_model(argv: &[String]) -> bool {
     parsed(argv).iter().any(|flag| flag.name == "--model")
+}
+
+/// The model `argv` (`argv[0]` first) names: the value of its last `--model`,
+/// the one Claude Code's parser keeps. `None` when it names none, and then
+/// Claude Code's own settings choose the model.
+#[must_use]
+pub fn model_of(argv: &[String]) -> Option<&str> {
+    parsed(argv)
+        .iter()
+        .rev()
+        .find(|flag| flag.name == "--model")
+        .and_then(unit_value)
+}
+
+/// `flags` (from [`resume_argv`], the resume pair last) resumed on `model`:
+/// every `--model <value>` and `--model=<value>` of the launch is taken out and
+/// one `--model <model>` is put in front of the resume pair. Every other word
+/// keeps its place, option values and a literal `--` suffix included. `None`
+/// when an option's arity is unknown: which words are the launch's model then
+/// cannot be told, and nothing is guessed.
+#[must_use]
+pub fn with_model(flags: Vec<String>, model: &str) -> Option<Vec<String>> {
+    put_model(flags, Some(model))
+}
+
+/// `flags` (from [`resume_argv`], the resume pair last) with every `--model
+/// <value>` and `--model=<value>` taken out and none put in: a resume line
+/// that takes up the conversation's newest model. Every other word keeps its
+/// place; `None` when an option's arity is unknown, as for [`with_model`].
+#[must_use]
+pub fn without_model(flags: Vec<String>) -> Option<Vec<String>> {
+    put_model(flags, None)
+}
+
+/// [`with_model`] on `model`, or [`without_model`] for none.
+fn put_model(flags: Vec<String>, model: Option<&str>) -> Option<Vec<String>> {
+    let argv: Vec<String> = std::iter::once(COMMAND.to_string()).chain(flags).collect();
+    let units = parsed(&argv);
+    if units.iter().any(|unit| unit.fate.is_none()) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut insert_at = None;
+    let mut after = 1;
+    for unit in units {
+        out.extend_from_slice(&argv[after..unit.at]);
+        match unit.name {
+            "--model" => {}
+            "--resume" | "-r" => {
+                insert_at.get_or_insert(out.len());
+                out.extend_from_slice(unit.tokens);
+            }
+            _ => out.extend_from_slice(unit.tokens),
+        }
+        after = unit.at + unit.tokens.len();
+    }
+    let suffix = &argv[after..];
+    let insert_at = insert_at.unwrap_or_else(|| {
+        out.len()
+            + suffix
+                .iter()
+                .position(|word| word == "--")
+                .unwrap_or(suffix.len())
+    });
+    out.extend_from_slice(suffix);
+    if let Some(model) = model {
+        out.splice(
+            insert_at..insert_at,
+            ["--model".to_string(), model.to_string()],
+        );
+    }
+    Some(out)
 }
 
 const ONE_SHOT: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
@@ -847,13 +1000,34 @@ mod tests {
                 Some("acceptEdits")
             ),
             args(&[
+                "--permission-mode=plan",
+                "--add-dir",
+                "/w",
+                "--resume",
+                "ID"
+            ]),
+            "never wider than the launch named: as launched"
+        );
+        assert_eq!(
+            with_permission_mode(
+                args(&[
+                    "--permission-mode=acceptEdits",
+                    "--add-dir",
+                    "/w",
+                    "--resume",
+                    "ID"
+                ]),
+                Some("plan")
+            ),
+            args(&[
                 "--add-dir",
                 "/w",
                 "--permission-mode",
-                "acceptEdits",
+                "plan",
                 "--resume",
                 "ID"
-            ])
+            ]),
+            "narrower than the launch named: carried"
         );
         assert_eq!(
             with_permission_mode(args(&["--resume", "ID"]), Some("bypassPermissions")),
@@ -888,9 +1062,16 @@ mod tests {
                 let launch = args(&["claude", "--permission-mode", "default", option, value]);
                 let flags = resume_argv(&launch, "ID").expect("known value boundary");
                 assert_eq!(
-                    with_permission_mode(flags, Some("auto")),
-                    args(&[option, value, "--permission-mode", "auto", "--resume", "ID"]),
+                    with_permission_mode(flags.clone(), Some("plan")),
+                    args(&[option, value, "--permission-mode", "plan", "--resume", "ID"]),
                     "{option} {value} is a value, not permission posture"
+                );
+                // Nor does such a value allow bypass: the launch asked for
+                // `default`, and a historical `auto` is wider.
+                assert_eq!(
+                    with_permission_mode(flags.clone(), Some("auto")),
+                    flags,
+                    "{option} {value} grants nothing"
                 );
             }
         }
@@ -910,13 +1091,13 @@ mod tests {
                     "literal",
                     "--permission-mode=plan",
                 ]),
-                Some("auto")
+                Some("plan")
             ),
             args(&[
                 "--model",
                 "opus",
                 "--permission-mode",
-                "auto",
+                "plan",
                 "--",
                 "--dangerously-skip-permissions",
                 "--resume",
@@ -955,7 +1136,7 @@ mod tests {
             "ID",
         ]);
         assert_eq!(
-            with_permission_mode(unknown.clone(), Some("auto")),
+            with_permission_mode(unknown.clone(), Some("plan")),
             unknown,
             "unknown option arity cannot authorize a rewrite"
         );
@@ -1018,3 +1199,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+#[path = "profile_resume_posture_tests.rs"]
+mod resume_posture_tests;

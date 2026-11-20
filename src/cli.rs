@@ -10,15 +10,19 @@
 //!   are consumed (Claude Code has no `--alab-` flag; an unknown one is refused,
 //!   never passed on);
 //! * `run --` or `launch --` as the first two words after them: managed
-//!   permission, bypass, update and usage policy is applied. `launch --`
-//!   always execs the vendor in place, leaving live duties to the host;
+//!   permission, bypass, update and usage policy is applied. `run --` is the
+//!   entry aterm's `claude` launcher hands a session to ([`LEADING_WORDS`]):
+//!   the vendor then runs as this harness's supervised child. `launch --`
+//!   always execs the vendor in place, with nothing to perform its duties;
 //! * a lone `--version` or `-v` outside that envelope, which prints
 //!   `claude-code-alab <version> (claude <vendor version>)` from the store's
 //!   records and the shared origin line, never by running the vendor.
 //!
 //! Two kinds of launch run the vendor alone, exec'd in the harness's place
-//! ([`pass_through`]: the same pid, no supervision claim):
-//! * inside aterm, `ATERM_NO_HARNESS=1` leaves the harness out ([`left_out`]);
+//! ([`pass_through`]: the same pid, no supervision claim left standing):
+//! * inside aterm, `ATERM_NO_HARNESS=1` (`claude --no-harness`) leaves the
+//!   harness out ([`left_out`]): the person's own word, and the only one that
+//!   runs an interactive session the harness could move without it;
 //! * a launch the harness could never move onto another build
 //!   ([`crate::supervise::live_update_refusal`]: `--alab-no-live-update`, no
 //!   terminal on stdin, a one-shot such as `-p` or `--help`, a command line
@@ -26,13 +30,20 @@
 //!   move; in front of any other it would be one more process between the
 //!   terminal and the vendor, and inside aterm it would keep aterm from
 //!   proving that the tab's foreground leader is the vendor.
+//!
+//! Whatever aterm answers the claim, every other launch is supervised
+//! ([`crate::supervise`]). The claim takes the crash relaunch and the vendor
+//! upgrade; the duties that type stay aterm's until the shared link carries
+//! a fenced typing channel (`src/supervise_link.rs`).
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 
 use alab_policy::ORIGIN_LINE;
 
+use crate::aterm::Duties;
 use crate::journal::Journal;
+use crate::limit::RESET_GRACE_MS;
 use crate::profile::{COMMAND, PACKAGE, REPO, TOOL};
 use crate::quiet::QUIET_MS;
 use crate::store::{self, Store};
@@ -114,16 +125,23 @@ pub const QUIET_MS_MAX: u64 = 24 * 3600 * 1000;
 /// How often the harness looks at the store and the child, by default.
 pub const POLL_MS: u64 = 250;
 
+/// The longest `--alab-reset-grace-ms` accepts: one hour.
+pub const RESET_GRACE_MS_MAX: u64 = 3600 * 1000;
+
 /// Exit status when the vendor CLI cannot be found or run (the shell's "not found").
 pub const EXIT_VENDOR_MISSING: i32 = 127;
 
 /// Exit status for a harness usage error.
 pub const EXIT_USAGE: i32 = 2;
 
-/// Vendor command words this build is qualified to lead through its managed
-/// entry. The package manifest must describe this same source declaration.
-/// Native qualification is still in progress, so no word is led yet.
-pub const LEADING_WORDS: &[&str] = &[];
+/// Vendor command words this build leads through its managed entry: a session
+/// typed as `claude` is handed to `claude-alab run -- <arguments>`
+/// ([`ENTRY_WORD`]), which applies the launch policy and supervises the vendor
+/// as its child. `alab-harness.toml`'s `leads` states the same words, and it is
+/// that declaration, in aterm's registry row for this harness, that makes the
+/// launcher hand over; this constant is the build's own answer to
+/// `--alab-leads=<word>`.
+pub const LEADING_WORDS: &[&str] = &[COMMAND];
 
 /// Vendor words whose launch policy this build owns before execing the vendor
 /// in place. This grants no lifecycle or terminal supervision capability.
@@ -275,6 +293,26 @@ pub fn journal_refusal(reason: &str) {
     .note(&format!("refused {reason}"));
 }
 
+/// What a person does about a launch the launcher handed over (`run --`,
+/// `launch --`) whose vendor build this harness cannot run. The launcher holds
+/// the path of a build of its own and runs it wherever the harness is left out,
+/// so the way round names that; the harness itself reads the stores under
+/// `prefixes` ([`store::vendor_prefixes`]: the one it is installed under, then
+/// the one under the home directory) and tries no other.
+#[must_use]
+pub fn handed_over_advice(prefixes: &[std::path::PathBuf]) -> String {
+    let read = prefixes
+        .iter()
+        .map(|prefix| prefix.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", then ");
+    format!(
+        "nothing was run. This harness reads Claude Code's build only from the atpkg store \
+         under {read}; `{COMMAND} --no-alab-harness …` runs the launcher's own Claude Code \
+         build without the harness"
+    )
+}
+
 /// Write `text` to stdout; a closed or broken stdout is ignored.
 fn put(text: &str) {
     let mut out = std::io::stdout();
@@ -292,6 +330,13 @@ pub struct Options {
     /// How long after its SIGTERM the harness waits for the child to end before
     /// it abandons that update ([`TERM_GRACE_MS`]).
     pub term_grace_ms: u64,
+    /// How long after the reset a Fable limit names the session is moved back
+    /// onto its launch's model ([`RESET_GRACE_MS`]).
+    pub reset_grace_ms: u64,
+    /// The duties the claim takes inside aterm (`--alab-duties=`): every one
+    /// this build performs unless told otherwise ([`Duties::BUILT`]), and
+    /// `relaunch` and `upgrade` whatever it is told ([`Duties::ALWAYS`]).
+    pub duties: Duties,
 }
 
 impl Default for Options {
@@ -300,6 +345,8 @@ impl Default for Options {
             quiet_ms: QUIET_MS,
             poll_ms: POLL_MS,
             term_grace_ms: TERM_GRACE_MS,
+            reset_grace_ms: RESET_GRACE_MS,
+            duties: Duties::BUILT,
         }
     }
 }
@@ -329,6 +376,7 @@ pub enum Command {
 /// The harness's usage text.
 #[must_use]
 pub fn usage() -> String {
+    let built_duties = Duties::BUILT.words();
     format!(
         "{TOOL} {VERSION}: runs the vendor `{COMMAND}` from the atpkg store as its child.\n\
          {ORIGIN_LINE}\n\
@@ -354,6 +402,12 @@ pub fn usage() -> String {
          \x20                         (default {POLL_MS}, 20..=5000)\n\
          \x20 --alab-term-grace-ms=<ms>  how long an update waits for {COMMAND} to end after\n\
          \x20                         SIGTERM before it is abandoned (default {TERM_GRACE_MS}, 500..=600000)\n\
+         \x20 --alab-reset-grace-ms=<ms>  how long after Fable's limit resets a session moved\n\
+         \x20                         onto Opus goes back (default {RESET_GRACE_MS}, 0..={RESET_GRACE_MS_MAX})\n\
+         \x20 --alab-duties=<list>    the duties the launch names, comma-separated\n\
+         \x20                         (default and most {built_duties}); the claim takes\n\
+         \x20                         relaunch and upgrade whatever the list says, and the\n\
+         \x20                         four that type stay aterm's until the link can type\n\
          \x20 --alab-help             this text\n\
          \n\
          Inside aterm, {NO_HARNESS_VAR}=1 runs `{COMMAND}` alone, in this program's place.\n\
@@ -404,6 +458,15 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
             ("quiet-ms", _) => opts.quiet_ms = number(100, QUIET_MS_MAX)?,
             ("poll-ms", _) => opts.poll_ms = number(20, 5000)?,
             ("term-grace-ms", _) => opts.term_grace_ms = number(500, 600_000)?,
+            ("reset-grace-ms", _) => opts.reset_grace_ms = number(0, RESET_GRACE_MS_MAX)?,
+            ("duties", Some(words)) => {
+                opts.duties = Duties::parse(words).ok_or_else(|| {
+                    format!(
+                        "--alab-duties={words}: expected duties from {}, comma-separated",
+                        Duties::BUILT.words()
+                    )
+                })?;
+            }
             _ => return Err(format!("unknown harness option `{text}`")),
         }
         rest.next();
@@ -482,7 +545,8 @@ pub const LEFT_OUT_REASON: &str = "no-harness";
 /// Run the vendor in this process's place (`execve`: the same pid, so nothing
 /// is left behind when the launcher is killed), for `reason`: the launch leaves
 /// the harness out ([`LEFT_OUT_REASON`]), or it could never be moved
-/// ([`crate::supervise::live_update_refusal`]'s words). The journal gets one
+/// ([`crate::supervise::live_update_refusal`]'s words, the `launch --`
+/// envelope's among them). The journal gets one
 /// line, `pass <reason> vendor-build=<n> vendor=<version>`. The build's shim
 /// environment and the harness's forced variables apply as on a supervised
 /// start. [`PARENT_VAR`] is removed, since the vendor is not this harness's
@@ -491,7 +555,7 @@ pub const LEFT_OUT_REASON: &str = "no-harness";
 /// is installed. Managed launches can still use the host's account service,
 /// unless `reason` is [`LEFT_OUT_REASON`]. Returns only by exiting: 127 when the vendor cannot
 /// be run.
-fn pass_through(
+pub(crate) fn pass_through(
     home: &std::path::Path,
     build: &store::Build,
     args: &[OsString],
@@ -555,6 +619,20 @@ pub fn main_with_image_host(
     let words: Vec<_> = std::env::args_os().skip(1).collect();
     if let Some(status) = capability_query(&words) {
         std::process::exit(status);
+    }
+    // Land's repository probe, which the supervisor starts beside its loop:
+    // it reads, writes its one line and exits, touching no harness state.
+    if let Some(request) = crate::repo_probe::entry(&words) {
+        let request = match request {
+            Ok(request) => request,
+            Err(why) => {
+                say(&format!("{TOOL}: {why}"));
+                std::process::exit(EXIT_USAGE)
+            }
+        };
+        let line = format!("{}\n", request.run().line());
+        let written = std::io::stdout().lock().write_all(line.as_bytes());
+        std::process::exit(if written.is_ok() { 0 } else { EXIT_USAGE });
     }
     crate::supervise::image::early_entry(factory);
     if started_as_vendor(
@@ -703,11 +781,18 @@ pub fn main_with_image_host(
         ));
         std::process::exit(EXIT_VENDOR_MISSING);
     };
-    let store = Store::new(&store::default_prefix(&home), PACKAGE, COMMAND);
-    let build = match store.current(own_exe.as_deref()) {
-        Ok(b) => b,
-        Err(missing) => {
+    // A hand-off reads the launcher's own prefix first, where it saw a vendor
+    // build, so a launch under another `HOME` still finds that build.
+    let prefixes = store::vendor_prefixes(managed, own_exe.as_deref(), &home);
+    let (store, build) = match store::find_vendor(&prefixes, PACKAGE, COMMAND, own_exe.as_deref()) {
+        Ok((_, store, build)) => (store, build),
+        Err((_, missing)) => {
+            // Nothing was started before this point but a managed update, which
+            // never returns: no host helper, no vendor, no claim.
             say(&format!("{TOOL}: {missing}"));
+            if managed {
+                say(&format!("{TOOL}: {}", handed_over_advice(&prefixes)));
+            }
             journal_refusal(&format!("{} {missing}", missing.word()));
             std::process::exit(EXIT_VENDOR_MISSING);
         }
@@ -715,6 +800,7 @@ pub fn main_with_image_host(
     if disabled {
         pass_through(&home, &build, &args, depth, LEFT_OUT_REASON);
     }
+    let mut tapped = false;
     if managed && !informational {
         let trust = crate::folder_trust::settle(&build, &args, original_stdout_terminal)?;
         if !matches!(&trust, crate::folder_trust::Outcome::Skipped(_)) {
@@ -730,7 +816,7 @@ pub fn main_with_image_host(
         if let crate::folder_trust::Outcome::Interrupted { signal } = trust {
             std::process::exit(128 + signal);
         }
-        crate::launch::usage_tap(&mut args)?;
+        tapped = crate::launch::usage_tap(&mut args, original_stdout_terminal)?;
     }
     // Launch preparation has restored the caller's signal policy. Only a
     // resumable terminal session proceeds to resident supervision below.
@@ -747,6 +833,7 @@ pub fn main_with_image_host(
             build,
             opts,
             args,
+            tapped,
             depth,
         },
         factory,
@@ -854,17 +941,43 @@ mod tests {
         }
     }
 
+    /// `alab-harness.toml` and this build answer alike: the declaration aterm
+    /// reads names this package, this tool and exactly [`LEADING_WORDS`].
     #[test]
-    fn launch_capability_grants_no_leading_word_and_requires_exact_metadata_argv() {
+    fn the_declaration_file_names_this_build_and_its_leading_words() {
+        let text = include_str!("../alab-harness.toml");
+        let value = |key: &str| {
+            let mut lines = text.lines().filter_map(|line| {
+                let (name, rest) = line.split_once('=')?;
+                (name.trim() == key).then(|| rest.split('#').next().unwrap_or("").trim())
+            });
+            let value = lines.next().unwrap_or_else(|| panic!("no `{key}`"));
+            assert!(lines.next().is_none(), "`{key}` is written twice");
+            value.to_owned()
+        };
+        assert_eq!(value("id"), format!("\"{}\"", env!("CARGO_PKG_NAME")));
+        assert_eq!(value("tool"), format!("\"{TOOL}\""));
+        let leads: Vec<String> = LEADING_WORDS.iter().map(|w| format!("\"{w}\"")).collect();
+        assert_eq!(value("leads"), format!("[{}]", leads.join(", ")));
+    }
+
+    #[test]
+    fn capabilities_require_exact_metadata_argv() {
         for (words, status) in [
             (&["--alab-launches=claude"][..], 0),
+            (&["--alab-leads=claude"][..], 0),
+            (&["--alab-leads=muse"][..], 1),
+            (&["--alab-leads=unknown"][..], 1),
+            (&["--alab-leads="][..], 1),
+            (&["--alab-leads"][..], 1),
+            (&["--alab-leads=claude", "run", "--"][..], 1),
+            (&["--alab-leads=claude", "--alab-launches=claude"][..], 1),
             (&["--alab-primes=claude:settings-defaults"][..], 0),
             (&["--alab-primes=claude:legacy-hooks"][..], 0),
             (&["--alab-primes=muse:legacy-hooks"][..], 1),
             (&["--alab-primes=claude"][..], 1),
             (&["--alab-primes=muse:settings-defaults"][..], 1),
             (&["--alab-primes=claude:settings-defaults", "prime"][..], 1),
-            (&["--alab-leads=claude"][..], 1),
             (&["--alab-launches=muse"][..], 1),
             (&["--alab-launches=unknown"][..], 1),
             (&["--alab-launches="][..], 1),
@@ -895,7 +1008,7 @@ mod tests {
                 Options {
                     quiet_ms: 500,
                     poll_ms: 50,
-                    term_grace_ms: TERM_GRACE_MS,
+                    ..Options::default()
                 },
                 &["--resume", "x"],
                 false
@@ -1260,6 +1373,43 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn the_claimed_duties_are_a_harness_option_that_names_only_built_ones() {
+        assert_eq!(Options::default().duties, Duties::BUILT);
+        assert_eq!(
+            parse(os(&["--alab-duties=relaunch,upgrade", "-c"])),
+            run(
+                Options {
+                    duties: Duties::ALWAYS,
+                    ..Options::default()
+                },
+                &["-c"],
+                false
+            )
+        );
+        // A list that leaves `upgrade` out claims it all the same.
+        let walls = Duties::parse("relaunch,upgrade,walls").unwrap();
+        assert_eq!(
+            parse(os(&["--alab-duties=walls,relaunch", "-c"])),
+            run(
+                Options {
+                    duties: walls,
+                    ..Options::default()
+                },
+                &["-c"],
+                false
+            )
+        );
+        assert!(walls.takes(crate::aterm::Scope::Upgrade));
+        // Negative controls: no value, an empty one, a word aterm does not
+        // spell so.
+        for word in ["--alab-duties", "--alab-duties=", "--alab-duties=wall"] {
+            assert!(parse(os(&[word, "-c"])).is_err(), "{word}");
+        }
+        assert!(usage().contains("--alab-duties=<list>"));
+        assert!(usage().contains("relaunch,upgrade,turn-end,approvals,questions,walls"));
     }
 
     #[test]
